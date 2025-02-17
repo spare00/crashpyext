@@ -42,6 +42,9 @@ def show_qspinlock_flowchart():
 def analyze_qspinlock(counter, rhel_version):
     """ Analyze qspinlock status based on the given counter value and RHEL version. """
 
+    # Convert counter to 32-bit unsigned integer
+    counter = counter & 0xFFFFFFFF
+
     # Define bitfield positions based on RHEL version
     if rhel_version == 7:
         bitfield = {
