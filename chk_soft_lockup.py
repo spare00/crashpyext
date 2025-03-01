@@ -3,7 +3,7 @@ from LinuxDump import percpu
 
 def get_softlockup_values():
     """Fetches per-CPU rq->clock and watchdog_touch_ts to check for soft lockups."""
-    
+
     if not symbol_exists("runqueues") or not symbol_exists("watchdog_touch_ts") or not symbol_exists("watchdog_thresh") or not symbol_exists("watchdog_enabled"):
         print("⚠️ Warning: Required symbols 'runqueues', 'watchdog_touch_ts', 'watchdog_thresh', or 'watchdog_enabled' are missing.")
         return None, None, None, None
@@ -12,17 +12,18 @@ def get_softlockup_values():
         # Fetch all CPU runqueues
         runqueue_addrs = percpu.get_cpu_var("runqueues")
         rq_clock = []
-        
+
         for addr in runqueue_addrs:
             rq = readSU("struct rq", addr)  # Read the entire struct rq
             rq_clock.append(rq.clock)  # Access the 'clock' field
-        
+
+
+        # Convert rq_clock from nanoseconds to seconds (rq_clock >> 30)
+        rq_time_sec = [int(clock_value / 1e9) for clock_value in rq_clock]
+
         # Fetch watchdog_touch_ts values for all CPUs
         watchdog_touch_ts_addrs = percpu.get_cpu_var("watchdog_touch_ts")
         watchdog_touch_ts = [readULong(addr) for addr in watchdog_touch_ts_addrs]
-
-        # Convert rq_clock from nanoseconds to seconds (rq_clock >> 30)
-        rq_time_sec = [clock_value >> 30 for clock_value in rq_clock]
 
         # Get soft lockup threshold (watchdog_thresh * 2)
         watchdog_thresh = readSymbol("watchdog_thresh")
@@ -52,7 +53,7 @@ def detect_soft_lockup():
         return
 
     print(f"Soft Lockup Threshold: {softlockup_thresh} seconds\n")
-    print(f"{'CPU':<5} {'rq->clock (sec)':<20} {'watchdog_touch_ts':<20} {'Difference':<15} {'Status'}")
+    print(f"{'CPU':<5} {'now (sec)':<20} {'touch_ts + ' + str(softlockup_thresh):<20} {'Difference':<15} {'Status'}")
     print("=" * 90)
 
     locked_cpus = []
@@ -77,3 +78,4 @@ def detect_soft_lockup():
 
 # Run the detection function inside crash
 detect_soft_lockup()
+
