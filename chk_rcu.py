@@ -95,25 +95,27 @@ def get_per_cpu_rcu_data(rcu_state, rhel_version):
         return
 
     print("\n=== Per-CPU RCU Status ===")
+    print(f"{'🔹 CPU':<10} {'📌 Grace Period Sequence':<28} {'💤 RCU Quiescent State'}")
+
     for cpu in range(cpu_count_val):
         try:
             rcu_data = readSU("struct rcu_data", percpu.get_cpu_var("rcu_sched_data")[cpu])
             gp_field = "gpnum" if rhel_version == 7 else "gp_seq"
             qs_field = "qs_pending" if rhel_version == 7 else "dynticks_nesting"
-            
+
             if not hasattr(rcu_data, gp_field):
                 print(f"CPU {cpu}: ❌ Failed to retrieve RCU data - missing field {gp_field}")
                 continue
-            
-            print(f"🔹 CPU {cpu}:")
-            print(f"    📌 Grace Period Sequence: {getattr(rcu_data, gp_field, 'N/A')}")
-            
-            if hasattr(rcu_data, qs_field):
-                print(f"    💤 RCU Quiescent State: {getattr(rcu_data, qs_field, 'N/A')}")
-            else:
-                print(f"    ⚠️ Warning: Unable to determine RCU quiescent state field.")
+
+            gp_value = getattr(rcu_data, gp_field, 'N/A')
+            qs_value = getattr(rcu_data, qs_field, 'N/A') if hasattr(rcu_data, qs_field) else "⚠️ Unknown"
+
+            print(f"   {cpu:<10} {gp_value:<28} {qs_value}")
+
         except Exception as e:
-            print(f"    ❌ Failed to read RCU data for CPU {cpu}: {e}")
+            print(f"   {cpu:<10} ❌ Failed to read RCU data: {e}")
+
+    print(f"\nA quiescent state means the CPU has exited any RCU read-side critical section and is considered safe for memory reclamation.")
 
 def main():
     print("=== 🛠️ RCU Status Check ===")
