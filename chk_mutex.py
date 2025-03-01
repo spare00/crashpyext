@@ -45,7 +45,7 @@ def get_waiters(mutex):
         task = waiter.task
         if task:
             state = task_state_array.get(task.__state, f"Unknown ({task.__state})")
-            waiters.append({"pid": task.pid, "comm": task.comm, "state": state})
+            waiters.append((task.pid, task.comm, state))
     return waiters
 
 def get_owner_info(owner_address):
@@ -71,13 +71,13 @@ def get_mutex_info(mutex_addr, list_waiters):
     except Exception as e:
         print(f"Error accessing mutex at {hex(mutex_addr)}: {e}")
         return None
-
+    
     # Extract owner address by masking out the flags
     owner_raw = mutex.owner.counter
     owner_address = owner_raw & ~0x07
     owner_address = owner_address & (2**64 - 1)  # Ensure unsigned 64-bit representation
     flags = owner_raw & 0x07
-
+    
     flag_status = []
     if flags & 0x01:
         flag_status.append("WAITERS - Unlock must issue a wakeup")
@@ -85,9 +85,9 @@ def get_mutex_info(mutex_addr, list_waiters):
         flag_status.append("HANDOFF - Unlock needs to hand the lock to the top-waiter")
     if flags & 0x04:
         flag_status.append("PICKUP - Handoff has been done, waiting for pickup")
-
+    
     lock_state = "Locked" if mutex.wait_lock.raw_lock.val.counter != 1 else "Unlocked"
-
+    
     mutex_info = {
         "address": hex(mutex_addr),
         "owner": get_owner_info(owner_address) if owner_address else "None",  # Owner with PID and COMM
@@ -97,10 +97,10 @@ def get_mutex_info(mutex_addr, list_waiters):
         "wait_list_prev": hex(mutex.wait_list.prev),
         "locked": lock_state,
     }
-
+    
     if list_waiters:
         mutex_info["waiters"] = get_waiters(mutex)
-
+    
     return mutex_info
 
 def analyze_mutex(mutex_info):
@@ -110,7 +110,7 @@ def analyze_mutex(mutex_info):
     if not mutex_info:
         print("No valid mutex information found.")
         return
-
+    
     print("\nMutex Analysis:")
     print("Address: ", mutex_info["address"])
     print("Owner Address: ", mutex_info["owner"])  # Properly formatted with PID and COMM
@@ -119,11 +119,13 @@ def analyze_mutex(mutex_info):
     print("Wait List Next: ", mutex_info["wait_list_next"])
     print("Wait List Prev: ", mutex_info["wait_list_prev"])
     print("Status: ", mutex_info["locked"])
-
-    if "waiters" in mutex_info:
+    
+    if "waiters" in mutex_info and mutex_info["waiters"]:
         print("\nWaiting Tasks:")
-        for waiter in mutex_info["waiters"]:
-            print(f"PID: {waiter['pid']}, Command: {waiter['comm']}, State: {waiter['state']}")
+        print("{:<10} {:<20} {:<15}".format("PID", "Command", "State"))
+        print("-" * 50)
+        for pid, comm, state in mutex_info["waiters"]:
+            print("{:<10} {:<20} {:<15}".format(pid, comm, state))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Analyze mutex state in a VMcore.")
