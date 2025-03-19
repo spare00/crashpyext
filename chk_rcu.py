@@ -30,7 +30,7 @@ def get_panic_info():
     panic_time = "Unknown"
     panic_message = "Unknown"
     kernel_version = "Unknown"
-    
+
     for line in sys_output.splitlines():
         if "PANIC:" in line:
             panic_message = line.strip().replace("PANIC:", "").strip()
@@ -38,7 +38,7 @@ def get_panic_info():
             panic_time = line.strip().replace("TIME:", "").strip()
         elif "RELEASE" in line:
             kernel_version = line.split()[-1]
-    
+
     return panic_time, panic_message, kernel_version
 
 def detect_rhel_version(kernel_version):
@@ -69,16 +69,16 @@ def get_rcu_state(rhel_version):
             gps = rcu_state.gp_start
             js = rcu_state.jiffies_stall
             gs2 = rcu_state.gp_seq  # Read again to detect changes
-            
+
             in_progress = gs1 & 0b11  # Equivalent to RCU_SEQ_STATE_MASK
             stalled = (gs1 == gs2) and (gps < js)
-            
+
             print(f"Current GP Sequence Number: {gs1}")
             print(f"Grace Period Start Timestamp: {gps}")
             print(f"Last Jiffies Stall Check: {js}")
             if stalled:
                 print("⚠️ Warning: RCU stall detected! The grace period may not be progressing.")
-        
+
         if in_progress:
             print("✅ RCU grace period is currently in progress.")
         else:
@@ -95,33 +95,34 @@ def get_per_cpu_rcu_data(rcu_state, rhel_version):
         return
 
     print("\n=== Per-CPU RCU Status ===")
-    print(f"{'🔹 CPU':<10} {'📌 Grace Period Sequence':<28} {'💤 RCU Quiescent State'}")
+    print(f"{'🔹 CPU':<10} {'📌 GP Sequence':<16} {'🚦 Awaiting Quiescence':<22} {'🚦 GP In Progress'}")
 
     for cpu in range(cpu_count_val):
         try:
-            rcu_data = readSU("struct rcu_data", percpu.get_cpu_var("rcu_sched_data")[cpu])
-            gp_field = "gpnum" if rhel_version == 7 else "gp_seq"
-            qs_field = "qs_pending" if rhel_version == 7 else "dynticks_nesting"
-
-            if not hasattr(rcu_data, gp_field):
-                print(f"CPU {cpu}: ❌ Failed to retrieve RCU data - missing field {gp_field}")
-                continue
+            if rhel_version == 7:
+                rcu_data = readSU("struct rcu_data", percpu.get_cpu_var("rcu_sched_data")[cpu])
+                gp_field = "gpnum"
+                qs_field = "qs_pending"
+                in_progress = rcu_data.gpnum != rcu_state.completed
+            else:
+                rcu_data = readSU("struct rcu_data", percpu.get_cpu_var("rcu_data")[cpu])
+                gp_field = "gp_seq"
+                qs_field = "core_needs_qs"
+                in_progress = (rcu_data.gp_seq & 0b11) != 0
 
             gp_value = getattr(rcu_data, gp_field, 'N/A')
             qs_value = getattr(rcu_data, qs_field, 'N/A') if hasattr(rcu_data, qs_field) else "⚠️ Unknown"
 
-            print(f"   {cpu:<10} {gp_value:<28} {qs_value}")
+            print(f"   {cpu:<11} {gp_value:<17} {'True' if qs_value else 'False':<23} {'✅' if in_progress else '⛔'}")
 
         except Exception as e:
             print(f"   {cpu:<10} ❌ Failed to read RCU data: {e}")
-
-    print(f"\nA quiescent state means the CPU has exited any RCU read-side critical section and is considered safe for memory reclamation.")
 
 def main():
     print("=== 🛠️ RCU Status Check ===")
     panic_time, panic_message, kernel_version = get_panic_info()
     rhel_version = detect_rhel_version(kernel_version)
-    
+
     print(f"⏱️ Crash Time: {panic_time}")
     print(f"⚠️ Panic Message: {panic_message}")
     print(f"🖥️ Kernel Version: {kernel_version} (Detected RHEL {rhel_version})")
