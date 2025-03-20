@@ -2,6 +2,10 @@ import pykdump.API as api
 import sys
 import argparse
 
+# Global variable
+kernel_version = "Unknown"
+rhel_version = 8
+
 def get_rhel_version():
     """Determines the major RHEL version from the kernel release."""
     sys_output = exec_crash_command("sys")
@@ -55,12 +59,12 @@ def resolve_address(input_value):
         sys.exit(1)
 
 def get_task_state(task):
-    task_state_value = task.__state if rhel_version >= 8 else task.state
+    task_state_value = task.state if rhel_version >= 8 else task.__state
     state_flags = [name for bit, name in task_state_array.items() if task_state_value & bit]
     state = " | ".join(state_flags) if state_flags else f"Unknown ({task_state_value})"
     return state
 
-def get_waiters(mutex, rhel_version):
+def get_waiters(mutex):
     waiters = []
     wait_list = ListHead(int(mutex.wait_list), "struct mutex_waiter")
     for waiter in wait_list.list:
@@ -81,7 +85,7 @@ def get_owner_info(owner_address):
     except Exception:
         return hex(owner_address)
 
-def get_mutex_info(mutex_addr, list_waiters, rhel_version):
+def get_mutex_info(mutex_addr, list_waiters):
     try:
         mutex = readSU("struct mutex", mutex_addr)
     except Exception as e:
@@ -116,7 +120,7 @@ def get_mutex_info(mutex_addr, list_waiters, rhel_version):
     }
 
     if list_waiters:
-        mutex_info["waiters"] = get_waiters(mutex, rhel_version)
+        mutex_info["waiters"] = get_waiters(mutex)
 
     return mutex_info
 
@@ -150,8 +154,9 @@ if __name__ == "__main__":
     parser.add_argument("-l", "--list", action="store_true", help="List tasks waiting on the mutex")
     args = parser.parse_args()
 
+    # Get basic info
     rhel_version = get_rhel_version()
     mutex_addr = resolve_address(args.mutex)
-    mutex_info = get_mutex_info(mutex_addr, args.list, rhel_version)
+    mutex_info = get_mutex_info(mutex_addr, args.list)
     analyze_mutex(mutex_info)
 
