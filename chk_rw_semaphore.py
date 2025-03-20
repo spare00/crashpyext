@@ -2,8 +2,63 @@
 
 import sys
 import argparse
+from pykdump.API import readSU  # Importing ePython API for VMcore analysis
 
-def check_integrity(count, owner, signed_count, reader_owned, writer_task_struct, rhel_version):
+# Global variable
+kernel_version = "Unknown"
+rhel_version = 8
+
+def get_rhel_version():
+    """Determines the major RHEL version from the kernel release."""
+    sys_output = exec_crash_command("sys")
+
+    for line in sys_output.splitlines():
+        if "RELEASE" in line:
+            kernel_version = line.split()[-1]
+            if "el" in kernel_version:
+                try:
+                    rhel_version = int(kernel_version.split(".el")[1][0])
+                except (IndexError, ValueError):
+                    pass
+
+    print(f"Detected RHEL Version: {rhel_version} (Kernel: {kernel_version})")
+    return rhel_version
+
+def get_architecture():
+    """Determines the system architecture from VMcore."""
+    sys_output = exec_crash_command("sys")
+    arch = "64-bit"  # Default to 64-bit
+
+    for line in sys_output.splitlines():
+        if "BIOS" in line or "Kernel" in line:
+            if "x86_64" in line:
+                arch = "64-bit"
+            elif "i686" in line or "i386" in line:
+                arch = "32-bit"
+
+    print(f"Detected Architecture: {arch}")
+    return arch
+
+task_state_array = {
+    0x00: "TASK_RUNNING",
+    0x01: "TASK_INTERRUPTIBLE",
+    0x02: "TASK_UNINTERRUPTIBLE",
+    0x04: "__TASK_STOPPED",
+    0x08: "__TASK_TRACED",
+    0x10: "EXIT_DEAD",
+    0x20: "EXIT_ZOMBIE",
+    0x40: "TASK_PARKED" if rhel_version >= 8 else "TASK_DEAD",
+    0x80: "TASK_DEAD" if rhel_version >= 8 else "TASK_WAKEKILL",
+    0x100: "TASK_WAKEKILL" if rhel_version >= 8 else "TASK_WAKING",
+    0x200: "TASK_WAKING" if rhel_version >= 8 else "TASK_PARKED",
+    0x400: "TASK_NOLOAD" if rhel_version >= 8 else "TASK_STATE_MAX",
+    0x800: "TASK_NEW" if rhel_version >= 8 else "TASK_STATE_MAX",
+    0x1000: "TASK_RTLOCK_WAIT" if rhel_version >= 8 else "TASK_STATE_MAX",
+    0x2000: "TASK_STATE_MAX" if rhel_version >= 9 else "TASK_STATE_MAX",
+}
+
+
+def check_integrity(count, owner, signed_count, reader_owned, writer_task_struct):
     """ Perform logical integrity checks on rw_semaphore values. """
 
     issues = []
@@ -98,7 +153,7 @@ def format_owner(owner):
 
     return formatted_binary, reader_owned, nonspinnable, task_address_bits
 
-def analyze_rw_semaphore(count, owner, arch="64-bit", verbose=False, rhel_version=8):
+def analyze_rw_semaphore(count, owner, owner_info, arch="64-bit", verbose=False):
     """ Analyze the rw_semaphore state based on the given count and owner values. """
 
     RWSEM_WRITER_LOCKED = 0x1  # Bit 0
@@ -134,7 +189,7 @@ def analyze_rw_semaphore(count, owner, arch="64-bit", verbose=False, rhel_versio
     print(f"\n🚨 **RW Semaphore Integrity Check** 🚨")
 
     # ✅ Run the logical consistency checks
-    integrity_issues = check_integrity(count, owner, signed_count, reader_owned, writer_task_struct, rhel_version)
+    integrity_issues = check_integrity(count, owner, signed_count, reader_owned, writer_task_struct)
 
     if integrity_issues:
         for issue in integrity_issues:
@@ -157,7 +212,10 @@ def analyze_rw_semaphore(count, owner, arch="64-bit", verbose=False, rhel_versio
 
     print(f"\n=== RW Semaphore Status ({arch}) ===")
     print(f"Count Value:     {formatted_count} ({signed_count})")
-    print(f"Owner Value:     0x{owner:X} ({owner})")
+
+    owner_address = owner & (2**64 - 1)
+
+    print(f"Owner Value:     {hex(owner_address)}")
     print(f"Binary Count:    {binary_output}")
     print("========================\n")
 
@@ -196,7 +254,9 @@ def analyze_rw_semaphore(count, owner, arch="64-bit", verbose=False, rhel_versio
 
     print("\n🔍 **Breakdown of RW Semaphore Owner Field**")
     print(f"  🔢 **Binary Owner Value:** `{binary_owner}`")
-    print(f"  🏷 **Task Struct Address:** `{b_task_address}`")
+
+    # Get formatted owner info for display
+    print(f"  🏷 **Owner Task:** `{ owner_info }`")
 
     if rhel_version == 8:
         print(f"  🔄 **Non-Spinnable Bit (Bit 1):** `{b_nonspinnable}`")
@@ -211,17 +271,67 @@ def analyze_rw_semaphore(count, owner, arch="64-bit", verbose=False, rhel_versio
     else:
         print("  ℹ️ **(RHEL 7)** The `owner` field should only be set by writers.")
 
-# Main Execution
+def get_task_state(task):
+    task_state_value = task.state if rhel_version >= 8 else task.__state
+    state_flags = [name for bit, name in task_state_array.items() if task_state_value & bit]
+    state = " | ".join(state_flags) if state_flags else f"Unknown ({task_state_value})"
+    return state
+
+def get_owner_info(owner_address):
+    try:
+        owner_address = int(owner_address, 16) if isinstance(owner_address, str) else owner_address
+        owner_task = readSU("struct task_struct", owner_address)
+        pid = owner_task.pid
+        comm = owner_task.comm
+        state = get_task_state(owner_task)
+        return f"{hex(owner_address)} (PID: {pid}, COMM: {comm}, {state})"
+    except Exception as e:
+        print(f"Error accessing owner task at {hex(owner_address)}: {e}")
+        return hex(owner_address)
+
+def analyze_rw_semaphore_from_vmcore(rw_semaphore_addr, verbose=False, debug=False):
+    """ Read rw_semaphore structure from VMcore and analyze its state. """
+
+    # Read rw_semaphore struct from VMcore
+    rwsem = readSU("struct rw_semaphore", rw_semaphore_addr)
+
+    # Extract fields
+    count = rwsem.count.counter  # Ensure correct extraction of counter value
+
+    # Correct sign extension for count
+    if count & (1 << 63):  # Check if the sign bit (bit 63) is set
+        count -= (1 << 64)  # Convert to signed 64-bit integer
+
+    # Detect RHEL version and architecture automatically
+    arch = get_architecture()
+
+    # Get formatted owner info for display
+    owner_raw = rwsem.owner.counter if rhel_version >= 8 else rwsem.owner
+    owner_address = owner_raw & ~0x07
+    owner_address = owner_address & (2**64 - 1)
+
+    owner_info = get_owner_info(owner_address)
+
+    # Print raw structure data if debug mode is enabled
+    if debug:
+        print("\n🔍 **Raw rw_semaphore Structure Data:**")
+        raw_output = exec_crash_command(f"struct rw_semaphore {rw_semaphore_addr:#x} -x")
+        print(raw_output)
+
+    print(f"owner:::: {hex(owner_address)}")
+    # Call existing analysis function with both raw owner and formatted owner info
+    analyze_rw_semaphore(count, owner_raw, owner_info, arch, verbose)
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Analyze rw_semaphore status in Linux.")
-    parser.add_argument("count", type=lambda x: int(x, 0))
-    parser.add_argument("owner", type=lambda x: int(x, 0))
-    parser.add_argument("-a", "--arch", choices=["32-bit", "64-bit"], default="64-bit")
+    parser = argparse.ArgumentParser(description="Analyze rw_semaphore from VMcore.")
+    parser.add_argument("rw_semaphore_addr", type=lambda x: int(x, 16), help="Memory address of rw_semaphore (hex)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable detailed breakdown of bit fields.")
-    parser.add_argument("-r", "--rhel-version", type=int, choices=[7, 8], default=8,
-                    help="Specify RHEL version (7 or 8). Default is 8.")
+    parser.add_argument("-d", "--raw", action="store_true", help="Show raw rw_semaphore structure data.")
 
     args = parser.parse_args()
 
-    analyze_rw_semaphore(args.count, args.owner, args.arch, args.verbose, args.rhel_version)
+    # Get basic info
+    get_rhel_version()
+
+    analyze_rw_semaphore_from_vmcore(args.rw_semaphore_addr, args.verbose, args.raw)
 
