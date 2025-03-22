@@ -9,6 +9,12 @@ kernel_version = "Unknown"
 RHEL_VERSION = 8
 DEBUG = False
 
+RWSEM_WRITER_LOCKED = 1 << 0
+RWSEM_FLAG_WAITERS  = 1 << 1
+RWSEM_FLAG_HANDOFF  = 1 << 2
+RWSEM_FLAG_READFAIL = 1 << 63
+RWSEM_READER_BIAS   = 1 << 8
+
 def logging(str):
     if DEBUG:
         print(f"{str}")
@@ -68,12 +74,6 @@ def check_integrity(count, owner, signed_count, reader_owned, writer_task_struct
     """ Perform logical integrity checks on rw_semaphore values. """
 
     issues = []
-
-    RWSEM_FLAG_READFAIL = 1 << 63
-    RWSEM_WRITER_LOCKED = 1 << 0
-    RWSEM_FLAG_WAITERS  = 1 << 1
-    RWSEM_FLAG_HANDOFF  = 1 << 2
-    RWSEM_READER_BIAS   = 1 << 8
 
     # Check if RWSEM_FLAG_READFAIL is set
     if count & RWSEM_FLAG_READFAIL:
@@ -186,16 +186,57 @@ def format_owner(owner):
 
     return formatted_binary, reader_owned, nonspinnable, task_address_bits
 
+# Extension to analyze more realistic rw_semaphore.count states
+# Replaces or enhances a part of analyze_rw_semaphore()
+
+def classify_rwsem_state(count):
+    """Extended logic to classify the rw_semaphore count value"""
+
+    flags = []
+    state = ""
+
+    unsigned_count = count & 0xFFFFFFFFFFFFFFFF
+
+    writer = bool(unsigned_count & RWSEM_WRITER_LOCKED)
+    waiters = bool(unsigned_count & RWSEM_FLAG_WAITERS)
+    handoff = bool(unsigned_count & RWSEM_FLAG_HANDOFF)
+    readfail = bool(unsigned_count & RWSEM_FLAG_READFAIL)
+
+    # Extract reader count
+    reader_count = (unsigned_count & ~((1 << 8) - 1)) >> 8  # bits 8+
+
+    if writer: flags.append("WRITER_LOCKED")
+    if waiters: flags.append("WAITERS")
+    if handoff: flags.append("HANDOFF")
+    if readfail: flags.append("READFAIL")
+
+    # Classify based on values
+    if reader_count > 0 and not writer:
+        state = "✅ Readers hold the lock"
+    elif writer and reader_count == 0:
+        state = "✅ Writer holds the lock"
+    elif count == 0:
+        state = "✅ Lock is free"
+    elif readfail:
+        state = "🌀 Transitional (READFAIL set)"
+    elif reader_count == 0 and waiters:
+        state = "🌀 Transitional (waiters present)"
+    elif reader_count < 0:
+        state = "❗ Corrupted: Negative reader count"
+    elif writer and reader_count > 0:
+        state = "❗ Invalid: Writer and readers simultaneously"
+    else:
+        state = "🌀 Unclassified transitional or rare state"
+
+    return {
+        "flags": flags,
+        "reader_count": reader_count,
+        "state_description": state,
+        "raw_value": f"0x{unsigned_count:016x}"
+    }
+
 def analyze_rw_semaphore(count, owner, owner_info, arch="64-bit", verbose=False):
     """ Analyze the rw_semaphore state based on the given count and owner values. """
-
-    RWSEM_WRITER_LOCKED = 0x1  # Bit 0
-    RWSEM_FLAG_WAITERS = 0x2    # Bit 1
-    RWSEM_FLAG_HANDOFF = 0x4    # Bit 2
-    RWSEM_FLAG_READFAIL = 1 << (63 if arch == "64-bit" else 31)  # Bit 63 (64-bit) or Bit 31 (32-bit)
-
-    RWSEM_READER_SHIFT = 8
-    RWSEM_READER_BIAS = 1 << RWSEM_READER_SHIFT
 
     RWSEM_READER_MASK = ~(RWSEM_READER_BIAS - 1)
     RWSEM_WRITER_MASK = RWSEM_WRITER_LOCKED
@@ -242,60 +283,65 @@ def analyze_rw_semaphore(count, owner, owner_info, arch="64-bit", verbose=False)
 
     # **Breakdown of RW Semaphore Count Field**
     print("🔍 **Breakdown of RW Semaphore Count Field**")
-    print(f"Binary Count:    {binary_output}")
+    print(f"Binary:    {binary_output}")
 
-    print(f"  🟢 **Read Fail Bit (Bit 63):** `{b_read_fail}`")
+    print(f"  🟢 Read Fail Bit (Bit 63): {b_read_fail}")
     if verbose:
         print("      - 1 = Rare failure case (potential semaphore corruption)")
         print("      - 0 = Normal operation")
 
-    print(f"  📖 **Reader Count (Bits 8-62):** `{b_reader_count}`")
+    print(f"  📖 Reader Count (Bits 8-62): {b_reader_count}")
     if verbose:
         print("      - Number of active readers currently holding the lock")
 
-    print(f"  🔹 **Reserved Bits (Bits 3-7):** `{b_reserved}`")
+    print(f"  🔹 Reserved Bits (Bits 3-7): {b_reserved}")
     if verbose:
         print("      - Reserved for future use")
 
-    print(f"  🔄 **Lock Handoff Bit (Bit 2):** `{b_handoff}`")
+    print(f"  🔄 Lock Handoff Bit (Bit 2): {b_handoff}")
     if verbose:
         print("      - 1 = Next writer is guaranteed to acquire the lock")
         print("      - 0 = Normal contention handling")
 
-    print(f"  ⏳ **Waiters Present Bit (Bit 1):** `{b_waiters}`")
+    print(f"  ⏳ Waiters Present Bit (Bit 1): {b_waiters}")
     if verbose:
         print("      - 1 = Other threads are waiting for the lock")
         print("      - 0 = No other threads are queued")
 
-    print(f"  🔒 **Writer Locked Bit (Bit 0):** `{b_writer_locked}`")
+    print(f"  🔒 Writer Locked Bit (Bit 0): {b_writer_locked}")
     if verbose:
         print("      - 1 = A writer is currently holding the lock")
         print("      - 0 = Lock is free or held by readers")
 
-    if unsigned_count == 0xFFFFFFFFFFFFFF06:
-        print("\n  💡 Known transitional state: Reader failed to acquire during writer handoff (bit 63 + bit 1 + bit 2 set)")
+    result = classify_rwsem_state(count)
+    if result:
+        print("\n  🧠 Inferred State:")
+        print(f"  Flags Set: {', '.join(result['flags']) if result['flags'] else 'None'}")
+        print(f"  Reader Count: {result['reader_count']}")
+        print(f"  Raw Value: {result['raw_value']}")
+        print(f"  🧾 Classification: {result['state_description']}")
 
     # ✅ NEW: Breakdown of RW Semaphore Owner Field
     binary_owner, b_reader_owned, b_nonspinnable, b_task_address = format_owner(owner)
 
     print("\n🔍 **Breakdown of RW Semaphore Owner Field**")
-    print(f"  🔢 **Binary Owner Value:** `{binary_owner}`")
+    print(f"Binary Value: {binary_owner}")
 
     # Get formatted owner info for display
-    print(f"  🏷 **Owner Task:** `{ owner_info }`")
+    print(f"  🏷 Owner Task: { owner_info }")
 
     if RHEL_VERSION == 8:
-        print(f"  🔄 **Non-Spinnable Bit (Bit 1):** `{b_nonspinnable}`")
+        print(f"  🔄 Non-Spinnable Bit (Bit 1): {b_nonspinnable}")
         if verbose:
             print("     - 1 = A waiting writer has stopped spinning")
             print("     - 0 = Normal behavior")
 
-        print(f"  📖 **Reader Owned Bit (Bit 0):** `{b_reader_owned}`")
+        print(f"  📖 Reader Owned Bit (Bit 0): {b_reader_owned}")
         if verbose:
             print("     - 1 = A reader currently owns the lock")
             print("     - 0 = Not reader-owned (could be a writer or empty)")
     else:
-        print("  ℹ️ **(RHEL 7)** The `owner` field should only be set by writers.")
+        print("  ℹ️ (RHEL 7)** The `owner` field should only be set by writers.")
 
 def get_task_state(task):
     task_state_value = task.state if RHEL_VERSION < 8 else task.__state
