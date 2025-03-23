@@ -70,6 +70,31 @@ task_state_array = {
     0x2000: "TASK_STATE_MAX" if RHEL_VERSION >= 9 else "TASK_STATE_MAX",
 }
 
+# Known combinations for reference/diagnostics
+KNOWN_RWSEM_STATES = [
+    {"value": 0, "desc": "Unlocked"},
+    {"value": 1, "desc": "Writer holds lock"},
+    {"value": 256, "desc": "1 reader"},
+    {"value": 512, "desc": "2 readers"},
+    {"value": 258, "desc": "1 reader + waiters"},
+    {"value": 2, "desc": "Waiters only"},
+    {"value": 6, "desc": "Waiters + handoff"},
+    {"value": 3, "desc": "Writer + waiters"},
+    {"value": 7, "desc": "Writer + waiters + handoff"},
+    {"value": -9223372036854775802, "desc": "READFAIL + waiters + handoff"},
+    {"value": -9223372036854775808, "desc": "READFAIL only"},
+    {"value": -256, "desc": "Reader released (raw -1 reader)"},
+    {"value": -254, "desc": "Released + waiters"},
+    {"value": -250, "desc": "Reader release + waiters + handoff"},
+    {"value": -1, "desc": "All bits set — likely corrupted"},
+    {"value": -9223372036854775801, "desc": "All flags + READFAIL"},
+    {"value": 518, "desc": "2 readers + waiters + handoff"},
+    {"value": -9223372036854775553, "desc": "READFAIL + writer + 1 reader"},
+    {"value": 4, "desc": "HANDOFF only"},
+    {"value": -9223372036854775807, "desc": "WRITER + READFAIL"},
+    {"value": 5, "desc": "WRITER + HANDOFF"}
+]
+
 def check_integrity(count, owner, signed_count, reader_owned, writer_task_struct):
     """ Perform logical integrity checks on rw_semaphore values. """
 
@@ -272,13 +297,16 @@ def classify_rwsem_state(count):
     if reserved_bits:
         description += " Reserved bits (3–7) are set — unexpected."
 
+    logging(f"count: {count}")
+    matched_known = next((entry['desc'] for entry in KNOWN_RWSEM_STATES if count == entry['value']), None)
+
     return {
         "flags": flags,
         "reader_count": reader_count,
         "reader_note": reader_note,
         "reserved_bits": f"{reserved_bits:05b}",
         "state_type": state_type,
-        "description": description,
+        "description": description + (f"🔎 Matched known pattern: {matched_known}" if matched_known else ""),
         "raw_value": f"0x{unsigned_count:016x}"
     }
 
@@ -398,7 +426,27 @@ def get_owner_info(owner_address):
         print(f"Error accessing owner task at {hex(owner_address)}: {e}")
         return hex(owner_address)
 
-def analyze_rw_semaphore_from_vmcore(rw_semaphore_addr, verbose=False, debug=False):
+def list_waiting_tasks(wait_list_addr):
+    """Return a list of tasks in the rw_semaphore's wait_list."""
+    print("\n**List of waiters in s wait_list**\n")
+    try:
+        command = f"list -s rwsem_waiter.task,type -l rwsem_waiter.list {wait_list_addr:#x}"
+        print(f"Executing: {command}\n")
+        output = exec_crash_command(command)
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        grouped = []
+        i = 0
+        while i < len(lines):
+            if i + 2 < len(lines):
+                print(f"{lines[i]}  {lines[i+1]}  {lines[i+2]}")
+                i += 3
+            else:
+                break
+    except Exception as e:
+        print(f"Error listing waiters for rw_semaphore at {hex(wait_list_addr)}: {e}")
+        return []
+
+def analyze_rw_semaphore_from_vmcore(rw_semaphore_addr, list_waiters=False, verbose=False, debug=False):
     """ Read rw_semaphore structure from VMcore and analyze its state. """
 
     # Read rw_semaphore struct from VMcore
@@ -428,16 +476,21 @@ def analyze_rw_semaphore_from_vmcore(rw_semaphore_addr, verbose=False, debug=Fal
     # Call existing analysis function with both raw owner and formatted owner info
     analyze_rw_semaphore(count, owner_raw, owner_info, arch, verbose)
 
+    if list_waiters:
+        list_waiting_tasks(rwsem.wait_list)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Analyze rw_semaphore from VMcore.")
     parser.add_argument("rw_semaphore_addr", type=lambda x: int(x, 16), help="Memory address of rw_semaphore (hex)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable detailed breakdown of bit fields.")
     parser.add_argument("-d", "--raw", action="store_true", help="Show raw rw_semaphore structure data.")
+    parser.add_argument("-l", "--list", action="store_true", help="List tasks waiting on the rw_semaphore")
 
     args = parser.parse_args()
     DEBUG = args.raw
 
     # Get basic info
     RHEL_VERSION = get_rhel_version()
-    analyze_rw_semaphore_from_vmcore(args.rw_semaphore_addr, args.verbose, args.raw)
+
+    analyze_rw_semaphore_from_vmcore(args.rw_semaphore_addr, args.list, args.verbose, args.raw)
 
