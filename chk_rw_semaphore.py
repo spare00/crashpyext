@@ -14,7 +14,16 @@ RWSEM_FLAG_WAITERS  = 1 << 1
 RWSEM_FLAG_HANDOFF  = 1 << 2
 RWSEM_FLAG_READFAIL = 1 << 63
 RWSEM_READER_BIAS   = 1 << 8
-RWSEM_READER_SHIFT = 8
+RWSEM_READER_SHIFT  = 8
+
+RWSEM_READER_MASK = ~(RWSEM_READER_BIAS - 1)
+RWSEM_WRITER_MASK = RWSEM_WRITER_LOCKED
+RWSEM_LOCK_MASK = RWSEM_WRITER_MASK | RWSEM_READER_MASK
+RWSEM_READ_FAILED_MASK = (RWSEM_WRITER_MASK | RWSEM_FLAG_WAITERS | RWSEM_FLAG_HANDOFF | RWSEM_FLAG_READFAIL)
+
+RWSEM_READER_OWNED = 0x1
+RWSEM_NONSPINNABLE = 0x2
+RWSEM_OWNER_FLAGS_MASK = (RWSEM_READER_OWNED | RWSEM_NONSPINNABLE)
 
 def logging(str):
     if DEBUG:
@@ -83,9 +92,9 @@ KNOWN_RWSEM_STATES = [
     {"value": 7, "desc": "Writer + waiters + handoff"},
     {"value": -9223372036854775802, "desc": "READFAIL + waiters + handoff"},
     {"value": -9223372036854775808, "desc": "READFAIL only"},
-    {"value": -256, "desc": "Reader released (raw -1 reader)"},
-    {"value": -254, "desc": "Released + waiters"},
-    {"value": -250, "desc": "Reader release + waiters + handoff"},
+    {"value": -256, "desc": "Reader released (-1 reader)"},
+    {"value": -254, "desc": "Reader released (-1 reader)+ waiters"},
+    {"value": -250, "desc": "Reader released (-1 reader)+ waiters + handoff"},
     {"value": -1, "desc": "All bits set — likely corrupted"},
     {"value": -9223372036854775801, "desc": "All flags + READFAIL"},
     {"value": 518, "desc": "2 readers + waiters + handoff"},
@@ -118,28 +127,32 @@ def check_integrity(count, owner, signed_count, reader_owned, writer_task_struct
         # ✅ Transitional state — skip strict checks
         return issues
 
-    # Reader-held state
-    if signed_count > 0:
+    # Reader-associated state (not guaranteed active readers)
+    reader_bias_count = count & RWSEM_READER_MASK
+    if reader_bias_count > 0 and not (count & RWSEM_WRITER_LOCKED):
         if RHEL_VERSION == 8:
             if not reader_owned:
-                issues.append("⚠️ Inconsistent: `count` is positive (read-held), but `owner` does not indicate reader ownership.")
+                issues.append("ℹ️ Reader bias is present in `.count`, but RWSEM_READER_OWNED bit is not set — may be valid (fastpath), or worth reviewing.")
             if writer_task_struct != 0 and not reader_owned:
-                issues.append("⚠️ Suspicious Owner: Nonzero `owner` without RWSEM_READER_OWNED while read-locked.")
+                issues.append("⚠️ Owner field is nonzero but RWSEM_READER_OWNED not set — possible stale writer, or early reader acquisition.")
+
         elif RHEL_VERSION == 7:
             if writer_task_struct != 0:
-                issues.append("⚠️ Unexpected: `owner` should be 0 in RHEL 7 when read-locked.")
+                issues.append("⚠️ Unexpected: `.owner` should be 0 in RHEL 7 when readers hold the lock.")
 
-        if signed_count % RWSEM_READER_BIAS != 0:
-            issues.append("⚠️ Reader count not aligned to RWSEM_READER_BIAS (256). Possible corruption.")
+        if reader_bias_count % RWSEM_READER_BIAS != 0:
+            issues.append("⚠️ Reader count not aligned to RWSEM_READER_BIAS (256) — possible corruption or misinterpretation.")
 
-    # Writer-held or invalid state
+    # Transitional or negative count state (not strictly writer-held)
     elif signed_count < 0:
         if writer_task_struct == 0:
-            issues.append("⚠️ Missing Owner: `count` is negative but `owner` is 0 (expected writer task).")
+            issues.append("🌀 `.count` is negative — transitional state or race possible. `owner` is null, which may be valid during unlock or reader release.")
+
         if reader_owned:
-            issues.append("⚠️ Conflict: `owner` marked as reader, but `count` is negative (write-lock).")
+            issues.append("⚠️ Conflict: `owner` marked as reader, but `count` is negative — inconsistent state.")
+
         if signed_count < -1:
-            issues.append("🚨 INVALID STATE: `count < -1` suggests multiple writers — this is a BUG.")
+            issues.append("🌀 `.count < -1` likely indicates a reader release racing with unlock, not multiple writers. Check flags (WAITERS, HANDOFF).")
 
     # Free lock
     elif signed_count == 0:
@@ -214,21 +227,54 @@ def format_owner(owner):
 # Extension to analyze more realistic rw_semaphore.count states
 # Replaces or enhances a part of analyze_rw_semaphore()
 
+def explain_bits_combination(count, adjusted_reader_bias, is_readfail_real):
+    """Return list of active flags and interpreted description from .count"""
+    bitwise_count = count & 0xFFFFFFFFFFFFFFFF
+
+    flags = []
+    if bitwise_count & RWSEM_WRITER_LOCKED:
+        flags.append("1(WRITER_LOCKED)")
+    if bitwise_count & RWSEM_FLAG_WAITERS:
+        flags.append("2(WAITERS)")
+    if bitwise_count & RWSEM_FLAG_HANDOFF:
+        flags.append("4(HANDOFF)")
+    if is_readfail_real & bitwise_count & RWSEM_FLAG_READFAIL:
+        flags.append("9223372036854775808(READFAIL)")
+
+    reader_count = adjusted_reader_bias if not is_readfail_real else (bitwise_count & RWSEM_READER_MASK) >> 8
+    desc_parts = []
+    if flags:
+        desc_parts.append(" + ".join(flags) )
+    if reader_count > 0:
+        if is_readfail_real:
+            desc_parts.append(f"+{RWSEM_READER_BIAS * reader_count} ({reader_count} reader(s))")
+        else:
+            desc_parts.append(f"{-RWSEM_READER_BIAS * reader_count} ({reader_count} reader(s))")
+
+    if not desc_parts:
+        desc_parts.append("no bits or readers set")
+
+    return flags, reader_count, " ".join(desc_parts)
+
 def classify_rwsem_state(count):
     """Extended logic to classify the rw_semaphore count value"""
 
     flags = []
     state = ""
 
-    unsigned_count = count & 0xFFFFFFFFFFFFFFFF
+    # Interpret count bitwise (64-bit) to extract flags regardless of sign
+    bitwise_count = count & 0xFFFFFFFFFFFFFFFF
+    logging(f"bitwise_count: {bitwise_count}")
+    writer = bool(bitwise_count & RWSEM_WRITER_LOCKED)
+    waiters = bool(bitwise_count & RWSEM_FLAG_WAITERS)
+    handoff = bool(bitwise_count & RWSEM_FLAG_HANDOFF)
+    readfail = bool(bitwise_count & RWSEM_FLAG_READFAIL)
 
-    writer = bool(unsigned_count & RWSEM_WRITER_LOCKED)
-    waiters = bool(unsigned_count & RWSEM_FLAG_WAITERS)
-    handoff = bool(unsigned_count & RWSEM_FLAG_HANDOFF)
-    readfail = bool(unsigned_count & RWSEM_FLAG_READFAIL)
+    count_hex = hex(bitwise_count)
+    is_readfail_real = (count & RWSEM_FLAG_READFAIL) and not count_hex.startswith("0xf")
 
-    reserved_bits = (unsigned_count >> 3) & 0x1F
-    raw_reader_bits = (unsigned_count >> 8) & ((1 << (63 - 8)) - 1)
+    reserved_bits = (bitwise_count >> 3) & 0x1F
+    raw_reader_bits = (bitwise_count >> 8) & ((1 << (63 - 8)) - 1)
     reader_count = raw_reader_bits
     reader_note = ""
     reader_count_valid = True
@@ -238,11 +284,21 @@ def classify_rwsem_state(count):
     if handoff: flags.append("HANDOFF")
     if readfail: flags.append("READFAIL")
 
+    adjusted_reader_bias = 0
+
+    # 🧠 Special case: treat large negative counts with flags as likely race (e.g., -256, -1018)
+    logging(f"count: {count}, {(count & 0xFF)}, {readfail}")
+    if(waiters or handoff) and not is_readfail_real:
+        adjusted_reader_bias = ((-count + (count & 0xFF)) & RWSEM_READER_MASK) >> 8
+        logging(f"adjusted_reader_bias: {adjusted_reader_bias}")
+        reader_note = f"🌀 Transitional: derived {adjusted_reader_bias} reader(s) released during flag state."
+        reader_count_valid = False
+
     # Reader count validity analysis
-    if reader_count > 1000000:
+    elif not is_readfail_real:
         reader_note = "⚠️ Suspicious: extremely high reader count, likely due to corruption or race."
         reader_count_valid = False
-    elif reader_count == 0 and (count < 0) and not readfail:
+    elif reader_count == 0 and (count < 0) and not is_readfail_real:
         reader_note = "⚠️ Reader count is zero, but count is negative — possibly transitional or corrupted."
         reader_count_valid = False
     else:
@@ -274,7 +330,7 @@ def classify_rwsem_state(count):
         state_type = "❗ Invalid"
         description = f"Writer and {reader_note} both appear to hold the lock — should not happen."
 
-    elif readfail:
+    elif is_readfail_real:
         state_type = "🌀 Transitional"
         description = "Reader failed to acquire the lock — likely fallback to queue."
 
@@ -297,8 +353,11 @@ def classify_rwsem_state(count):
     if reserved_bits:
         description += " Reserved bits (3–7) are set — unexpected."
 
-    logging(f"count: {count}")
     matched_known = next((entry['desc'] for entry in KNOWN_RWSEM_STATES if count == entry['value']), None)
+
+    # 🔍 Append breakdown from flag analyzer
+    _, _, combined_bits_desc = explain_bits_combination(count, adjusted_reader_bias, is_readfail_real)
+    description += f"\n  🧩  Bits Combination: {combined_bits_desc}"
 
     return {
         "flags": flags,
@@ -307,7 +366,7 @@ def classify_rwsem_state(count):
         "reserved_bits": f"{reserved_bits:05b}",
         "state_type": state_type,
         "description": description + (f"🔎 Matched known pattern: {matched_known}" if matched_known else ""),
-        "raw_value": f"0x{unsigned_count:016x}"
+        "raw_value": f"0x{bitwise_count:016x}"
     }
 
 def print_owner_bitfield(binary_owner, b_reader_owned, b_nonspinnable, owner_info, verbose=False):
@@ -348,15 +407,6 @@ def print_bitfield_breakdown(binary_output, b_read_fail, b_reader_count, b_reser
 
 def analyze_rw_semaphore(count, owner, owner_info, arch="64-bit", verbose=False):
     """ Analyze the rw_semaphore state based on the given count and owner values. """
-
-    RWSEM_READER_MASK = ~(RWSEM_READER_BIAS - 1)
-    RWSEM_WRITER_MASK = RWSEM_WRITER_LOCKED
-    RWSEM_LOCK_MASK = RWSEM_WRITER_MASK | RWSEM_READER_MASK
-    RWSEM_READ_FAILED_MASK = (RWSEM_WRITER_MASK | RWSEM_FLAG_WAITERS | RWSEM_FLAG_HANDOFF | RWSEM_FLAG_READFAIL)
-
-    RWSEM_READER_OWNED = 0x1
-    RWSEM_NONSPINNABLE = 0x2
-    RWSEM_OWNER_FLAGS_MASK = (RWSEM_READER_OWNED | RWSEM_NONSPINNABLE)
 
     writer_locked = count & RWSEM_WRITER_LOCKED
     waiters_present = (count >> 1) & 1  # ✅ FIXED Extraction of Bit 1
