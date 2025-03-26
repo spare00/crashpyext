@@ -8,6 +8,7 @@ from pykdump.API import readSU  # Importing ePython API for VMcore analysis
 kernel_version = "Unknown"
 RHEL_VERSION = 8
 DEBUG = False
+is_readfail_reliable = True
 
 RWSEM_WRITER_LOCKED = 1 << 0
 RWSEM_FLAG_WAITERS  = 1 << 1
@@ -61,6 +62,14 @@ def get_architecture():
     print(f"Detected Architecture: {arch}")
     return arch
 
+def chk_readfail(count_raw):
+    bitwise_count = count_raw & 0xFFFFFFFFFFFFFFFF
+    logging(f"{count_raw} -> {bitwise_count}")
+
+    count_hex = hex(bitwise_count)
+    logging(F"RWSEM_FLAG_READFAIL: {RWSEM_FLAG_READFAIL}")
+    return (count_raw & RWSEM_FLAG_READFAIL) and not count_hex.startswith("0xf")
+
 task_state_array = {
     0x00: "TASK_RUNNING",
     0x01: "TASK_INTERRUPTIBLE",
@@ -104,68 +113,6 @@ KNOWN_RWSEM_STATES = [
     {"value": 5, "desc": "WRITER + HANDOFF"}
 ]
 
-def check_integrity(count, owner, signed_count, reader_owned, writer_task_struct):
-    """ Perform logical integrity checks on rw_semaphore values. """
-
-    issues = []
-
-    # Check if RWSEM_FLAG_READFAIL is set
-    if count & RWSEM_FLAG_READFAIL:
-        flags = []
-        if count & RWSEM_WRITER_LOCKED:
-            flags.append("WRITER_LOCKED")
-        if count & RWSEM_FLAG_WAITERS:
-            flags.append("WAITERS_PRESENT")
-        if count & RWSEM_FLAG_HANDOFF:
-            flags.append("HANDOFF")
-
-        if flags:
-            issues.append(f"ℹ️ RWSEM_FLAG_READFAIL set with: {', '.join(flags)} — likely a transitional contention state.")
-        else:
-            issues.append("ℹ️ RWSEM_FLAG_READFAIL set — benign reader acquisition failure (no other flags set).")
-
-        # ✅ Transitional state — skip strict checks
-        return issues
-
-    # Reader-associated state (not guaranteed active readers)
-    reader_bias_count = count & RWSEM_READER_MASK
-    if reader_bias_count > 0 and not (count & RWSEM_WRITER_LOCKED):
-        if RHEL_VERSION == 8:
-            if not reader_owned:
-                issues.append("ℹ️ Reader bias is present in `.count`, but RWSEM_READER_OWNED bit is not set — may be valid (fastpath), or worth reviewing.")
-            if writer_task_struct != 0 and not reader_owned:
-                issues.append("⚠️ Owner field is nonzero but RWSEM_READER_OWNED not set — possible stale writer, or early reader acquisition.")
-
-        elif RHEL_VERSION == 7:
-            if writer_task_struct != 0:
-                issues.append("⚠️ Unexpected: `.owner` should be 0 in RHEL 7 when readers hold the lock.")
-
-        if reader_bias_count % RWSEM_READER_BIAS != 0:
-            issues.append("⚠️ Reader count not aligned to RWSEM_READER_BIAS (256) — possible corruption or misinterpretation.")
-
-    # Transitional or negative count state (not strictly writer-held)
-    elif signed_count < 0:
-        if writer_task_struct == 0:
-            issues.append("🌀 `.count` is negative — transitional state or race possible. `owner` is null, which may be valid during unlock or reader release.")
-
-        if reader_owned:
-            issues.append("⚠️ Conflict: `owner` marked as reader, but `count` is negative — inconsistent state.")
-
-        if signed_count < -1:
-            issues.append("🌀 `.count < -1` likely indicates a reader release racing with unlock, not multiple writers. Check flags (WAITERS, HANDOFF).")
-
-    # Free lock
-    elif signed_count == 0:
-        if writer_task_struct != 0:
-            issues.append("⚠️ `owner` field not cleared: lock is free but `owner` is set.")
-
-    # Reserved bits check (bits 3–7)
-    reserved_mask = 0b11111000
-    if count & reserved_mask:
-        issues.append("⚠️ Reserved bits (3–7) are set — should be 0.")
-
-    return issues
-
 def to_binary(value, bits=64):
     """Convert signed integer to 64-bit two's complement binary string."""
     unsigned_count = value & 0xFFFFFFFFFFFFFFFF
@@ -189,9 +136,6 @@ def format_binary(count, arch="64-bit"):
     waiters_present = (count_unsigned >> 1) & 0x1
     writer_locked   = count_unsigned & 0x1
 
-    # Format full 64-bit binary string
-    raw_binary = f"{count_unsigned:064b}"
-
     # Construct grouped output like: 1 [reader] [reserved] 1 1 0
     formatted_binary = (
         f"{read_fail_bit} "
@@ -200,15 +144,7 @@ def format_binary(count, arch="64-bit"):
         f"{lock_handoff} {waiters_present} {writer_locked}"
     )
 
-    return (
-        formatted_binary,
-        str(read_fail_bit),
-        f"{reader_count:055b}",
-        f"{reserved_bits:05b}",
-        str(lock_handoff),
-        str(waiters_present),
-        str(writer_locked),
-    )
+    return formatted_binary
 
 def format_owner(owner):
     """ Format the owner field into its binary components. """
@@ -218,60 +154,177 @@ def format_owner(owner):
     nonspinnable = bin_str[-2]  # Bit 1 (RWSEM_NONSPINNABLE)
     task_ptr = owner & ~0x3
     task_address_bits = f"{task_ptr:064b}"[:-2]
-    #task_address_bits = bin_str[:-2]  # Remaining bits (task_struct address)
 
     formatted_binary = f"{task_address_bits} {nonspinnable} {reader_owned}"
 
-    return formatted_binary, reader_owned, nonspinnable, task_address_bits
+    return formatted_binary
 
-# Extension to analyze more realistic rw_semaphore.count states
-# Replaces or enhances a part of analyze_rw_semaphore()
+def get_task_state(task):
+    task_state_value = task.state if RHEL_VERSION < 8 else task.__state
+    state_flags = [name for bit, name in task_state_array.items() if task_state_value & bit]
+    state = " | ".join(state_flags) if state_flags else f"Unknown ({task_state_value})"
+    return state
 
-def explain_bits_combination(count, adjusted_reader_bias, is_readfail_real):
-    """Return list of active flags and interpreted description from .count"""
-    bitwise_count = count & 0xFFFFFFFFFFFFFFFF
+def get_owner_info(owner_address):
+    try:
+        owner_address = int(owner_address, 16) if isinstance(owner_address, str) else owner_address
+        owner_task = readSU("struct task_struct", owner_address)
+        pid = owner_task.pid
+        comm = owner_task.comm
+        state = get_task_state(owner_task)
+        return f"{hex(owner_address)} (PID: {pid}, COMM: {comm}, {state})"
+    except Exception as e:
+        print(f"Error accessing owner task at {hex(owner_address)}: {e}")
+        return hex(owner_address)
 
-    flags = []
-    if bitwise_count & RWSEM_WRITER_LOCKED:
-        flags.append("1(WRITER_LOCKED)")
-    if bitwise_count & RWSEM_FLAG_WAITERS:
-        flags.append("2(WAITERS)")
-    if bitwise_count & RWSEM_FLAG_HANDOFF:
-        flags.append("4(HANDOFF)")
-    if is_readfail_real & bitwise_count & RWSEM_FLAG_READFAIL:
-        flags.append("9223372036854775808(READFAIL)")
+def get_reader_count(count_raw, is_readfail_reliable):
+    reader_count = 0
+    if is_readfail_reliable:
+        reader_count = (count_raw - (count_raw & 0xFF)) >> 8
+    else:
+        reader_count = (-count_raw + (count_raw & 0xFF)) >> 8
 
-    reader_count = adjusted_reader_bias if not is_readfail_real else (bitwise_count & RWSEM_READER_MASK) >> 8
-    desc_parts = []
-    if flags:
-        desc_parts.append(" + ".join(flags) )
-    if reader_count > 0:
-        if is_readfail_real:
-            desc_parts.append(f"+{RWSEM_READER_BIAS * reader_count} ({reader_count} reader(s))")
+    logging(f"get_reader_count(): count: {count_raw}, is_readfail_reliable: {is_readfail_reliable}, readers: {reader_count}")
+    return reader_count
+
+def list_waiting_tasks(wait_list_addr):
+    """Return a list of tasks in the rw_semaphore's wait_list."""
+    print("\n**List of waiters in s wait_list**\n")
+    try:
+        command = f"list -s rwsem_waiter.task,type -l rwsem_waiter.list {wait_list_addr:#x}"
+        print(f"Executing: {command}\n")
+        output = exec_crash_command(command)
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        grouped = []
+        i = 0
+        while i < len(lines):
+            if i + 2 < len(lines):
+                print(f"{lines[i]}  {lines[i+1]}  {lines[i+2]}")
+                i += 3
+            else:
+                break
+    except Exception as e:
+        print(f"Error listing waiters for rw_semaphore at {hex(wait_list_addr)}: {e}")
+        return []
+
+def check_integrity(count, owner, reader_owned, owner_task_addr, is_readfail_reliable, reader_count, verbose=False):
+    """ Perform logical integrity checks on rw_semaphore values. """
+
+    issues = []
+
+    # Check if reliable RWSEM_FLAG_READFAIL is set
+    if is_readfail_reliable and (count & RWSEM_FLAG_READFAIL) == RWSEM_FLAG_READFAIL:
+        flags = []
+        if count & RWSEM_WRITER_LOCKED:
+            flags.append("WRITER_LOCKED")
+        if count & RWSEM_FLAG_WAITERS:
+            flags.append("WAITERS_PRESENT")
+        if count & RWSEM_FLAG_HANDOFF:
+            flags.append("HANDOFF")
+
+        if flags:
+            issues.append(f"ℹ️ RWSEM_FLAG_READFAIL set with: {', '.join(flags)} — likely a transitional contention state.")
         else:
-            desc_parts.append(f"{-RWSEM_READER_BIAS * reader_count} ({reader_count} reader(s))")
+            issues.append("ℹ️ RWSEM_FLAG_READFAIL set — benign reader acquisition failure (no other flags set).")
+
+        # ✅ Transitional state with racing or corrupted — skip strict checks
+        return issues
+
+    # Reader-associated state (not guaranteed active readers)
+    reader_bias_count = count & RWSEM_READER_MASK
+    if reader_bias_count > 0 and not (count & RWSEM_WRITER_LOCKED):
+        if RHEL_VERSION == 8:
+            if not reader_owned:
+                issues.append("ℹ️ Reader bias is present in `.count`, but RWSEM_READER_OWNED bit is not set — may be valid (fastpath), or worth reviewing.")
+            if writer_task_struct != 0 and not reader_owned:
+                issues.append("⚠️ Owner field is nonzero but RWSEM_READER_OWNED not set — possible stale writer, or early reader acquisition.")
+
+        elif RHEL_VERSION == 7:
+            if writer_task_struct != 0:
+                issues.append("⚠️ Unexpected: `.owner` should be 0 in RHEL 7 when readers hold the lock.")
+
+        if reader_bias_count % RWSEM_READER_BIAS != 0:
+            issues.append("⚠️ Reader count not aligned to RWSEM_READER_BIAS (256) — possible corruption or misinterpretation.")
+
+    # Transitional or negative count state (not strictly writer-held)
+    elif count < 0:
+        if reader_count > 0:
+            issues.append("🌀 `.count` is negative with negative reader bias. Reader release may not be properly completed due to racing.")
+
+        elif reader_count == 0:
+            issues.append("🌀 `.count` is negative without reader bias. Transitional state ipossibly with waiters or handoff or writer racing.")
+
+        else: # reader_count < 0
+            logging("Unexpected error state!")
+
+        if owner_task_addr == 0:
+            issues.append("🌀 `.count` is negative — transitional state or race possible. `owner` is null, which may be valid during unlock or reader release.")
+
+        if reader_owned:
+            issues.append("🌀 transitional: `owner` marked as reader, and `count` is negative. Reader release may not be properly completed due to racing.")
+
+        if count == -1:
+            issues.append("🌀 `.count < -1` likely indicates a writer release racing with unlock which be impossible as only 1 writer can hold the rw_semaphore.")
+
+    # Free lock
+    elif count == 0:
+        if owner_task_addr != 0:
+            issues.append("⚠️ `owner` field not cleared: lock is free but `owner` is set.")
+
+    # Reserved bits check (bits 3–7)
+    reserved_mask = 0b11111000
+    if count & reserved_mask:
+        issues.append("⚠️ Reserved bits (3–7) are set — should be 0.")
+
+    return issues
+
+def chk_count_bits(count_raw):
+    # Interpret count bitwise (64-bit) to extract flags regardless of sign
+    bitwise_count = count_raw & 0xFFFFFFFFFFFFFFFF
+    logging(f"bitwise_count: {bitwise_count}")
+    writer_b = bool(bitwise_count & RWSEM_WRITER_LOCKED)
+    waiters_b = bool(bitwise_count & RWSEM_FLAG_WAITERS)
+    handoff_b = bool(bitwise_count & RWSEM_FLAG_HANDOFF)
+    readfail_b = bool(bitwise_count & RWSEM_FLAG_READFAIL)
+
+    return bitwise_count, writer_b, waiters_b, handoff_b, readfail_b
+
+def explain_bits_combination(count, reader_count, is_readfail_reliable):
+    """Return list of active flags and interpreted description from .count"""
+    # Interpret count bitwise (64-bit) to extract flags regardless of sign
+    bitwise_count, writer, waiters, handoff, readfail = chk_count_bits(count)
+
+    count_bits = []
+    if writer: count_bits.append("1(WRITER_LOCKED)")
+    if waiters: count_bits.append("2(WAITERS)")
+    if handoff: count_bits.append("4(HANDOFF)")
+    if is_readfail_reliable & readfail: count_bits.append("9223372036854775808(READFAIL)")
+
+    desc_parts = []
+    if count_bits:
+        desc_parts.append(" + ".join(count_bits) )
+    logging(f"reader_count: {reader_count}")
+    if reader_count > 0:
+        if is_readfail_reliable:
+            desc_parts.append(f"+ {RWSEM_READER_BIAS * reader_count} ({reader_count} reader(s))")
+        else:
+            desc_parts.append(f"- {RWSEM_READER_BIAS * reader_count} ({reader_count} reader(s))")
 
     if not desc_parts:
         desc_parts.append("no bits or readers set")
 
-    return flags, reader_count, " ".join(desc_parts)
+    return " ".join(desc_parts)
 
-def classify_rwsem_state(count):
+def classify_rwsem_state(count_raw, is_readfail_reliable, reader_count, verbose=False):
     """Extended logic to classify the rw_semaphore count value"""
 
     flags = []
     state = ""
 
     # Interpret count bitwise (64-bit) to extract flags regardless of sign
-    bitwise_count = count & 0xFFFFFFFFFFFFFFFF
-    logging(f"bitwise_count: {bitwise_count}")
-    writer = bool(bitwise_count & RWSEM_WRITER_LOCKED)
-    waiters = bool(bitwise_count & RWSEM_FLAG_WAITERS)
-    handoff = bool(bitwise_count & RWSEM_FLAG_HANDOFF)
-    readfail = bool(bitwise_count & RWSEM_FLAG_READFAIL)
+    bitwise_count, writer, waiters, handoff, readfail = chk_count_bits(count_raw)
 
     count_hex = hex(bitwise_count)
-    is_readfail_real = (count & RWSEM_FLAG_READFAIL) and not count_hex.startswith("0xf")
 
     reserved_bits = (bitwise_count >> 3) & 0x1F
     raw_reader_bits = (bitwise_count >> 8) & ((1 << (63 - 8)) - 1)
@@ -284,21 +337,20 @@ def classify_rwsem_state(count):
     if handoff: flags.append("HANDOFF")
     if readfail: flags.append("READFAIL")
 
-    adjusted_reader_bias = 0
+    # Find a reliable reader count
+    reader_count = get_reader_count(count_raw, is_readfail_reliable)
 
     # 🧠 Special case: treat large negative counts with flags as likely race (e.g., -256, -1018)
-    logging(f"count: {count}, {(count & 0xFF)}, {readfail}")
-    if(waiters or handoff) and not is_readfail_real:
-        adjusted_reader_bias = ((-count + (count & 0xFF)) & RWSEM_READER_MASK) >> 8
-        logging(f"adjusted_reader_bias: {adjusted_reader_bias}")
-        reader_note = f"🌀 Transitional: derived {adjusted_reader_bias} reader(s) released during flag state."
+    logging(f"count: {count_raw}, {(count_raw & 0xFF)}, {readfail}")
+    if (waiters or handoff) and not is_readfail_reliable:
+        reader_note = f"🌀 Transitional: derived {reader_count} reader(s) released during flag state."
         reader_count_valid = False
 
     # Reader count validity analysis
-    elif not is_readfail_real:
+    elif not is_readfail_reliable:
         reader_note = "⚠️ Suspicious: extremely high reader count, likely due to corruption or race."
         reader_count_valid = False
-    elif reader_count == 0 and (count < 0) and not is_readfail_real:
+    elif reader_count == 0 and (count < 0) and not is_readfail_reliable:
         reader_note = "⚠️ Reader count is zero, but count is negative — possibly transitional or corrupted."
         reader_count_valid = False
     else:
@@ -306,11 +358,11 @@ def classify_rwsem_state(count):
         reader_count_valid = True
 
     # Classify known edge case first
-    if count == -1:
+    if count_raw == -1:
         state_type = "🌀 Transitional / Invalid"
         description = "-1 observed due to race condition between reader release and writer unlock — likely transient and invalid in steady state."
 
-    elif count == 0:
+    elif count_raw == 0:
         state_type = "✅ Stable"
         description = "Lock is free."
 
@@ -330,7 +382,7 @@ def classify_rwsem_state(count):
         state_type = "❗ Invalid"
         description = f"Writer and {reader_note} both appear to hold the lock — should not happen."
 
-    elif is_readfail_real:
+    elif is_readfail_reliable:
         state_type = "🌀 Transitional"
         description = "Reader failed to acquire the lock — likely fallback to queue."
 
@@ -353,11 +405,11 @@ def classify_rwsem_state(count):
     if reserved_bits:
         description += " Reserved bits (3–7) are set — unexpected."
 
-    matched_known = next((entry['desc'] for entry in KNOWN_RWSEM_STATES if count == entry['value']), None)
+    matched_known = next((entry['desc'] for entry in KNOWN_RWSEM_STATES if count_raw == entry['value']), None)
 
     # 🔍 Append breakdown from flag analyzer
-    _, _, combined_bits_desc = explain_bits_combination(count, adjusted_reader_bias, is_readfail_real)
-    description += f"\n  🧩  Bits Combination: {combined_bits_desc}"
+    combined_bits_desc = explain_bits_combination(count_raw, reader_count, is_readfail_reliable)
+    description += f"\n  🧩  Possible Bits Combination: {combined_bits_desc}"
 
     return {
         "flags": flags,
@@ -365,13 +417,16 @@ def classify_rwsem_state(count):
         "reader_note": reader_note,
         "reserved_bits": f"{reserved_bits:05b}",
         "state_type": state_type,
-        "description": description + (f"🔎 Matched known pattern: {matched_known}" if matched_known else ""),
+        "description": description + (f"\n  🔎  Matched known pattern: {matched_known}" if matched_known else ""),
         "raw_value": f"0x{bitwise_count:016x}"
     }
 
-def print_owner_bitfield(binary_owner, b_reader_owned, b_nonspinnable, owner_info, verbose=False):
-    print("\n🔍 **Breakdown of RW Semaphore Owner Field**")
-    print(f"Binary Value: {binary_owner}")
+def print_owner_bitfield(owner, owner_info, verbose=False):
+    # ✅ NEW: Breakdown of RW Semaphore Owner Field
+    binary_owner = format_owner(owner)
+
+    print("\n=== Breakdown of RW Semaphore Owner Field ===")
+    print(f"Binary:       {binary_owner}")
     print("                                                                             ^ ^")
     print("  🔄 Non-Spinnable Bit               ────────────────────────────────────────┘ |")
     print("  📖 Reader Owned Bit (Bit 0):       ──────────────────────────────────────────┘")
@@ -385,8 +440,12 @@ def print_owner_bitfield(binary_owner, b_reader_owned, b_nonspinnable, owner_inf
     else:
         print("  ℹ️ (RHEL 7) The `owner` field should only be set by writers.")
 
-def print_bitfield_breakdown(binary_output, b_read_fail, b_reader_count, b_reserved, b_handoff, b_waiters, b_writer_locked, verbose=False):
-    print("\n🔍 **Breakdown of RW Semaphore Count Field**")
+def print_count_bitfield_breakdown(count_raw, arch="64-bit", verbose=False):
+
+    # ✅ FIX: Restore `Binary Count` Output
+    binary_output = format_binary(count_raw,  arch)
+
+    print("\n=== Breakdown of RW Semaphore Count Field ===")
     print(f"Binary:    {binary_output}")
     print("           ^                                       ^                   ^   ^ ^ ^")
     print("  🟢 Read Fail Bit (Bit 63):                       |                   |   | | |")
@@ -405,96 +464,49 @@ def print_bitfield_breakdown(binary_output, b_read_fail, b_reader_count, b_reser
         print("  - Waiters: 1 = Tasks are waiting for the semaphore")
         print("  - Writer Locked: 1 = Semaphore is held exclusively by a writer")
 
-def analyze_rw_semaphore(count, owner, owner_info, arch="64-bit", verbose=False):
+def analyze_rw_semaphore(count, is_readfail_reliable, owner, arch="64-bit", verbose=False):
     """ Analyze the rw_semaphore state based on the given count and owner values. """
 
-    writer_locked = count & RWSEM_WRITER_LOCKED
-    waiters_present = (count >> 1) & 1  # ✅ FIXED Extraction of Bit 1
-    lock_handoff = (count >> 2) & 1  # ✅ FIXED Extraction of Bit 2
-    read_fail_bit = (count >> 63) & 1  # ✅ Extract Bit 63
+    # Interpret count bitwise (64-bit) to extract flags regardless of sign
+    bitwise_count, _, _, _, readfail = chk_count_bits(count)
 
-    reader_count = (count >> RWSEM_READER_SHIFT) if count >= 0 else 0
+    print(f"\n=== RW Semaphore Status ({arch}) ===")
+    print(f"Count Value:     0x{bitwise_count:016X} ({count})")
+
+    owner_address = owner & (2**64 - 1)
+
+    print(f"Owner Value:     {hex(owner_address)}")
+    print("====================================")
+
+    print_count_bitfield_breakdown(count, arch, verbose)
+
+    # Find a reliable reader count
+    reader_count = get_reader_count(count, is_readfail_reliable)
+
+    result = classify_rwsem_state(count, is_readfail_reliable, reader_count)
+    if result:
+        print("\n  🧠 Inferred State:")
+        print(f"  Flags Set: {', '.join(result['flags']) if result['flags'] else 'None'}")
+        print(f"  Number of Readers: {result['reader_count']}")
+        print(f"  {result['state_type']}: {result['description']}")
 
     reader_owned = owner & RWSEM_READER_OWNED
-    writer_task_struct = owner & ~RWSEM_OWNER_FLAGS_MASK
+    owner_task_addr = owner & ~RWSEM_OWNER_FLAGS_MASK
+
+    owner_info = get_owner_info(owner_address)
+
+    print_owner_bitfield(owner, owner_info, verbose)
 
     print(f"\n🚨 **RW Semaphore Integrity Check** 🚨")
 
     # ✅ Run the logical consistency checks
-    integrity_issues = check_integrity(count, owner, count, reader_owned, writer_task_struct)
+    integrity_issues = check_integrity(count, owner, reader_owned, owner_task_addr, is_readfail_reliable, reader_count, verbose)
 
     if integrity_issues:
         for issue in integrity_issues:
             print(issue)
     else:
         print("✅ **Semaphore state is logically consistent.**")
-
-    # ✅ FIX: Restore `Binary Count` Output
-    binary_output, b_read_fail, b_reader_count, b_reserved, b_handoff, b_waiters, b_writer_locked = format_binary(count,  arch)
-
-    unsigned_count = count & 0xFFFFFFFFFFFFFFFF
-
-    print(f"\n=== RW Semaphore Status ({arch}) ===")
-    print(f"Count Value:     0x{unsigned_count:016X} ({count})")
-
-    owner_address = owner & (2**64 - 1)
-
-    print(f"Owner Value:     {hex(owner_address)}")
-    print("========================\n")
-
-    print_bitfield_breakdown(binary_output, b_read_fail, b_reader_count, b_reserved, b_handoff, b_waiters, b_writer_locked, verbose)
-
-    result = classify_rwsem_state(count)
-    if result:
-        print("\n  🧠 Inferred State:")
-        print(f"  Flags Set: {', '.join(result['flags']) if result['flags'] else 'None'}")
-        print(f"  Reader Count: {result['reader_count']}")
-        print(f"  Reserved Bits: {result['reserved_bits']}")
-        print(f"  Raw Value: {result['raw_value']}")
-        print(f"  {result['state_type']}: {result['description']}")
-
-    # ✅ NEW: Breakdown of RW Semaphore Owner Field
-    binary_owner, b_reader_owned, b_nonspinnable, b_task_address = format_owner(owner)
-
-    print_owner_bitfield(binary_owner, b_reader_owned, b_nonspinnable, owner_info, verbose)
-
-def get_task_state(task):
-    task_state_value = task.state if RHEL_VERSION < 8 else task.__state
-    state_flags = [name for bit, name in task_state_array.items() if task_state_value & bit]
-    state = " | ".join(state_flags) if state_flags else f"Unknown ({task_state_value})"
-    return state
-
-def get_owner_info(owner_address):
-    try:
-        owner_address = int(owner_address, 16) if isinstance(owner_address, str) else owner_address
-        owner_task = readSU("struct task_struct", owner_address)
-        pid = owner_task.pid
-        comm = owner_task.comm
-        state = get_task_state(owner_task)
-        return f"{hex(owner_address)} (PID: {pid}, COMM: {comm}, {state})"
-    except Exception as e:
-        print(f"Error accessing owner task at {hex(owner_address)}: {e}")
-        return hex(owner_address)
-
-def list_waiting_tasks(wait_list_addr):
-    """Return a list of tasks in the rw_semaphore's wait_list."""
-    print("\n**List of waiters in s wait_list**\n")
-    try:
-        command = f"list -s rwsem_waiter.task,type -l rwsem_waiter.list {wait_list_addr:#x}"
-        print(f"Executing: {command}\n")
-        output = exec_crash_command(command)
-        lines = [line.strip() for line in output.splitlines() if line.strip()]
-        grouped = []
-        i = 0
-        while i < len(lines):
-            if i + 2 < len(lines):
-                print(f"{lines[i]}  {lines[i+1]}  {lines[i+2]}")
-                i += 3
-            else:
-                break
-    except Exception as e:
-        print(f"Error listing waiters for rw_semaphore at {hex(wait_list_addr)}: {e}")
-        return []
 
 def analyze_rw_semaphore_from_vmcore(rw_semaphore_addr, list_waiters=False, verbose=False, debug=False):
     """ Read rw_semaphore structure from VMcore and analyze its state. """
@@ -503,7 +515,11 @@ def analyze_rw_semaphore_from_vmcore(rw_semaphore_addr, list_waiters=False, verb
     rwsem = readSU("struct rw_semaphore", rw_semaphore_addr)
 
     # Extract fields
-    count = rwsem.count.counter  # Ensure correct extraction of counter value
+    count_raw = rwsem.count.counter  # Ensure correct extraction of counter value
+
+    # See if the readfail is reliable before using the readfail bit
+    is_readfail_reliable = chk_readfail(count_raw)
+    logging(f"is_readfail_reliable: {is_readfail_reliable}")
 
     # Detect RHEL version and architecture automatically
     arch = get_architecture()
@@ -515,8 +531,6 @@ def analyze_rw_semaphore_from_vmcore(rw_semaphore_addr, list_waiters=False, verb
     owner_address = owner_raw & ~0x07
     owner_address = owner_address & (2**64 - 1)
 
-    owner_info = get_owner_info(owner_address)
-
     # Print raw structure data if debug mode is enabled
     if verbose:
         print("\n🔍 **Raw rw_semaphore Structure Data:**")
@@ -524,7 +538,7 @@ def analyze_rw_semaphore_from_vmcore(rw_semaphore_addr, list_waiters=False, verb
         print(raw_output)
 
     # Call existing analysis function with both raw owner and formatted owner info
-    analyze_rw_semaphore(count, owner_raw, owner_info, arch, verbose)
+    analyze_rw_semaphore(count_raw, is_readfail_reliable, owner_raw, arch, verbose)
 
     if list_waiters:
         list_waiting_tasks(rwsem.wait_list)
