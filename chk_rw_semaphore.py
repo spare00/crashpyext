@@ -165,17 +165,17 @@ def get_task_state(task):
     state = " | ".join(state_flags) if state_flags else f"Unknown ({task_state_value})"
     return state
 
-def get_owner_info(owner_address):
+def get_owner_info(owner_flag_masked):
     try:
-        owner_address = int(owner_address, 16) if isinstance(owner_address, str) else owner_address
+        owner_address = int(owner_flag_masked, 16) if isinstance(owner_flag_masked, str) else owner_flag_masked
         owner_task = readSU("struct task_struct", owner_address)
         pid = owner_task.pid
         comm = owner_task.comm
         state = get_task_state(owner_task)
-        return f"{hex(owner_address)} (PID: {pid}, COMM: {comm}, {state})"
+        return f"{hex(owner_flag_masked)} (PID: {pid}, COMM: {comm}, {state})"
     except Exception as e:
-        print(f"Error accessing owner task at {hex(owner_address)}: {e}")
-        return hex(owner_address)
+        print(f"Error accessing owner task at {hex(owner_flag_masked)}: {e}")
+        return hex(owner_raw)
 
 def get_reader_count(count_raw, is_readfail_reliable):
     reader_count = 0
@@ -493,7 +493,7 @@ def analyze_rw_semaphore(count, is_readfail_reliable, owner, arch="64-bit", verb
     reader_owned = owner & RWSEM_READER_OWNED
     owner_task_addr = owner & ~RWSEM_OWNER_FLAGS_MASK
 
-    owner_info = get_owner_info(owner_address)
+    owner_info = get_owner_info(owner_task_addr)
 
     print_owner_bitfield(owner, owner_info, verbose)
 
