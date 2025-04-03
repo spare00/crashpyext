@@ -175,7 +175,7 @@ def get_owner_info(owner_flag_masked):
         return f"{hex(owner_flag_masked)} (PID: {pid}, COMM: {comm}, {state})"
     except Exception as e:
         print(f"Error accessing owner task at {hex(owner_flag_masked)}: {e}")
-        return hex(owner_raw)
+        return hex(owner_flag_masked)
 
 def get_reader_count(count_raw, is_readfail_reliable):
     reader_count = 0
