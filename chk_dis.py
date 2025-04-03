@@ -87,7 +87,12 @@ def disassemble_addresses_with_push_values(addresses, frames, debug=False):
             print("[WARNING] No disassembly output.")
             continue
 
-        stack_vals = parse_bt_frame_stack(frame, debug=debug)
+        if frame == frames[-1]:  # skip the deepest frame (e.g., entry_SYSCALL_64)
+            stack_vals = []
+            if debug:
+                print(f"[DEBUG] Skipping deepest frame #{frame}")
+        else:
+            stack_vals = parse_bt_frame_stack(frame, debug=debug)
 
         # Track push order dynamically
         push_index = 0
