@@ -75,7 +75,31 @@ def get_frame_rsp(frame_num):
 
     raise ValueError(f"Could not find RSP for frame #{frame_num}")
 
-def disassemble_addresses_with_push_values(addresses, frames, debug=False):
+def annotate_pop_or_lea(instr_line, rsp, debug=False):
+    instr = instr_line.strip().split(":", 1)[-1].strip()
+    try:
+        if instr.startswith("pop"):
+            match = re.search(r"pop\s+(%\w+)", instr)
+            if not match:
+                return instr_line
+            reg = match.group(1)
+            val = readU64(rsp)
+            annotated = f"{instr_line.rstrip():<60} {YELLOW}; {val:#018x}{RESET}"
+            return annotated
+
+        elif instr.startswith("lea"):
+            # lea = mov %rbp, %rsp; pop %rbp
+            rbp = get_reg("rbp")
+            popped_val = readU64(rbp)
+            msg = f"{instr_line.rstrip():<60} {MAGENTA}; %rsp ← %rbp ({rbp:#x}), pop %rbp = {popped_val:#018x}{RESET}"
+            return msg
+
+    except Exception as e:
+        if debug:
+            print(f"[DEBUG] pop/lea annotation failed: {e}")
+    return instr_line
+
+def disassemble_addresses_with_push_values(addresses, frames, deepest_frame, debug=False):
     for addr, frame in zip(reversed(addresses), reversed(frames)):
         comm = f"dis -rl {addr}"
         print(f"\n\033[96m\033[1m--- {comm} (frame #{frame}) ---\033[0m\n")
@@ -87,7 +111,7 @@ def disassemble_addresses_with_push_values(addresses, frames, debug=False):
             print("[WARNING] No disassembly output.")
             continue
 
-        if frame == frames[-1]:  # skip the deepest frame (e.g., entry_SYSCALL_64)
+        if frame == deepest_frame:  # skip the deepest frame (e.g., entry_SYSCALL_64)
             stack_vals = []
             if debug:
                 print(f"[DEBUG] Skipping deepest frame #{frame}")
@@ -105,6 +129,13 @@ def disassemble_addresses_with_push_values(addresses, frames, debug=False):
                 val = stack_vals[push_index]
                 print(f"{line:<60} \033[93m; {val}\033[0m")
                 push_index += 1
+                continue
+
+            # Handle pop/leave
+            if any(op in line for op in ("pop", "leave")):
+                rsp = get_frame_rsp(frame)
+                annotated = annotate_pop_or_lea(line, rsp, debug=debug)
+                print(annotated)
                 continue
 
             # Highlight RSP-relative memory references
@@ -177,9 +208,22 @@ def disassemble_addresses_with_push_values(addresses, frames, debug=False):
             else:
                 print(line)
 
+def get_deepest_frame_number_from_bt_lines(lines):
+    """Extract the highest frame number from a bt -f output."""
+    deepest = 0
+    for line in lines:
+        if line.strip().startswith("#"):
+            try:
+                frame_num = int(line.strip().split()[0][1:])
+                deepest = max(deepest, frame_num)
+            except:
+                continue
+    return deepest
 
 def get_bt_addresses_exception_to_frame(upto_frame, debug=False):
     lines = exec_crash_command("bt -f").splitlines()
+    deepest_frame = get_deepest_frame_number_from_bt_lines(lines)
+
     start_index = None
     end_marker = f"#{upto_frame}"
     addresses = []
@@ -193,7 +237,7 @@ def get_bt_addresses_exception_to_frame(upto_frame, debug=False):
             break
     else:
         print(f"[ERROR] Could not find 'exception RIP' or frame #{upto_frame}")
-        return [], []
+        return [], [], None
 
     for line in target_lines:
         tokens = line.strip().split()
@@ -203,11 +247,13 @@ def get_bt_addresses_exception_to_frame(upto_frame, debug=False):
             if debug:
                 print(f"[DEBUG] Frame #{frames[-1]} => {addresses[-1]}")
 
-    return addresses, frames
+    return addresses, frames, deepest_frame  # deepest frame #
 
 
 def get_bt_addresses_range(start_frame, end_frame, debug=False):
     lines = exec_crash_command("bt -f").splitlines()
+    deepest_frame = get_deepest_frame_number_from_bt_lines(lines)
+
     addresses = []
     frames = []
     capturing = False
@@ -228,8 +274,7 @@ def get_bt_addresses_range(start_frame, end_frame, debug=False):
     if not addresses and debug:
         print(f"[DEBUG] No addresses found between #{start_frame} and #{end_frame}")
 
-    return addresses, frames
-
+    return addresses, frames, deepest_frame
 
 # --- Main ---
 if __name__ == "__main__":
@@ -240,12 +285,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if len(args.frames) == 1:
-        addrs, frame_ids = get_bt_addresses_exception_to_frame(args.frames[0], debug=args.debug)
+        addrs, frame_ids, deepest_frame = get_bt_addresses_exception_to_frame(args.frames[0], debug=args.debug)
     elif len(args.frames) == 2:
-        addrs, frame_ids = get_bt_addresses_range(args.frames[0], args.frames[1], debug=args.debug)
+        addrs, frame_ids, deepest_frame = get_bt_addresses_range(args.frames[0], args.frames[1], debug=args.debug)
     else:
         print("[ERROR] Use chk_dis <frame> or chk_dis <start> <end>")
         sys.exit(1)
 
-    disassemble_addresses_with_push_values(addrs, frame_ids, debug=args.debug)
-
+    disassemble_addresses_with_push_values(addrs, frame_ids, deepest_frame, debug=args.debug)
