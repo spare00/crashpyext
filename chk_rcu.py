@@ -2,6 +2,17 @@ import argparse
 from pykdump import *
 from LinuxDump import percpu
 
+QS_WAIT_WARN_JIFFIES = 10000  # Example threshold for flagging long waits (adjustable)
+HZ = 1000  # Jiffies per second (can be system-specific)
+
+def get_current_jiffies():
+    """Read the current jiffies value."""
+    try:
+        return int(readSymbol("jiffies"))
+    except Exception:
+        print("Warning: Could not read jiffies.")
+        return None
+
 def get_symbol_addr(symbol):
     """Get the address of a kernel symbol."""
     try:
@@ -66,6 +77,7 @@ def get_rcu_state(rhel_version, verbose=False, debug=False):
 
         if rhel_version == 7:
             in_progress = rcu_state.completed != rcu_state.gpnum
+            gp_start = getattr(rcu_state, "gp_start", None)
             print(f"Last Completed Grace Period: {rcu_state.completed}")
             print(f"Current Grace Period: {rcu_state.gpnum}")
         else:
@@ -73,9 +85,10 @@ def get_rcu_state(rhel_version, verbose=False, debug=False):
             gps = rcu_state.gp_start
             js = rcu_state.jiffies_stall
             gs2 = rcu_state.gp_seq
-
+            print(f"gps: {gps}")
             in_progress = gs1 & 0b11
             stalled = (gs1 == gs2) and (gps < js)
+            gp_start = gps
 
             print(f"Current GP Sequence Number: {gs1}")
             print(f"Grace Period Start Timestamp: {gps}")
@@ -92,19 +105,28 @@ def get_rcu_state(rhel_version, verbose=False, debug=False):
         if verbose:
             print(f"\n[Verbose] Raw RCU State:\n{rcu_state}")
 
-        return rcu_state
+        return rcu_state, in_progress, gp_start
     except Exception as e:
         print(f"Failed to read RCU state: {e}")
         return None
 
-def get_per_cpu_rcu_data(rcu_state, rhel_version, verbose=False, debug=False):
+def get_per_cpu_rcu_data(rcu_state, rhel_version, verbose=False, debug=False, gp_in_progress=False, gp_start=None):
     cpu_count_val = get_cpu_count()
     if cpu_count_val == 0:
         print("Error: No CPUs detected, cannot proceed with per-CPU data.")
         return
 
+    jiffies_now = get_current_jiffies()
+    if jiffies_now is not None and gp_start is not None:
+        gp_duration = jiffies_now - gp_start
+        print(f"\n🕒 GP Duration (jiffies): {gp_duration}")
+    else:
+        gp_duration = None
+
     print("\n=== Per-CPU RCU Status ===")
-    print(f"{'🔹 CPU':<10} {'📌 GP Sequence':<16} {'🚦 Awaiting Quiescence':<22} {'🚦 GP In Progress'}")
+    print(f"{'🔹 CPU':<6} {'📌 GP Sequence':<16} {'🚦 Awaiting QS':<14} {'🚦 GP In Progress':<20} {'⏱️ Time since GP start(jiffies)'}")
+
+    any_qs_pending = False
 
     for cpu in range(cpu_count_val):
         try:
@@ -124,13 +146,45 @@ def get_per_cpu_rcu_data(rcu_state, rhel_version, verbose=False, debug=False):
             gp_value = getattr(rcu_data, gp_field, 'N/A')
             qs_value = getattr(rcu_data, qs_field, 'N/A') if hasattr(rcu_data, qs_field) else "⚠️ Unknown"
 
-            print(f"   {cpu:<11} {gp_value:<17} {'True' if qs_value else 'False':<23} {'✅' if in_progress else '⛔'}")
+            qs_value = getattr(rcu_data, qs_field, 'N/A') if hasattr(rcu_data, qs_field) else "⚠️ Unknown"
+            qs_pending = bool(qs_value)
+
+            if qs_pending:
+                any_qs_pending = True
+
+            time_in_gp = (jiffies_now - gp_start) if (jiffies_now and gp_start) else "N/A"
+
+            if not qs_pending:
+                wait_after_qs = (jiffies_now - gp_start) if (jiffies_now and gp_start) else "N/A"
+            else:
+                wait_after_qs = 0
+
+            # Calculate human-readable time
+            if isinstance(wait_after_qs, int) and wait_after_qs > 0:
+                wait_sec = round(wait_after_qs / HZ, 1)
+                wait_str = f"{wait_sec}s ({wait_after_qs})"
+            else:
+                wait_str = "0s (0)" if wait_after_qs == 0 else "N/A"
+
+            # Highlight long waits
+            if isinstance(wait_after_qs, int) and wait_after_qs >= QS_WAIT_WARN_JIFFIES:
+                wait_flag = "⚠️"
+            else:
+                wait_flag = ""
+
+            print(f"   {cpu:<7} {gp_value:<17} {'True' if qs_pending else 'False':<15} "
+                    f"{'⏳' if in_progress else '✔️':16}  ⏱️ {wait_str} {wait_flag}")
 
             if debug:
                 print(f"      [Debug] rcu_data[{cpu}]: <struct rcu_data {addr:#x}>")
 
         except Exception as e:
             print(f"   {cpu:<10} ❌ Failed to read RCU data: {e}")
+
+    # 🛑 Add warning if no CPUs have QS pending, but GP still in progress
+    if not any_qs_pending and gp_in_progress:
+        print("\n⚠️ Warning: All CPUs have reported QS, but GP has not completed.")
+        print("   → This may indicate an RCU stall or scheduling issue (common on virtualized guests).")
 
 def show_info():
     print("""
@@ -165,9 +219,9 @@ def show_info():
                     [RCU Subsystem Starts GP]
                               |
                               v
-                +-----------------------------+
-                | Mark all CPUs as needing QS |
-                +-----------------------------+
+            +-------------------------------------------+
+            | Mark all CPUs as needing Quiescence State |
+            +-------------------------------------------+
                               |
                               v
      +-------------------+   +-------------------+   +-------------------+
@@ -206,9 +260,9 @@ def main():
     print(f"⚠️ Panic Message: {panic_message}")
     print(f"🖥️ Kernel Version: {kernel_version} (Detected RHEL {rhel_version})")
 
-    rcu_state = get_rcu_state(rhel_version, verbose, debug)
+    rcu_state, in_progress, gp_start = get_rcu_state(rhel_version, verbose, debug)
     if rcu_state:
-        get_per_cpu_rcu_data(rcu_state, rhel_version, verbose, debug)
+        get_per_cpu_rcu_data(rcu_state, rhel_version, verbose, debug, in_progress, gp_start)
 
     if verbose:
         show_info()
