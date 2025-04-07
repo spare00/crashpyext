@@ -50,7 +50,7 @@ def detect_rhel_version(kernel_version):
     else:
         return 9  # Default to RHEL9+ if unknown
 
-def get_rcu_state(rhel_version, verbose=False):
+def get_rcu_state(rhel_version, verbose=False, debug=False):
     rcu_state_symbol = "rcu_sched_state" if rhel_version == 7 else "rcu_state"
     rcu_state_addr = get_symbol_addr(rcu_state_symbol)
     if not rcu_state_addr:
@@ -60,9 +60,9 @@ def get_rcu_state(rhel_version, verbose=False):
     try:
         rcu_state = readSU("struct rcu_state", rcu_state_addr)
         print("\n=== Global RCU State ===")
-        if verbose:
-            print(f"RCU symbol: {rcu_state_symbol}")
-            print(f"Address: 0x{rcu_state_addr:x}")
+
+        if debug:
+            print(f"[Debug] {rcu_state_symbol} @ 0x{rcu_state_addr:x}")
 
         if rhel_version == 7:
             in_progress = rcu_state.completed != rcu_state.gpnum
@@ -72,9 +72,9 @@ def get_rcu_state(rhel_version, verbose=False):
             gs1 = rcu_state.gp_seq
             gps = rcu_state.gp_start
             js = rcu_state.jiffies_stall
-            gs2 = rcu_state.gp_seq  # Re-check for stall detection
+            gs2 = rcu_state.gp_seq
 
-            in_progress = gs1 & 0b11  # Lower 2 bits indicate state
+            in_progress = gs1 & 0b11
             stalled = (gs1 == gs2) and (gps < js)
 
             print(f"Current GP Sequence Number: {gs1}")
@@ -97,7 +97,7 @@ def get_rcu_state(rhel_version, verbose=False):
         print(f"Failed to read RCU state: {e}")
         return None
 
-def get_per_cpu_rcu_data(rcu_state, rhel_version, verbose=False):
+def get_per_cpu_rcu_data(rcu_state, rhel_version, verbose=False, debug=False):
     cpu_count_val = get_cpu_count()
     if cpu_count_val == 0:
         print("Error: No CPUs detected, cannot proceed with per-CPU data.")
@@ -109,12 +109,14 @@ def get_per_cpu_rcu_data(rcu_state, rhel_version, verbose=False):
     for cpu in range(cpu_count_val):
         try:
             if rhel_version == 7:
-                rcu_data = readSU("struct rcu_data", percpu.get_cpu_var("rcu_sched_data")[cpu])
+                addr = percpu.get_cpu_var("rcu_sched_data")[cpu]
+                rcu_data = readSU("struct rcu_data", addr)
                 gp_field = "gpnum"
                 qs_field = "qs_pending"
                 in_progress = rcu_data.gpnum != rcu_state.completed
             else:
-                rcu_data = readSU("struct rcu_data", percpu.get_cpu_var("rcu_data")[cpu])
+                addr = percpu.get_cpu_var("rcu_data")[cpu]
+                rcu_data = readSU("struct rcu_data", addr)
                 gp_field = "gp_seq"
                 qs_field = "core_needs_qs"
                 in_progress = (rcu_data.gp_seq & 0b11) != 0
@@ -124,8 +126,8 @@ def get_per_cpu_rcu_data(rcu_state, rhel_version, verbose=False):
 
             print(f"   {cpu:<11} {gp_value:<17} {'True' if qs_value else 'False':<23} {'✅' if in_progress else '⛔'}")
 
-            if verbose:
-                print(f"      [Verbose] rcu_data[{cpu}]: {rcu_data}")
+            if debug:
+                print(f"      [Debug] rcu_data[{cpu}]: <struct rcu_data {addr:#x}>")
 
         except Exception as e:
             print(f"   {cpu:<10} ❌ Failed to read RCU data: {e}")
@@ -190,8 +192,11 @@ Tip: Use '-v' to see raw structure contents for advanced debugging.
 def main():
     parser = argparse.ArgumentParser(description="RCU state checker for crash VMcore analysis.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument("-d", "--debug", action="store_true", help="Show debug info (struct addresses, symbols)")
+
     args = parser.parse_args()
     verbose = args.verbose
+    debug = args.debug
 
     print("=== 🛠️ RCU Status Check ===")
     panic_time, panic_message, kernel_version = get_panic_info()
@@ -201,9 +206,9 @@ def main():
     print(f"⚠️ Panic Message: {panic_message}")
     print(f"🖥️ Kernel Version: {kernel_version} (Detected RHEL {rhel_version})")
 
-    rcu_state = get_rcu_state(rhel_version, verbose)
+    rcu_state = get_rcu_state(rhel_version, verbose, debug)
     if rcu_state:
-        get_per_cpu_rcu_data(rcu_state, rhel_version, verbose)
+        get_per_cpu_rcu_data(rcu_state, rhel_version, verbose, debug)
 
     if verbose:
         show_info()
