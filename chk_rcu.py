@@ -98,9 +98,9 @@ def get_rcu_state(rhel_version, verbose=False, debug=False):
                 print("⚠️ Warning: RCU stall detected! The grace period may not be progressing.")
 
         if in_progress:
-            print("✅ RCU grace period is currently in progress.")
+            print("⏳ RCU grace period is currently in progress.")
         else:
-            print("⛔ No active RCU grace period detected.")
+            print("✔️  No active RCU grace period detected.")
 
         if verbose:
             print(f"\n[Verbose] Raw RCU State:\n{rcu_state}")
