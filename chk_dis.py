@@ -20,6 +20,26 @@ BOLD    = '\033[1m'
 # Callee-saved registers we care about, for validation
 CALLEE_SAVED_REGS = {"%r15", "%r14", "%r13", "%r12", "%rbp", "%rbx"}
 
+def get_dis_symbol_context(addr, before_lines=1, debug=False):
+    """
+    Run 'dis -s <addr>' and return `*` line with N lines before it.
+    """
+    output = exec_crash_command(f"dis -s {addr}")
+    lines = output.strip().splitlines()
+
+    for i, line in enumerate(lines):
+        if line.strip().startswith("*"):
+            start = max(i - before_lines, 0)
+            selected = lines[start:i + 1]
+            if debug:
+                print(f"[DEBUG] Symbol context for {addr}")
+                print(f"start: {start}")
+                print(f"selected: {selected}")
+                print(f"before_lines: {before_lines}")
+            return "\n".join(selected)
+
+    return ""
+
 def parse_bt_frame_stack(frame_num, debug=False):
     bt_output = exec_crash_command("bt -f")
     lines = bt_output.splitlines()
@@ -148,7 +168,18 @@ def disassemble_addresses_with_push_values(addresses, frames, deepest_frame, deb
         stack_vals = stack_vals[1:]
         push_index = 0
         pop_index = len(stack_vals) - 1
+
         for line in output.splitlines():
+            stripped = line.strip()
+
+            # If line starts with an address, call dis symbol context
+            if stripped.startswith("0x"):
+                addr_match = re.match(r"0x[0-9a-fA-F]+", stripped)
+                if addr_match:
+                    sym_output = get_dis_symbol_context(addr_match.group(0), before_lines=args.lines - 1, debug=debug)
+                    if sym_output:
+                        print(f"{sym_output}")
+
             stripped_line = line.strip()
 
             # Annotate push
@@ -288,6 +319,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Disassemble and annotate pushed register values")
     parser.add_argument("frames", metavar="N", type=int, nargs="+",
                         help="One frame number (exception RIP to frame), or a start and end range")
+    parser.add_argument("-l", "--lines", type=int, default=2,
+                    help="Number of lines to show from dis -s <addr> (default: 2)")
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
     args = parser.parse_args()
 
@@ -330,4 +363,5 @@ if __name__ == "__main__":
         sys.exit(1)
 
     disassemble_addresses_with_push_values(addrs, frame_ids, deepest_frame, debug=args.debug)
+
 
