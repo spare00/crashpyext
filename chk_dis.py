@@ -5,6 +5,8 @@ import sys
 import argparse
 import re
 
+EXCEPTION_RSP = None  # populated dynamically when needed
+
 # ANSI color codes
 RED     = '\033[91m'
 GREEN   = '\033[92m'
@@ -22,16 +24,44 @@ def parse_bt_frame_stack(frame_num, debug=False):
     bt_output = exec_crash_command("bt -f")
     lines = bt_output.splitlines()
     stack_vals = []
+
+    MAX_PUSHES = 6  # for tg3_poll_work and similar prologues
+
+    if frame_num == "exception":
+        found = False
+        for line in lines:
+            if "[exception RIP:" in line:
+                found = True
+                continue
+            if found:
+                if line.strip().startswith("#"):  # next frame
+                    break
+                if ":" in line:
+                    try:
+                        _, data = line.strip().split(":", 1)
+                        matches = re.findall(r"[0-9a-fA-F]{16}", data)
+                        if matches:
+                            if debug:
+                                print(f"[DEBUG] Exception stack line: {line.strip()} => {matches}")
+                            stack_vals.extend(matches)
+                    except:
+                        continue
+        stack_vals = stack_vals[::-1]
+        trimmed = stack_vals[:MAX_PUSHES + 1]
+        if debug:
+            print(f"[DEBUG] Parsed {len(trimmed)} exception stack entries (including return address)")
+        return trimmed
+
+    # Normal frame
     frame_pattern = re.compile(rf"^#{frame_num}\b")
     found = False
-
     for line in lines:
         if not found and frame_pattern.match(line.strip()):
             found = True
             continue
         if found:
             if line.strip().startswith("#"):
-                break  # end of this frame
+                break
             parts = line.strip().split(":", 1)
             if len(parts) != 2:
                 continue
@@ -42,20 +72,19 @@ def parse_bt_frame_stack(frame_num, debug=False):
                     print(f"[DEBUG] Line: {line.strip()} => {matches}")
                 stack_vals.extend(matches)
 
-    # reverse the full stack to go bottom-to-top
     stack_vals = stack_vals[::-1]
-
+    trimmed = stack_vals[:MAX_PUSHES + 1]
     if debug:
-        print(f"[DEBUG] Parsed {len(stack_vals)} stack values from frame #{frame_num}")
-        print(f"[DEBUG] Skipping return address: {stack_vals[0] if stack_vals else 'N/A'}")
-        print(f"[DEBUG] Stack values before slicing: {stack_vals}")
-
-    if len(stack_vals) < 2:
-        return []
-
-    return stack_vals[1:]  # skip return address (first word from bottom-right)
+        print(f"[DEBUG] Parsed {len(trimmed)} stack values from frame #{frame_num} (including return addr)")
+    return trimmed
 
 def get_frame_rsp(frame_num):
+    if frame_num == "exception":
+        if EXCEPTION_RSP is not None:
+            return EXCEPTION_RSP
+        else:
+            raise ValueError("Exception RSP not initialized.")
+
     bt_output = exec_crash_command("bt -f")
     lines = bt_output.splitlines()
     frame_pattern = re.compile(rf"^#{frame_num}\s+\[([0-9a-fA-F]+)\]")
@@ -66,12 +95,11 @@ def get_frame_rsp(frame_num):
             found = True
             continue
         if found:
-            # Find first stack line after frame header
             if ":" in line:
                 addr_str = line.strip().split(":")[0]
                 return int(addr_str, 16)
             elif line.strip().startswith("#"):
-                break  # Next frame started, nothing found
+                break
 
     raise ValueError(f"Could not find RSP for frame #{frame_num}")
 
@@ -88,9 +116,8 @@ def annotate_pop_or_lea(instr_line, rsp, debug=False):
             return annotated
 
         elif instr.startswith("lea"):
-            # lea = mov %rbp, %rsp; pop %rbp
             rbp = get_reg("rbp")
-            popped_val = readU64(rbp)
+            popped_val = readU64(rsp)
             msg = f"{instr_line.rstrip():<60} {MAGENTA}; %rsp ← %rbp ({rbp:#x}), pop %rbp = {popped_val:#018x}{RESET}"
             return msg
 
@@ -101,8 +128,9 @@ def annotate_pop_or_lea(instr_line, rsp, debug=False):
 
 def disassemble_addresses_with_push_values(addresses, frames, deepest_frame, debug=False):
     for addr, frame in zip(reversed(addresses), reversed(frames)):
+        frame_str = f"frame #{frame}" if isinstance(frame, int) else f"frame {frame}"
         comm = f"dis -rl {addr}"
-        print(f"\n\033[96m\033[1m--- {comm} (frame #{frame}) ---\033[0m\n")
+        print(f"\n\033[96m\033[1m--- {comm} ({frame_str}) ---\033[0m\n")
         if debug:
             print(f"[DEBUG] Running: {comm}")
 
@@ -111,44 +139,38 @@ def disassemble_addresses_with_push_values(addresses, frames, deepest_frame, deb
             print("[WARNING] No disassembly output.")
             continue
 
-        if frame == deepest_frame:  # skip the deepest frame (e.g., entry_SYSCALL_64)
-            stack_vals = []
-            if debug:
-                print(f"[DEBUG] Skipping deepest frame #{frame}")
-        else:
+        stack_vals = []
+        if frame != deepest_frame:
             stack_vals = parse_bt_frame_stack(frame, debug=debug)
+            if debug:
+                print(f"[DEBUG] stack_vals (raw): {stack_vals}")
 
-        # Track push order dynamically
+        stack_vals = stack_vals[1:]
         push_index = 0
-        push_instructions = []
+        pop_index = len(stack_vals) - 1
         for line in output.splitlines():
-            # Highlight push values if available
-            match = re.search(r"push\s+(%\w+)", line)
-            if match and push_index < len(stack_vals):
-                reg = match.group(1)
+            stripped_line = line.strip()
+
+            # Annotate push
+            if 'push' in line and push_index < len(stack_vals):
                 val = stack_vals[push_index]
-                print(f"{line:<60} \033[93m; {val}\033[0m")
+                print(f"{line:<60} {YELLOW}; {val}{RESET}")
                 push_index += 1
                 continue
 
-            # Handle pop/leave
-            if any(op in line for op in ("pop", "leave")):
-                rsp = get_frame_rsp(frame)
-                annotated = annotate_pop_or_lea(line, rsp, debug=debug)
-                print(annotated)
+            # Annotate pop (reverse order)
+            if 'pop' in line and pop_index >= 0:
+                val = stack_vals[pop_index]
+                print(f"{line:<60} {YELLOW}; {val}{RESET}")
+                pop_index -= 1
                 continue
 
-            # Highlight RSP-relative memory references
-            if '%rsp' in line:
-                print(f"[DEBUG] Potential RSP line: {line}")
-            # Clean out prefixes and extract just the disassembly part
+            # RSP-relative mem access
             if ':' in line:
                 disas = line.split(':', 1)[1].strip()
                 disas = re.sub(r"^(lock|rep[nz]?)\s+", "", disas)
 
-                # Match offset relative to %rsp
                 rsp_offset_match = re.search(r"([-+]?)0x([0-9a-fA-F]+)\(%rsp\)", disas)
-
                 if rsp_offset_match:
                     try:
                         sign = rsp_offset_match.group(1)
@@ -160,16 +182,14 @@ def disassemble_addresses_with_push_values(addresses, frames, deepest_frame, deb
                         rsp_addr = get_frame_rsp(frame)
                         mem_addr = rsp_addr + offset
 
-                        # Extract the instruction name (e.g., movl, addq, cmp)
                         instr_match = re.search(r"\b(\w+)", disas)
                         instr_full = instr_match.group(1).lower() if instr_match else ""
 
-                        # Determine suffix from instruction name
                         suffix = ""
                         if instr_full[-1] in ("b", "w", "l", "q"):
                             instr, suffix = instr_full[:-1], instr_full[-1]
                         else:
-                            instr = instr_full  # no suffix, assume default
+                            instr = instr_full
 
                         if suffix == "b":
                             mem_val = readU8(mem_addr)
@@ -184,32 +204,20 @@ def disassemble_addresses_with_push_values(addresses, frames, deepest_frame, deb
                             mem_val = readU64(mem_addr)
                             disp = f"{mem_val:#018x} (64-bit)"
                         else:
-                            # Default to 64-bit for 64-bit kernel work
                             mem_val = readU64(mem_addr)
                             disp = f"{mem_val:#018x}"
 
                         if debug:
-                            print(f"[DEBUG] instr: {instr_full}, parsed: {instr}, suffix: {suffix}")
                             print(f"[DEBUG] RSP: {hex(rsp_addr)} offset: {offset} → addr: {hex(mem_addr)} = {disp}")
 
-                        line = line.rstrip() + f"    \033[94m; 0x{mem_addr:x} = {disp}\033[0m"
-
+                        line = line.rstrip() + f"    {BLUE}; 0x{mem_addr:x} = {disp}{RESET}"
                     except Exception as e:
                         if debug:
                             print(f"[DEBUG] Memory read failed: {e}")
 
             print(line)
 
-        for line, reg in push_instructions:
-            if reg and push_index < len(stack_vals):
-                val = stack_vals[push_index]
-                print(f"{line:<60} {YELLOW}; {val}{RESET}")
-                push_index += 1
-            else:
-                print(line)
-
 def get_deepest_frame_number_from_bt_lines(lines):
-    """Extract the highest frame number from a bt -f output."""
     deepest = 0
     for line in lines:
         if line.strip().startswith("#"):
@@ -247,8 +255,7 @@ def get_bt_addresses_exception_to_frame(upto_frame, debug=False):
             if debug:
                 print(f"[DEBUG] Frame #{frames[-1]} => {addresses[-1]}")
 
-    return addresses, frames, deepest_frame  # deepest frame #
-
+    return addresses, frames, deepest_frame
 
 def get_bt_addresses_range(start_frame, end_frame, debug=False):
     lines = exec_crash_command("bt -f").splitlines()
@@ -286,6 +293,36 @@ if __name__ == "__main__":
 
     if len(args.frames) == 1:
         addrs, frame_ids, deepest_frame = get_bt_addresses_exception_to_frame(args.frames[0], debug=args.debug)
+
+        # Check for exception RIP
+        bt_lines = exec_crash_command("bt").splitlines()
+        exception_rip = None
+        for line in bt_lines:
+            if 'RIP:' in line:
+                match = re.search(r'RIP:\s+([0-9a-fA-F]+)', line)
+                if match:
+                    exception_rip = match.group(1)
+                    break
+
+        if exception_rip:
+            first_addr = addrs[0] if addrs else None
+            if first_addr and exception_rip.lower() != first_addr.lower():
+                # Also extract RSP
+                for line in bt_lines:
+                    if 'RIP:' in line and 'RSP:' in line:
+                        m = re.search(r'RSP:\s+([0-9a-fA-F]+)', line)
+                        if m:
+                            EXCEPTION_RSP = int(m.group(1), 16)
+                            if args.debug:
+                                print(f"[DEBUG] Captured exception RSP: {hex(EXCEPTION_RSP)}")
+                        break
+
+                if EXCEPTION_RSP:
+                    if args.debug:
+                        print(f"[DEBUG] Adding exception RIP disassembly: {exception_rip}")
+                    addrs.insert(0, exception_rip)
+                    frame_ids.insert(0, "exception")
+
     elif len(args.frames) == 2:
         addrs, frame_ids, deepest_frame = get_bt_addresses_range(args.frames[0], args.frames[1], debug=args.debug)
     else:
@@ -293,3 +330,4 @@ if __name__ == "__main__":
         sys.exit(1)
 
     disassemble_addresses_with_push_values(addrs, frame_ids, deepest_frame, debug=args.debug)
+
