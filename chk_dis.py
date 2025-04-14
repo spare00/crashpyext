@@ -169,18 +169,24 @@ def disassemble_addresses_with_push_values(addresses, frames, deepest_frame, deb
         push_index = 0
         pop_index = len(stack_vals) - 1
 
+        prev_line_was_source = False
+
         for line in output.splitlines():
             stripped = line.strip()
 
-            # If line starts with an address, call dis symbol context
-            if stripped.startswith("0x"):
-                addr_match = re.match(r"0x[0-9a-fA-F]+", stripped)
-                if addr_match:
-                    sym_output = get_dis_symbol_context(addr_match.group(0), before_lines=args.lines - 1, debug=debug)
-                    if sym_output:
-                        print(f"{sym_output}")
+            if stripped.startswith("/"):  # Source line from kernel debug info
+                prev_line_was_source = True
+                print(line)
+                continue
 
-            stripped_line = line.strip()
+            if stripped.startswith("0x"):
+                if prev_line_was_source:
+                    addr_match = re.match(r"0x[0-9a-fA-F]+", stripped)
+                    if addr_match:
+                        sym_output = get_dis_symbol_context(addr_match.group(0), before_lines=args.lines - 1, debug=debug)
+                        if sym_output:
+                            print(f"{sym_output}")
+                prev_line_was_source = False
 
             # Annotate push
             if 'push' in line and push_index < len(stack_vals):
