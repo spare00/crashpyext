@@ -245,10 +245,6 @@ def detect_hard_lockup():
     print("=" * 90)
 
     locked_cpus = []
-    print(f"{'CPU':<5} {'hrtimer_interrupts':<20} {'hrtimer_saved':<20} {'RFLAGS':<18} {'CS':<6} {'Status'}")
-    print("=" * 90)
-
-    locked_cpus = []
     for cpu in range(len(interrupts)):
         rflags = cs = "N/A"
         for info in cpu_info:
