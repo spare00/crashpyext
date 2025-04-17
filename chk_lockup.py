@@ -30,7 +30,7 @@ def get_softlockup_values(rhel_version):
     try:
         runqueue_addrs = percpu.get_cpu_var("runqueues")
         rq_clock = [readSU("struct rq", addr).clock for addr in runqueue_addrs]
-        rq_time_sec = [int(clock_value / 1e9) for clock_value in rq_clock]
+        rq_time_sec = [clock_value / 1e9 for clock_value in rq_clock]
 
         watchdog_thresh = readSymbol("watchdog_thresh")
         softlockup_thresh = watchdog_thresh * 2
@@ -62,7 +62,8 @@ def get_softlockup_values(rhel_version):
 def detect_soft_lockup():
     """Detects soft lockups in a vmcore."""
     rhel_version = get_rhel_version()
-    print(f"🔍 Checking for soft lockups in vmcore (RHEL {rhel_version})...\n")
+
+    print(f"\n🔍 Checking for soft lockups in vmcore (RHEL {rhel_version})...")
 
     rq_time, touch_ts, period_ts, softlockup_thresh, is_watchdog_enabled = get_softlockup_values(rhel_version)
     if None in (rq_time, touch_ts, softlockup_thresh):
@@ -74,34 +75,57 @@ def detect_soft_lockup():
         return
 
     print(f"Soft Lockup Threshold: {softlockup_thresh} seconds\n")
+
+    max_now = max(rq_time)
+    print(f"⏱️  Max rq->clock across CPUs: {max_now:.2f} sec\n")
+
     if rhel_version >= 9:
-        print(f"{'CPU':<5} {'now (sec)':<15} {'touch_ts':<20} {'period_ts + ' + str(softlockup_thresh):<20} {'Difference':<15} {'Status'}")
+        print(f"{'CPU':<5} {'now (sec)':<12} {'behind by (s)':>12} {'touch_ts':>15} {'period_ts + ' + str(softlockup_thresh):>15} {'Diff':>15}  {'Status'}")
     else:
-        print(f"{'CPU':<5} {'now (sec)':<20} {'touch_ts + ' + str(softlockup_thresh):<20} {'Difference':<15} {'Status'}")
+        print(f"{'CPU':<5} {'now (sec)':<12} {'behind by (s)':>12} {'touch+%d' % softlockup_thresh:>15} {'Diff':>15}  {'Status'}")
     print("=" * 100)
 
     locked_cpus = []
     ULONG_MAX = 18446744073709551615
 
     for cpu in range(len(rq_time)):
+        delta = max_now - rq_time[cpu]
+        plain_delta = f"{delta:>10.2f}"
+        #behind_by_str = f"\033[91m{plain_delta}\033[0m" if int(delta) > 0 else plain_delta
+        if int(delta) > 0:
+            # Dynamically pad based on uncolored string width
+            width = 12
+            pad = width - len(plain_delta)
+            behind_by_str = " " * pad + f"\033[91m{plain_delta}\033[0m"
+        else:
+            behind_by_str = f"{plain_delta:>10}"
+
         if rhel_version >= 9:
             if period_ts[cpu] == ULONG_MAX:
                 status = "Ignored"
+                diff_str = "-"
+                threshold_ts = "N/A"
             else:
-                diff = rq_time[cpu] - (period_ts[cpu] + softlockup_thresh)
-                status = "✅ Normal" if rq_time[cpu] <= period_ts[cpu] + softlockup_thresh else "⚠️ Soft Lockup"
+                threshold_ts = period_ts[cpu] + softlockup_thresh
+                diff = rq_time[cpu] - threshold_ts
+                diff_str = f"{diff:.2f}"
+                status = "✅ Normal" if diff <= 0 else "⚠️ Soft Lockup"
                 if status == "⚠️ Soft Lockup":
                     locked_cpus.append(cpu)
-            print(f"{cpu:<5} {rq_time[cpu]:<15} {touch_ts[cpu]:<20} {period_ts[cpu] + softlockup_thresh if period_ts[cpu] != ULONG_MAX else 'N/A':<20} {'-' if period_ts[cpu] == ULONG_MAX else diff:<15} {status}")
+            print(f"{cpu:<5} {rq_time[cpu]:<12.2f} {behind_by_str:>12} {str(touch_ts[cpu]):>15} {str(threshold_ts):>15} {diff_str:>15}  {status}")
         else:
             if touch_ts[cpu] == 0:
                 status = "Ignored"
+                diff_str = "-"
+                threshold_ts = "N/A"
             else:
-                diff = rq_time[cpu] - (touch_ts[cpu] + softlockup_thresh)
-                status = "✅ Normal" if rq_time[cpu] <= touch_ts[cpu] + softlockup_thresh else "⚠️ Soft Lockup"
+                threshold_ts = touch_ts[cpu] + softlockup_thresh
+                diff = rq_time[cpu] - threshold_ts
+                diff_str = f"{diff:.2f}"
+                status = "✅ Normal" if diff <= 0 else "⚠️ Soft Lockup"
                 if status == "⚠️ Soft Lockup":
                     locked_cpus.append(cpu)
-            print(f"{cpu:<5} {rq_time[cpu]:<20} {touch_ts[cpu] + softlockup_thresh if touch_ts[cpu] != 0 else 'N/A':<20} {'-' if touch_ts[cpu] == 0 else diff:<15} {status}")
+            print(f"{cpu:<5} {rq_time[cpu]:<12.2f} {behind_by_str:>12} {str(threshold_ts):>15} {diff_str:>15}  {status}")
 
     print("\n🔍 Analysis Complete.")
     if locked_cpus:
@@ -169,5 +193,4 @@ if __name__ == "__main__":
 
     if args.hard_lockup:
         detect_hard_lockup()
-
 
