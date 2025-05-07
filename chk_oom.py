@@ -302,6 +302,53 @@ def extract_and_display_meminfo_blocks(log_lines, show_unaccounted=False, show_f
             print(f"\nUnaccounted memory = Total Memory - {formula_str}")
             print(f"{format_value(unaccounted, unit):.2f} = {format_value(total, unit):.2f} - {terms_str}")
 
+def extract_and_display_slab_info(log_lines, unit='MB'):
+    current_event = None
+    slab_entries = []
+    collecting = False
+
+    for line in log_lines:
+        content = line.split("] ", 1)[-1].strip()
+
+        if "invoked oom-killer" in content:
+            current_event = content
+            slab_entries = []
+            collecting = False
+
+        elif content.startswith("Unreclaimable slab info:"):
+            collecting = True
+
+        elif collecting and content.startswith("Name"):
+            continue  # skip header
+
+        elif collecting:
+            if content.startswith("[") or content.startswith("Tasks state"):
+                collecting = False
+                if slab_entries:
+                    print(f"\nEvent: {current_event}")
+                    print(f"Top Slab Usage (Unreclaimable):")
+                    print(f"{f'Used ({unit})':>12}   Name")
+                    top_entries = sorted(slab_entries, key=lambda x: x[1], reverse=True)[:10]
+                    total = sum(x[1] for x in top_entries)
+
+                    for name, used_mb in top_entries:
+                        print(f"{format_value(used_mb, unit):>12.2f}   {name}")
+
+                    print("-" * 34)
+                    print(f"{format_value(total, unit):>12.2f}   Total Slab Usage")
+
+                continue
+
+            parts = re.split(r'\s{2,}', content)
+            if len(parts) >= 2:
+                name = parts[0]
+                used_kb = parts[1].strip().replace("KB", "")
+                try:
+                    used_mb = int(used_kb) / 1024
+                    slab_entries.append((name, used_mb))
+                except ValueError:
+                    continue
+
 def main():
     parser = argparse.ArgumentParser(description="Parse OOM logs from crash log -T")
     parser.add_argument('-p', '--process', action='store_true', help="Show per-process memory usage (optional with -i/-u)")
@@ -311,6 +358,7 @@ def main():
     parser.add_argument('-i', '--meminfo', action='store_true', help="Show memory info summary per event")
     parser.add_argument('-u', '--unaccounted', action='store_true', help="Include unaccounted memory")
     parser.add_argument('-f', '--full', action='store_true', help="With -u, include detailed fields")
+    parser.add_argument('-l', '--slab', action='store_true', help="Show top unreclaimable slab usage")
 
     unit_group = parser.add_mutually_exclusive_group()
     unit_group.add_argument('-K', '--kilobytes', action='store_const', const='KB', dest='unit', help="Display values in kilobytes")
@@ -346,6 +394,10 @@ def main():
             unit=args.unit,
             verbose=args.verbose
         )
+
+    # Show slab info only if -i/-u/-f/-p are not set
+    if args.slab and not (args.meminfo or args.unaccounted or args.full or args.process):
+        extract_and_display_slab_info(log_lines, unit=args.unit)
 
 main()
 
