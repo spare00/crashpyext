@@ -98,14 +98,27 @@ def get_percpu_memory_kb():
     except Exception:
         return 0
 
+def normalize_stats(stats):
+
+    if "NR_SLAB_RECLAIMABLE_B" not in stats and "NR_SLAB_RECLAIMABLE" in stats:
+        stats["NR_SLAB_RECLAIMABLE_B"] = stats["NR_SLAB_RECLAIMABLE"] * PAGE_SIZE
+
+    if "NR_SLAB_UNRECLAIMABLE_B" not in stats and "NR_SLAB_UNRECLAIMABLE" in stats:
+        stats["NR_SLAB_UNRECLAIMABLE_B"] = stats["NR_SLAB_UNRECLAIMABLE"] * PAGE_SIZE
+
+    if "NR_KERNEL_STACK_KB" not in stats and "NR_KERNEL_STACK" in stats:
+        stats["NR_KERNEL_STACK_KB"] = stats["NR_KERNEL_STACK"] * PAGE_SIZE // 1024
+
 def get_accounted_memory_kb(stats, hugepage_kb, percpu_kb):
     return sum([
+        pages_to_kb(stats.get("NR_ACTIVE_ANON", 0)),
+        pages_to_kb(stats.get("NR_INACTIVE_ANON", 0)),
+        bytes_to_kb(stats.get("NR_SLAB_RECLAIMABLE_B", 0)),
+        bytes_to_kb(stats.get("NR_SLAB_UNRECLAIMABLE_B", 0)),
         pages_to_kb(stats.get("NR_FREE_PAGES", 0)),
-        bytes_to_kb(stats.get("NR_SLAB_RECLAIMABLE_B", 0) + stats.get("NR_SLAB_UNRECLAIMABLE_B", 0)),
+        pages_to_kb(stats.get("NR_FILE_PAGES", 0)),
         stats.get("NR_KERNEL_STACK_KB", 0),
         pages_to_kb(stats.get("NR_PAGETABLE", 0)),
-        pages_to_kb(stats.get("NR_ANON_MAPPED", 0) + stats.get("NR_FILE_MAPPED", 0)),
-        pages_to_kb(stats.get("NR_FILE_PAGES", 0)),
         pages_to_kb(stats.get("NR_SWAPCACHE", 0)),
         hugepage_kb,
         percpu_kb
@@ -118,13 +131,14 @@ def print_unaccounted_formula(stats, total_kb, hugepage_kb, percpu_kb, unit):
     def scale(val): return scale_value(val, unit)
 
     fields = [
-        ("Free", kb(p("NR_FREE_PAGES"))),
+        ("Active Anon", kb(p("NR_ACTIVE_ANON"))),
+        ("Inactive Anon", kb(p("NR_INACTIVE_ANON"))),
         ("Slab Reclaimable", b(p("NR_SLAB_RECLAIMABLE_B"))),
         ("Slab Unreclaimable", b(p("NR_SLAB_UNRECLAIMABLE_B"))),
+        ("Free", kb(p("NR_FREE_PAGES"))),
+        ("PageCache", kb(p("NR_FILE_PAGES"))),
         ("KernelStack", p("NR_KERNEL_STACK_KB")),
         ("PageTables", kb(p("NR_PAGETABLE"))),
-        ("Mapped", kb(p("NR_ANON_MAPPED") + p("NR_FILE_MAPPED"))),
-        ("FilePages", kb(p("NR_FILE_PAGES"))),
         ("SwapCache", kb(p("NR_SWAPCACHE"))),
         ("HugePages", hugepage_kb),
         ("Percpu", percpu_kb),
@@ -162,6 +176,7 @@ def main():
         args.unaccounted = True
 
     stats = parse_kmem_V(debug=args.debug)
+    normalize_stats(stats)
     unit = args.unit
 
     total_kb = get_total_memory_from_kmem_i()
@@ -174,13 +189,15 @@ def main():
 
     print(f"{'Category':<30}{f'Memory ({unit_label})':>20}")
     print("-" * 50)
-    print(f"{'Total Estimated Memory':<30}{scale(total_kb):>20.2f}")
+    print(f"{'Total Memory':<30}{scale(total_kb):>20.2f}")
+    print(f"{'Active Anon':<30}{scale(pages_to_kb(stats.get('NR_ACTIVE_ANON', 0))):>20.2f}")
+    print(f"{'Inactive Anon':<30}{scale(pages_to_kb(stats.get('NR_INACTIVE_ANON', 0))):>20.2f}")
+    print(f"{'Slab Reclaimable':<30}{scale(bytes_to_kb(stats.get('NR_SLAB_RECLAIMABLE_B', 0))):>20.2f}")
+    print(f"{'Slab Unreclaimable':<30}{scale(bytes_to_kb(stats.get('NR_SLAB_UNRECLAIMABLE_B', 0))):>20.2f}")
     print(f"{'Free Pages':<30}{scale(pages_to_kb(stats.get('NR_FREE_PAGES', 0))):>20.2f}")
-    print(f"{'Slab':<30}{scale(bytes_to_kb(stats.get('NR_SLAB_RECLAIMABLE_B', 0) + stats.get('NR_SLAB_UNRECLAIMABLE_B', 0))):>20.2f}")
     print(f"{'Kernel Stacks':<30}{scale(stats.get('NR_KERNEL_STACK_KB', 0)):>20.2f}")
     print(f"{'Page Tables':<30}{scale(pages_to_kb(stats.get('NR_PAGETABLE', 0))):>20.2f}")
-    print(f"{'Anon + File Mapped':<30}{scale(pages_to_kb(stats.get('NR_ANON_MAPPED', 0) + stats.get('NR_FILE_MAPPED', 0))):>20.2f}")
-    print(f"{'File Cache':<30}{scale(pages_to_kb(stats.get('NR_FILE_PAGES', 0))):>20.2f}")
+    print(f"{'Pagecache':<30}{scale(pages_to_kb(stats.get('NR_FILE_PAGES', 0))):>20.2f}")
     print(f"{'Swap Cache':<30}{scale(pages_to_kb(stats.get('NR_SWAPCACHE', 0))):>20.2f}")
     print(f"{'Hugepages':<30}{scale(hugepage_kb):>20.2f}")
     print(f"{'Per-CPU Allocations':<30}{scale(percpu_kb):>20.2f}")
