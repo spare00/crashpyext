@@ -247,7 +247,21 @@ def extract_and_display_meminfo_blocks(log_lines, show_unaccounted=False, show_f
         sum_base = sum(base_fields.values())
         sum_extra = sum(extended_fields.values()) if show_unaccounted and show_full else 0
         accounted = sum_base + sum_extra
-        unaccounted = max(0, total - accounted)
+        unaccounted = total \
+            - data.get('active_anon', 0) \
+            - data.get('inactive_anon', 0) \
+            - data.get('isolated_anon', 0) \
+            - data.get('pagecache', 0) \
+            - data.get('swapcache', 0) \
+            - data.get('slab_reclaimable', 0) \
+            - data.get('slab_unreclaimable', 0) \
+            - data.get('pagetables', 0) \
+            - data.get('free', 0) \
+            - data.get('reserved', 0) \
+            - data.get('unevictable', 0) \
+            - data.get('bounce', 0) \
+            - data.get('free_cma', 0) \
+            - (data.get('hugepages_total', 0) * data.get('hugepages_size', 0) / 1024 / 1024)
 
         # Output
         print(f"\nTimestamp: {timestamp}")
