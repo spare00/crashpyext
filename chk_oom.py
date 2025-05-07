@@ -160,7 +160,7 @@ def display_usage(event_usage, include_swap, unit='GB'):
         else:
             print(f"{total_rss:>10.2f} {'RSS Total':>15}")
 
-def extract_and_display_meminfo_blocks(log_lines, show_unaccounted=False, show_full=False, unit='MB'):
+def extract_and_display_meminfo_blocks(log_lines, show_unaccounted=False, show_full=False, unit='MB', verbose=False):
     from collections import OrderedDict
 
     mem_blocks = []
@@ -278,6 +278,30 @@ def extract_and_display_meminfo_blocks(log_lines, show_unaccounted=False, show_f
         print("=" * 43)
         print(f"{'Total Memory':<35}{format_value(total, unit):>8.2f}")
 
+        if show_unaccounted and verbose:
+            # For breakdown display
+            components = OrderedDict([
+                ('Active Anon', data.get('active_anon', 0)),
+                ('Inactive Anon', data.get('inactive_anon', 0)),
+                ('Isolated Anon', data.get('isolated_anon', 0)),
+                ('Pagecache', data.get('pagecache', 0)),
+                ('Swapcache', data.get('swapcache', 0)),
+                ('Slab Reclaimable', data.get('slab_reclaimable', 0)),
+                ('Slab Unreclaimable', data.get('slab_unreclaimable', 0)),
+                ('Pagetables', data.get('pagetables', 0)),
+                ('Free', data.get('free', 0)),
+                ('Reserved', data.get('reserved', 0)),
+                ('Unevictable', data.get('unevictable', 0)),
+                ('Bounce', data.get('bounce', 0)),
+                ('Free CMA', data.get('free_cma', 0)),
+                ('Huge Pages', data.get('hugepages_total', 0) * data.get('hugepages_size', 0) / 1024 / 1024),
+            ])
+
+            terms_str = " - ".join(f"{format_value(v, unit):.2f}" for v in components.values())
+            formula_str = " - ".join(components.keys())
+            print(f"\nUnaccounted memory = Total Memory - {formula_str}")
+            print(f"{format_value(unaccounted, unit):.2f} = {format_value(total, unit):.2f} - {terms_str}")
+
 def main():
     parser = argparse.ArgumentParser(description="Parse OOM logs from crash log -T")
     parser.add_argument('-p', '--process', action='store_true', help="Show per-process memory usage (optional with -i/-u)")
@@ -319,7 +343,8 @@ def main():
             log_lines,
             show_unaccounted=args.unaccounted,
             show_full=args.full,
-            unit=args.unit
+            unit=args.unit,
+            verbose=args.verbose
         )
 
 main()
