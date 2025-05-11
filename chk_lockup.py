@@ -226,28 +226,9 @@ def get_cpu_rflags_cs_via_bt():
         print(f"❌ Failed to parse bt -a output: {e}")
         return []
 
-def get_rflags_and_cs_per_cpu():
-    """Returns RFLAGS and CS for each CPU using task_regs()."""
-    rflags_list = []
-    cs_list = []
-
-    for cpu in range(getCpuCount()):
-        task = getTaskByCpu(cpu)
-        if not task:
-            rflags_list.append("N/A")
-            cs_list.append("N/A")
-            continue
-        regs = task_regs(task)
-        rflags = regs.get("rflags", "N/A")
-        cs = regs.get("cs", "N/A")
-        rflags_list.append(f"{rflags:016x}" if isinstance(rflags, int) else "N/A")
-        cs_list.append(f"{cs:04x}" if isinstance(cs, int) else "N/A")
-
-    return rflags_list, cs_list
-
 def detect_hard_lockup():
     """Detects hard lockups in a vmcore by analyzing per-CPU hrtimer values."""
-    print("🔍 Checking for hard lockups in vmcore...\n")
+    print("\n🔍 Checking for hard lockups in vmcore...\n")
 
     interrupts, saved = get_hrtimer_values()
     cpu_info = get_cpu_rflags_cs_via_bt()
