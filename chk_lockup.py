@@ -3,7 +3,7 @@ import re
 from pykdump.API import *
 from LinuxDump import percpu
 
-# Soft lockup detector starts 
+# Soft lockup detector starts
 def get_rhel_version():
     """Determines the major RHEL version from the kernel release."""
     sys_output = exec_crash_command("sys")
@@ -44,7 +44,12 @@ def get_rflags_and_cs_from_bt():
             rflags = rflags_match.group(1) if rflags_match else "N/A"
             cs = cs_match.group(1) if cs_match else "N/A"
 
-            cpu_info.append((cpu, rflags, cs))
+            # Extract PID and COMMAND (task name)
+            pid_match = re.search(r"PID:\s*\d+", cpu_line)
+            comm_match = re.search(r'COMMAND:\s*"([^"]+)"', cpu_line)
+            task_comm = comm_match.group(1) if comm_match else "Unknown"
+
+            cpu_info.append((cpu, rflags, cs, task_comm))
             i += 3
         else:
             i += 1
@@ -115,15 +120,25 @@ def detect_soft_lockup():
     ULONG_MAX = 18446744073709551615
 
     for cpu in range(len(rq_time)):
+
         delta = max_now - rq_time[cpu]
         plain_delta = f"{delta:.2f}"
         behind_by_str = plain_delta.rjust(10)
 
-        rflags = cs = "N/A"
+        rflags = cs = task_comm = "N/A"
         for entry in cpu_info:
             if entry[0] == cpu:
-                rflags, cs = entry[1], entry[2]
+                rflags, cs, task_comm = entry[1], entry[2], entry[3]
                 break
+
+        # Skip if it's swapper
+        if task_comm.startswith("swapper"):
+            status = "Idle - Ignored"
+            diff_str = "-"
+            threshold_ts = "N/A"
+            line = f"{cpu:<5} {rq_time[cpu]:<12.2f} {'-':>10} {threshold_ts:>15} {diff_str:>10} {rflags:>18} {cs:>6} {status}"
+            print(line)
+            continue
 
         if touch_ts[cpu] == 0:
             status = "Ignored"
