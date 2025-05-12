@@ -1,0 +1,367 @@
+import re
+import argparse
+from pykdump.API import *
+
+# Currently only support bnxt and tg3 drivers. 
+
+
+BUFFER_SIZE = 2048
+RX_BUF_RING_SIZE = 1024
+MAX_ERRORS_TO_PRINT = 10
+MAX_WARNINGS = 10
+
+def log_warning(msg):
+    print(f"⚠️  {msg}")
+
+def log_error(msg):
+    print(f"❌ {msg}")
+
+def align_up(size, align):
+    return ((size + align - 1) // align) * align
+
+def get_buffer_size_from_mtu(mtu):
+    if mtu <= 1500:
+        return 2048
+    elif mtu <= 9000:
+        return 16384
+    else:
+        return align_up(mtu + 128, 2048)
+
+def get_struct_size(struct_name):
+    output = exec_crash_command(f"struct {struct_name}")
+    for line in output.splitlines():
+        if "SIZE:" in line:
+            return int(line.split("SIZE:")[1].strip())
+    raise RuntimeError(f"Could not get size of {struct_name}")
+
+def get_field_offset(struct_name, field_name):
+    output = exec_crash_command(f"struct {struct_name} -o")
+    for line in output.splitlines():
+        if field_name in line:
+            parts = line.strip().split()
+            if parts[0].startswith('[') and parts[0].endswith(']'):
+                try:
+                    offset = int(parts[0][1:-1])
+                    return offset
+                except ValueError:
+                    continue
+    raise RuntimeError(f"Field {field_name} not found in struct {struct_name}")
+
+def parse_net_devices(debug=False):
+    net_output = exec_crash_command("net")
+    netdev_addrs = []
+    for line in net_output.splitlines():
+        if debug:
+            print(f"DEBUG: Parsing net device line: {line}")
+        if re.match(r"^[0-9a-fA-F]+", line.strip()):
+            addr = int(line.split()[0], 16)
+            netdev_addrs.append(addr)
+    return netdev_addrs
+
+def read_driver_symbol(netdev):
+    try:
+        print(f"netdev.netdev_ops: {hex(int(netdev.netdev_ops))}")
+        rtn = readSymbol(hex(int(netdev.netdev_ops)))
+        print(f"netdev.netdev_ops: {hex(int(netdev.netdev_ops))}, {rtn}")
+        return rtn
+    except:
+        print(f"netdev.netdev_ops: {hex(int(netdev.netdev_ops))}")
+        return ""
+
+def analyze_bnxt(netdev_addr, buffer_size, verbose=False, debug=False):
+    try:
+        netdev_size = get_struct_size("net_device")
+        aligned_size = align_up(netdev_size, 32)
+        bnxt_addr = netdev_addr + aligned_size
+        if debug:
+            print(f"DEBUG: bnxt_addr: {hex(bnxt_addr)}")
+
+        # Offsets
+        rx_ring_off = get_field_offset("bnxt", "rx_ring")
+        cp_off = get_field_offset("bnxt", "cp_nr_rings")
+        tx_ring_off = get_field_offset("bnxt", "tx_ring")
+        tx_nr_rings_off = get_field_offset("bnxt", "tx_nr_rings")
+
+        # RX setup
+        rx_ring_ptr = readPtr(bnxt_addr + rx_ring_off)
+        num_rx_rings = read_u16(bnxt_addr + cp_off)
+        rx_bd_size = get_struct_size("bnxt_sw_rx_bd")
+        rx_data_off = get_field_offset("bnxt_sw_rx_bd", "data")
+        rx_ring_info_size = get_struct_size("bnxt_rx_ring_info")
+
+        total_rx_buffers = 0
+        for i in range(num_rx_rings):
+            ring_info_ptr = rx_ring_ptr + i * rx_ring_info_size
+            try:
+                ring_info = readSU("struct bnxt_rx_ring_info", ring_info_ptr)
+                rx_buf_ring_ptr = ring_info.rx_buf_ring
+                if rx_buf_ring_ptr == 0 or rx_buf_ring_ptr == 0xffffffffffffffff:
+                    if debug:
+                        print(f"DEBUG: [RX Ring {i}] Invalid rx_buf_ring_ptr: {hex(rx_buf_ring_ptr)} — skipping")
+                    continue
+            except Exception as e:
+                if debug:
+                    print(f"DEBUG: [RX Ring {i}] Failed to read ring_info: {e}")
+                continue
+
+            ring_buf_count = 0
+            for j in range(1024):  # RX_BUF_RING_SIZE is typically 1024
+                entry_addr = rx_buf_ring_ptr + j * rx_bd_size
+                try:
+                    data_ptr = readPtr(entry_addr + rx_data_off)
+                    if data_ptr:
+                        ring_buf_count += 1
+                        if verbose:
+                            print(f"[RX {i}:{j:04d}] data = {hex(data_ptr)}")
+                except:
+                    continue
+
+            if debug:
+                print(f"DEBUG: [RX Ring {i}] Allocated buffers: {ring_buf_count}")
+            total_rx_buffers += ring_buf_count
+
+        # TX setup
+        tx_ring_ptr = readPtr(bnxt_addr + tx_ring_off)
+        num_tx_rings = read_u16(bnxt_addr + tx_nr_rings_off)
+        tx_ring_info_size = get_struct_size("bnxt_tx_ring_info")
+        tx_bd_size = get_struct_size("tx_bd")
+        tx_buf_off = get_field_offset("bnxt_tx_ring_info", "tx_buf_ring")
+        tx_data_off = get_field_offset("tx_bd", "addr")
+
+        total_tx_buffers = 0
+        for i in range(num_tx_rings):
+            ring_info_ptr = tx_ring_ptr + i * tx_ring_info_size
+            try:
+                ring_info = readSU("struct bnxt_tx_ring_info", ring_info_ptr)
+                tx_buf_ring_ptr = ring_info.tx_buf_ring
+                if tx_buf_ring_ptr == 0 or tx_buf_ring_ptr == 0xffffffffffffffff:
+                    if debug:
+                        print(f"DEBUG: [TX Ring {i}] Invalid tx_buf_ring_ptr: {hex(tx_buf_ring_ptr)} — skipping")
+                    continue
+            except Exception as e:
+                if debug:
+                    print(f"DEBUG: [TX Ring {i}] Failed to read ring_info: {e}")
+                continue
+
+            buf_count = 0
+            for j in range(1024):  # Conservative default
+                entry_addr = tx_buf_ring_ptr + j * tx_bd_size
+                try:
+                    addr_val = int.from_bytes(readmem(entry_addr + tx_data_off, 8), "little")
+                    if addr_val:
+                        buf_count += 1
+                        if verbose:
+                            print(f"[TX {i}:{j:04d}] addr = {hex(addr_val)}")
+                except:
+                    continue
+
+            if debug:
+                print(f"DEBUG: [TX Ring {i}] Buffers used: {buf_count}")
+            total_tx_buffers += buf_count
+
+        return {
+            "driver": "bnxt",
+            "rx_buffers": total_rx_buffers,
+            "tx_buffers": total_tx_buffers,
+            "rx_bytes": total_rx_buffers * buffer_size,
+            "tx_bytes": total_tx_buffers * buffer_size
+        }
+
+    except Exception as e:
+        print(f"❌ Error analyzing bnxt: {e}")
+        return None
+
+def analyze_tg3(dev_addr, buffer_size, verbose=False, debug=False):
+    try:
+        netdev_size = get_struct_size("net_device")
+        aligned_size = align_up(netdev_size, 32)
+        tg3_addr = dev_addr + aligned_size
+        if debug:
+            print(f"DEBUG: tg3_addr = {hex(tg3_addr)}")
+
+        tg3 = readSU("struct tg3", tg3_addr)
+
+        # RX ring info
+        napi_off = get_field_offset("tg3", "napi")
+        napi_size = get_struct_size("tg3_napi")
+        rx_rcb_off = get_field_offset("tg3_napi", "rx_rcb")
+        rx_desc_size = get_struct_size("tg3_rx_buffer_desc")
+        rx_ring_size = 1024  # default conservative assumption
+
+        # TX ring info
+        tx_ring_off = get_field_offset("tg3_napi", "tx_ring")
+        tx_ring_size = 1024  # default conservative assumption
+        tx_desc_size = get_struct_size("tg3_tx_buffer_desc")
+
+        total_rx_buffers = 0
+        total_tx_buffers = 0
+
+        for i in range(5):  # tg3 has napi[5]
+            napi_addr = tg3_addr + napi_off + i * napi_size
+            napi = readSU("struct tg3_napi", napi_addr)
+
+            # RX accounting
+            rx_rcb_ptr = int(napi.rx_rcb)
+            if rx_rcb_ptr != 0 and rx_rcb_ptr != 0xffffffffffffffff:
+                rx_count = 0
+                error_count = 0
+                for j in range(rx_ring_size):
+                    desc_addr = rx_rcb_ptr + j * rx_desc_size
+                    try:
+                        val = int.from_bytes(readmem(desc_addr, 4), 'little')  # addr_lo
+                        if val != 0:
+                            rx_count += 1
+                            if verbose:
+                                print(f"[RX {i}:{j:04d}] addr_lo = {hex(val)}")
+                    except:
+                        if error_count < 10:
+                            print(f"⚠️  tg3: unreadable RX descriptor at {hex(desc_addr)}")
+                        elif error_count == 10:
+                            print("⚠️  tg3: Further unreadable RX descriptors suppressed...")
+                        error_count += 1
+                        continue
+                total_rx_buffers += rx_count
+                if debug:
+                    print(f"DEBUG: [NAPI {i}] RX buffers used: {rx_count}")
+            else:
+                if debug:
+                    print(f"DEBUG: [NAPI {i}] Invalid rx_rcb_ptr = {hex(rx_rcb_ptr)} — skipping")
+
+            # TX accounting
+            tx_ring_ptr = int(napi.tx_ring)
+            if tx_ring_ptr != 0 and tx_ring_ptr != 0xffffffffffffffff:
+                tx_count = 0
+                error_count = 0
+                for j in range(tx_ring_size):
+                    desc_addr = tx_ring_ptr + j * tx_desc_size
+                    try:
+                        val = int.from_bytes(readmem(desc_addr, 8), 'little')  # addr
+                        if val != 0:
+                            tx_count += 1
+                            if verbose:
+                                print(f"[TX {i}:{j:04d}] addr = {hex(val)}")
+                    except:
+                        if error_count < 10:
+                            print(f"⚠️  tg3: unreadable TX descriptor at {hex(desc_addr)}")
+                        elif error_count == 10:
+                            print("⚠️  tg3: Further unreadable TX descriptors suppressed...")
+                        error_count += 1
+                        continue
+                total_tx_buffers += tx_count
+                if debug:
+                    print(f"DEBUG: [NAPI {i}] TX buffers used: {tx_count}")
+            else:
+                if debug:
+                    print(f"DEBUG: [NAPI {i}] Invalid tx_ring = {hex(tx_ring_ptr)} — skipping")
+
+        return {
+            "driver": "tg3",
+            "rx_buffers": total_rx_buffers,
+            "tx_buffers": total_tx_buffers,
+            "rx_bytes": total_rx_buffers * buffer_size,
+            "tx_bytes": total_tx_buffers * buffer_size
+        }
+
+    except Exception as e:
+        print(f"❌ Error analyzing tg3: {e}")
+        return None
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose RX/TX entry info")
+    args = parser.parse_args()
+
+    print(f"{'Device':<12} {'Driver':<10} {'MTU':>6} {'RX Buffers':>12} {'TX Buffers':>12} "
+          f"{'RX Usage (KB)':>15} {'TX Usage (KB)':>15}")
+    print("=" * 88)
+
+    total_rx_buffers = 0
+    total_tx_buffers = 0
+    total_rx_bytes = 0
+    total_tx_bytes = 0
+
+    known_builtin_drivers = {
+        "loopback_ops": "loopback device",
+        "team_netdev_ops": "virtual device",
+    }
+
+    for addr in parse_net_devices(args.debug):
+        try:
+            netdev = readSU("struct net_device", addr)
+            name = str(netdev.name).strip("\x00")
+            mtu = int(netdev.mtu)
+            max_mtu = int(netdev.max_mtu)
+            buffer_size = get_buffer_size_from_mtu(mtu)
+
+            if args.debug:
+                print(f"DEBUG: Got net_device at {hex(addr)}, name = '{name}'")
+                print(f"DEBUG: MTU = {mtu}, max_mtu = {max_mtu}, buffer_size = {buffer_size}")
+
+            netdev_ops = int(netdev.netdev_ops)
+            sym_output = exec_crash_command(f"sym {hex(netdev_ops)}").strip()
+            if args.debug:
+                print(f"DEBUG: sym_output = {sym_output}")
+
+            match = re.search(r'(\S+)\s+\[\s*(\w+)\s*\]', sym_output)
+            if match:
+                func_name, module_name = match.groups()
+            else:
+                # Try extracting just the symbol name manually
+                parts = sym_output.strip().split()
+                if len(parts) >= 3:
+                    func_name = parts[2]
+                    module_name = "<builtin>"
+                else:
+                    func_name = parts[0]  # fallback to raw address
+                    module_name = "<unknown>"
+                if args.debug:
+                    print(f"DEBUG: Could not parse full symbol format for {name}")
+
+                if args.debug:
+                    print(f"DEBUG: Could not parse symbol for {name}")
+            if args.debug:
+                print(f"DEBUG: Found netdev_ops: {func_name} in module {module_name}")
+
+            # Check for known skip reasons
+            if func_name in known_builtin_drivers:
+                note = known_builtin_drivers[func_name]
+                if args.debug:
+                    print(f"DEBUG: ⚠️  Skipping {name}: {note}")
+                print(f"{name:<12} {'-':<10} {'-':>6} {'-':>12} {'-':>12} {'-':>15} {'-':>15}  # skipped: {note}")
+                continue
+
+            # Process supported drivers
+            if func_name == "bnxt_netdev_ops":
+                result = analyze_bnxt(addr, buffer_size, args.verbose, args.debug)
+            elif func_name == "tg3_netdev_ops":
+                result = analyze_tg3(addr, buffer_size, args.verbose, args.debug)
+            else:
+                note = f"unsupported driver ({func_name})"
+                if args.debug:
+                    print(f"DEBUG: ⚠️  Skipping {name}: {note}")
+                print(f"{name:<12} {'-':<10} {'-':>6} {'-':>12} {'-':>12} {'-':>15} {'-':>15}  # skipped: {note}")
+                continue
+
+            if result:
+                print(f"{name:<12} {result['driver']:<10} {mtu:>6} {result['rx_buffers']:>12} {result['tx_buffers']:>12} "
+                      f"{result['rx_bytes'] // 1024:>15,.2f} {result['tx_bytes'] // 1024:>15,.2f}")
+                total_rx_buffers += result["rx_buffers"]
+                total_tx_buffers += result["tx_buffers"]
+                total_rx_bytes += result["rx_bytes"]
+                total_tx_bytes += result["tx_bytes"]
+
+        except Exception as e:
+            print(f"⚠️  Failed to analyze device at {hex(addr)}: {e}")
+
+    print("=" * 88)
+    print(f"{'':<12} {'':<10} {'':>6} {total_rx_buffers:>12} {total_tx_buffers:>12} "
+          f"{total_rx_bytes // 1024:>15,.2f} {total_tx_bytes // 1024:>15,.2f}")
+    print("=" * 88)
+    print(f"{'TOTAL':<12} {'':<10} {'':>6} {'':>12} {'':>12} "
+          f"{'':>15} {(total_tx_bytes + total_tx_bytes) // 1024:>15,.2f}")
+
+
+if __name__ == "__main__":
+    main()
+
