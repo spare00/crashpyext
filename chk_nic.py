@@ -52,7 +52,7 @@ def parse_net_devices(debug=False):
     netdev_addrs = []
     for line in net_output.splitlines():
         if debug:
-            print(f"DEBUG: Parsing net device line: {line}")
+            print(f"DEBUG: [NET DEVICE]: {line}")
         if re.match(r"^[0-9a-fA-F]+", line.strip()):
             addr = int(line.split()[0], 16)
             netdev_addrs.append(addr)
@@ -334,6 +334,111 @@ def analyze_tg3(dev_addr, buffer_size, verbose=False, debug=False):
         print(f"❌ Error analyzing tg3: {e}")
         return None
 
+def analyze_ice(dev_addr, buffer_size, verbose=False, debug=False):
+    try:
+        netdev_size = get_struct_size("net_device")
+        aligned_size = align_up(netdev_size, 32)
+        priv_addr = dev_addr + aligned_size
+
+        # Read struct ice_netdev_priv
+        priv = readSU("struct ice_netdev_priv", priv_addr)
+        vsi_addr = int(priv.vsi)
+        if vsi_addr == 0 or vsi_addr == 0xffffffffffffffff:
+            if debug:
+                print("DEBUG: Invalid VSI pointer")
+            return None
+
+        vsi = readSU("struct ice_vsi", vsi_addr)
+        num_rxq = int(vsi.num_rxq)
+        num_txq = int(vsi.num_txq)
+        rx_rings_ptr = int(vsi.rx_rings)
+        tx_rings_ptr = int(vsi.tx_rings)
+
+        if debug:
+            print(f"DEBUG: VSI @ {hex(vsi_addr)} has {num_rxq} RX and {num_txq} TX queues")
+
+        rx_ring_size = get_struct_size("ice_rx_ring")
+        tx_ring_size = get_struct_size("ice_tx_ring")
+        rx_buf_size = get_struct_size("ice_rx_buf")
+        tx_buf_size = get_struct_size("ice_tx_buf")
+        dma_off = get_field_offset("ice_rx_buf", "dma")
+        tx_dma_off = get_field_offset("ice_tx_buf", "dma")
+
+        total_rx_buffers = 0
+        total_tx_buffers = 0
+
+        # RX processing
+        for i in range(num_rxq):
+            ring_ptr = readPtr(rx_rings_ptr + i * 8)
+            if ring_ptr in [0, 0xffffffffffffffff]:
+                if debug:
+                    print(f"DEBUG: RX Ring {i} pointer invalid: {hex(ring_ptr)}")
+                continue
+
+            rx_ring = readSU("struct ice_rx_ring", ring_ptr)
+            rx_buf_ptr = int(rx_ring.rx_buf)
+            depth = int(rx_ring.count)
+            if depth == 0 or depth > 8192:
+                depth = 1024
+
+            count = 0
+            for j in range(depth):
+                buf_addr = rx_buf_ptr + j * rx_buf_size
+                try:
+                    dma_val = readULong(buf_addr + dma_off)
+                    if dma_val:
+                        count += 1
+                        if verbose:
+                            print(f"[RX {i}:{j:04d}] dma = {hex(dma_val)}")
+                except:
+                    continue
+
+            total_rx_buffers += count
+            if debug:
+                print(f"DEBUG: RX Ring {i}: active buffers = {count}/{depth}")
+
+        # TX processing
+        for i in range(num_txq):
+            ring_ptr = readPtr(tx_rings_ptr + i * 8)
+            if ring_ptr in [0, 0xffffffffffffffff]:
+                if debug:
+                    print(f"DEBUG: TX Ring {i} pointer invalid: {hex(ring_ptr)}")
+                continue
+
+            tx_ring = readSU("struct ice_tx_ring", ring_ptr)
+            tx_buf_ptr = int(tx_ring.tx_buf)
+            depth = int(tx_ring.count)
+            if depth == 0 or depth > 8192:
+                depth = 1024
+
+            count = 0
+            for j in range(depth):
+                buf_addr = tx_buf_ptr + j * tx_buf_size
+                try:
+                    dma_val = readULong(buf_addr + tx_dma_off)
+                    if dma_val:
+                        count += 1
+                        if verbose:
+                            print(f"[TX {i}:{j:04d}] dma = {hex(dma_val)}")
+                except:
+                    continue
+
+            total_tx_buffers += count
+            if debug:
+                print(f"DEBUG: TX Ring {i}: active buffers = {count}/{depth}")
+
+        return {
+            "driver": "ice",
+            "rx_buffers": total_rx_buffers,
+            "tx_buffers": total_tx_buffers,
+            "rx_bytes": total_rx_buffers * buffer_size,
+            "tx_bytes": total_tx_buffers * buffer_size
+        }
+
+    except Exception as e:
+        print(f"❌ Error analyzing ice: {e}")
+        return None
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
@@ -404,6 +509,8 @@ def main():
                 result = analyze_bnxt(addr, buffer_size, args.verbose, args.debug)
             elif func_name == "tg3_netdev_ops":
                 result = analyze_tg3(addr, buffer_size, args.verbose, args.debug)
+            elif func_name == "ice_netdev_ops":
+                result = analyze_ice(addr, buffer_size, args.verbose, args.debug)
             else:
                 note = f"unsupported driver ({func_name})"
                 if args.debug:
@@ -427,7 +534,7 @@ def main():
           f"{total_rx_bytes // 1024:>15,.2f} {total_tx_bytes // 1024:>15,.2f}")
     print("=" * 88)
     print(f"{'TOTAL':<12} {'':<10} {'':>6} {'':>12} {'':>12} "
-          f"{'':>15} {(total_tx_bytes + total_tx_bytes) // 1024:>15,.2f}")
+          f"{'':>15} {(total_rx_bytes + total_tx_bytes) // 1024:>15,.2f}")
 
 
 if __name__ == "__main__":
