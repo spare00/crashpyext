@@ -74,7 +74,7 @@ def analyze_bnxt(netdev_addr, buffer_size, verbose=False, debug=False):
         aligned_size = align_up(netdev_size, 32)
         bnxt_addr = netdev_addr + aligned_size
         if debug:
-            print(f"DEBUG: bnxt_addr: {hex(bnxt_addr)}")
+            print(f"DEBUG: bnxt {hex(bnxt_addr)}")
 
         # Offset helpers
         rx_ring_off = get_field_offset("bnxt", "rx_ring")
@@ -99,6 +99,8 @@ def analyze_bnxt(netdev_addr, buffer_size, verbose=False, debug=False):
 
         for i in range(num_rx_rings):
             ring_info_ptr = rx_ring_ptr + i * rx_ring_info_size
+            if debug:
+                print(f"DEBUG: [RX Ring {i}] bnxt_rx_ring_info {hex(ring_info_ptr)}")
             try:
                 ring_info = readSU("struct bnxt_rx_ring_info", ring_info_ptr)
                 rx_buf_ring_ptr = ring_info.rx_buf_ring
@@ -114,6 +116,8 @@ def analyze_bnxt(netdev_addr, buffer_size, verbose=False, debug=False):
             ring_buf_count = 0
             ring_struct_addr = ring_info_ptr + rx_ring_struct_off
             ring_mem_addr = ring_struct_addr + ring_mem_off
+            if debug:
+                print(f"DEBUG: [RX Ring {i}] bnxt_ring_struct {hex(ring_struct_addr)}")
 
             try:
                 ring_depth = readU16(ring_mem_addr + depth_off)
@@ -156,6 +160,8 @@ def analyze_bnxt(netdev_addr, buffer_size, verbose=False, debug=False):
 
         for i in range(num_tx_rings):
             ring_info_ptr = tx_ring_ptr + i * tx_ring_info_size
+            if debug:
+                print(f"DEBUG: [TX Ring {i}] bnxt_tx_ring_info {hex(ring_info_ptr)}")
             try:
                 ring_info = readSU("struct bnxt_tx_ring_info", ring_info_ptr)
                 tx_buf_ring_ptr = ring_info.tx_buf_ring
@@ -170,6 +176,8 @@ def analyze_bnxt(netdev_addr, buffer_size, verbose=False, debug=False):
 
             ring_struct_addr = ring_info_ptr + tx_ring_info_struct_off
             ring_mem_addr = ring_struct_addr + ring_mem_off
+            if debug:
+                print(f"DEBUG: [TX Ring {i}] bnxt_ring_struct {hex(ring_struct_addr)}")
 
             try:
                 ring_depth = readU16(ring_mem_addr + depth_off)
@@ -199,7 +207,7 @@ def analyze_bnxt(netdev_addr, buffer_size, verbose=False, debug=False):
                     continue
 
             if debug:
-                print(f"DEBUG: [TX Ring {i}] Buffers used: {buf_count} / {ring_depth}")
+                print(f"DEBUG: [TX Ring {i}] Allocated buffers: {buf_count} / {ring_depth}")
             total_tx_buffers += buf_count
 
         return {
@@ -220,7 +228,7 @@ def analyze_tg3(dev_addr, buffer_size, verbose=False, debug=False):
         aligned_size = align_up(netdev_size, 32)
         tg3_addr = dev_addr + aligned_size
         if debug:
-            print(f"DEBUG: tg3_addr = {hex(tg3_addr)}")
+            print(f"DEBUG: tg3 {hex(tg3_addr)}")
 
         tg3 = readSU("struct tg3", tg3_addr)
 
@@ -239,6 +247,8 @@ def analyze_tg3(dev_addr, buffer_size, verbose=False, debug=False):
         for i in range(5):  # tg3 has napi[5]
             napi_addr = tg3_addr + napi_off + i * napi_size
             napi = readSU("struct tg3_napi", napi_addr)
+            if debug:
+                print(f"DEBUG: [NAPI {i}] tg3_napi {hex(napi_addr)}")
 
             # RX analysis
             rx_rcb_ptr = int(napi.rx_rcb)
@@ -262,12 +272,13 @@ def analyze_tg3(dev_addr, buffer_size, verbose=False, debug=False):
                             print("⚠️  tg3: Further unreadable RX descriptors suppressed...")
                         error_count += 1
                         continue
+
                 total_rx_buffers += rx_count
                 if debug:
-                    print(f"DEBUG: [NAPI {i}] RX buffers used: {rx_count}")
+                    print(f"DEBUG: [NAPI {i}] Allocated buffer: {rx_count} / {rx_ring_size}")
             else:
                 if debug:
-                    print(f"DEBUG: [NAPI {i}] Invalid rx_rcb_ptr = {hex(rx_rcb_ptr)} — skipping")
+                    print(f"DEBUG: [NAPI {i}] rx_rcb_ptr = {hex(rx_rcb_ptr)} skipping")
 
             # TX analysis
             tx_ring_ptr = int(napi.tx_ring)
@@ -303,12 +314,13 @@ def analyze_tg3(dev_addr, buffer_size, verbose=False, debug=False):
                             print("⚠️  tg3: Further unreadable TX descriptors suppressed...")
                         error_count += 1
                         continue
+
                 total_tx_buffers += tx_count
                 if debug:
-                    print(f"DEBUG: [NAPI {i}] TX buffers used: {tx_count}")
+                    print(f"DEBUG: [NAPI {i}] Allocated buffer: {tx_count} / {tx_ring_size}")
             else:
                 if debug:
-                    print(f"DEBUG: [NAPI {i}] Invalid tx_ring_ptr = {hex(tx_ring_ptr)} — skipping")
+                    print(f"DEBUG: [NAPI {i}] tx_ring_ptr = {hex(tx_ring_ptr)} — skipping")
 
         return {
             "driver": "tg3",
