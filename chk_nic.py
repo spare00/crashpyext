@@ -46,8 +46,9 @@ def get_field_offset(struct_name, field_name):
             continue
 
         # Clean trailing semicolon and pointer/reference symbols
-        raw_field = parts[-1].rstrip(';')
-        raw_field = raw_field.lstrip('*')  # handle pointer notation
+        raw_field = parts[-1].rstrip(';')  # Remove semicolon
+        raw_field = raw_field.lstrip('*')  # Remove pointer mark
+        raw_field = raw_field.split('[')[0]  # Strip array index, e.g., napi[5] → napi
 
         if raw_field == field_name:
             try:
@@ -165,7 +166,7 @@ def analyze_bnxt(netdev_addr, buffer_size, verbose=False, debug=False):
         num_tx_rings = readU16(bnxt_addr + tx_nr_rings_off)
         tx_ring_info_size = get_struct_size("bnxt_tx_ring_info")
         tx_bd_size = get_struct_size("tx_bd")
-        tx_data_off = get_field_offset("tx_bd", "addr")
+        tx_data_off = get_field_offset("tx_bd", "tx_bd_haddr")
 
         total_tx_buffers = 0
 
