@@ -37,14 +37,25 @@ def get_struct_size(struct_name):
 def get_field_offset(struct_name, field_name):
     output = exec_crash_command(f"struct {struct_name} -o")
     for line in output.splitlines():
-        if field_name in line:
-            parts = line.strip().split()
-            if parts[0].startswith('[') and parts[0].endswith(']'):
-                try:
-                    offset = int(parts[0][1:-1])
-                    return offset
-                except ValueError:
-                    continue
+        line = line.strip()
+        if not line or not line.startswith('['):
+            continue
+
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+
+        # Clean trailing semicolon and pointer/reference symbols
+        raw_field = parts[-1].rstrip(';')
+        raw_field = raw_field.lstrip('*')  # handle pointer notation
+
+        if raw_field == field_name:
+            try:
+                offset = int(parts[0][1:-1])
+                return offset
+            except ValueError:
+                continue
+
     raise RuntimeError(f"Field {field_name} not found in struct {struct_name}")
 
 def parse_net_devices(debug=False):
@@ -439,6 +450,92 @@ def analyze_ice(dev_addr, buffer_size, verbose=False, debug=False):
         print(f"❌ Error analyzing ice: {e}")
         return None
 
+def analyze_virtio_net(netdev_addr, buffer_size, verbose=False, debug=False):
+    try:
+        netdev = readSU("struct net_device", netdev_addr)
+        ml_priv_offset = get_field_offset("net_device", "ml_priv")
+        priv_ptr = readPtr(netdev_addr + ml_priv_offset)
+        if priv_ptr == 0:
+            if debug:
+                print("DEBUG: ml_priv is NULL — skipping")
+            return {
+                "driver": "virtio_net",
+                "rx_buffers": 0,
+                "tx_buffers": 0,
+                "rx_bytes": 0,
+                "tx_bytes": 0
+            }
+
+        if debug:
+            print(f"DEBUG: netdev_addr {hex(netdev_addr)}")
+            print(f"DEBUG: ml_priv_offset {ml_priv_offset}")
+            print(f"DEBUG: virtnet_info {priv_ptr}")
+            print(f"DEBUG: netdev {netdev}")
+        priv = readSU("struct virtnet_info", priv_ptr)
+
+        curr_qpairs = int(priv.curr_queue_pairs)
+        if curr_qpairs == 0:
+            if debug:
+                print("DEBUG: curr_queue_pairs is 0 — skipping")
+            return {
+                "driver": "virtio_net",
+                "rx_buffers": 0,
+                "tx_buffers": 0,
+                "rx_bytes": 0,
+                "tx_bytes": 0
+            }
+
+        rx_total = 0
+        tx_total = 0
+
+        rxq_size = get_struct_size("receive_queue")
+        txq_size = get_struct_size("send_queue")
+
+        for i in range(curr_qpairs):
+            # RX ring analysis
+            rq_ptr = readPtr(priv_ptr + get_field_offset("virtnet_info", "rq") + i * 8)
+            if rq_ptr:
+                try:
+                    rq = readSU("struct receive_queue", rq_ptr)
+                    vq_ptr = int(rq.vq)
+                    if vq_ptr:
+                        vq = readSU("struct virtqueue", vq_ptr)
+                        used = 256 - int(vq.num_free)  # Assume 256 ring size unless known
+                        rx_total += used
+                        if debug:
+                            print(f"DEBUG: [RX {i}] used = {used}")
+                except Exception as e:
+                    if debug:
+                        print(f"DEBUG: [RX {i}] error: {e}")
+
+            # TX ring analysis
+            sq_ptr = readPtr(priv_ptr + get_field_offset("virtnet_info", "sq") + i * 8)
+            if sq_ptr:
+                try:
+                    sq = readSU("struct send_queue", sq_ptr)
+                    vq_ptr = int(sq.vq)
+                    if vq_ptr:
+                        vq = readSU("struct virtqueue", vq_ptr)
+                        used = 256 - int(vq.num_free)  # Again, assume default ring size
+                        tx_total += used
+                        if debug:
+                            print(f"DEBUG: [TX {i}] used = {used}")
+                except Exception as e:
+                    if debug:
+                        print(f"DEBUG: [TX {i}] error: {e}")
+
+        return {
+            "driver": "virtio_net",
+            "rx_buffers": rx_total,
+            "tx_buffers": tx_total,
+            "rx_bytes": rx_total * buffer_size,
+            "tx_bytes": tx_total * buffer_size
+        }
+
+    except Exception as e:
+        print(f"❌ Error analyzing virtio_net: {e}")
+        return None
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
@@ -457,6 +554,11 @@ def main():
     known_builtin_drivers = {
         "loopback_ops": "loopback device",
         "team_netdev_ops": "virtual device",
+        "internal_dev_netdev_ops": "virtual device",
+        "ipgre_netdev_ops": "tunnel device",
+        "gre_tap_netdev_ops": "tunnel device",
+        "erspan_netdev_ops": "tunnel device",
+        "vxlan_netdev_ether_ops": "tunnel device",
     }
 
     for addr in parse_net_devices(args.debug):
@@ -511,6 +613,8 @@ def main():
                 result = analyze_tg3(addr, buffer_size, args.verbose, args.debug)
             elif func_name == "ice_netdev_ops":
                 result = analyze_ice(addr, buffer_size, args.verbose, args.debug)
+            elif func_name == "virtnet_netdev":
+                result = analyze_virtio_net(addr, buffer_size, args.verbose, args.debug)
             else:
                 note = f"unsupported driver ({func_name})"
                 if args.debug:
