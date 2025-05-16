@@ -1,5 +1,5 @@
 # -----------------------------------------------------------------------------
-# Examples for how to find values to use with --phys, --page, or --validity
+# Examples for how to find values to use with --phys, --kvaddr, or --validity
 #
 # --phys 0x926f87000
 #   → From vtop or page table walk output. This is the *physical address* of
@@ -10,7 +10,7 @@
 #     PTE: 0x926f87100 => 0xef980207ffffff8b
 #     → page-aligned base = 0x926f87000
 #
-# --page ffff8a26a6f87000
+# --kvaddr ffff8a26a6f87000
 #   → Kernel virtual address of the same PTE page (via direct map)
 #
 #     crash> ptov 0x926f87000
@@ -38,7 +38,7 @@ Examples:
   --phys 0x926f87000
       → From 'vtop' output: PTE entry page (aligned 4KB physical address)
 
-  --page ffff8a26a6f87000
+  --kvaddr ffff8a26a6f87000
       → From 'ptov 0x926f87000': kernel virtual address of PTE page
 
   --validity 0x561a84a202f8
@@ -53,7 +53,7 @@ Examples:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--phys", type=lambda x: int(x, 16),
             help="Physical base address of the PTE page (512 entries)")
-    group.add_argument("--page", type=lambda x: int(x, 16),
+    group.add_argument("--kvaddr", type=lambda x: int(x, 16),
             help="Kernel virtual address (e.g. direct-mapped) of the PTE page")
     group.add_argument("--validity", type=lambda x: int(x, 16),
             help="Validate PTE entry for a virtual address")
@@ -223,8 +223,8 @@ def main():
             sys.exit(1)
     if args.phys:
         scan_pte_page(args.phys, is_phys=True, verbose=args.verbose, debug=args.debug)
-    elif args.page:
-        scan_pte_page(args.page, is_phys=False, verbose=args.verbose, debug=args.debug)
+    elif args.kvaddr:
+        scan_pte_page(args.kvaddr, is_phys=False, verbose=args.verbose, debug=args.debug)
 
 if __name__ == "__main__":
     main()
