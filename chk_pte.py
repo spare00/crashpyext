@@ -32,17 +32,31 @@ import struct
 
 def parse_args():
     usage_desc = """
-Scan a PTE page for corruption or validate a single virtual address.
+Scan a PTE or PTEs in a PTE page for corruption or validate a single virtual address.
 
 Examples:
-  --phys 0x926f87000
-      → From 'vtop' output: PTE entry page (aligned 4KB physical address)
+ --phys 0x926f87000
+   → From vtop or page table walk output. This is the *physical address* of
+     a PTE page containing 512 64-bit entries (typically 4KB aligned).
 
-  --kvaddr ffff8a26a6f87000
-      → From 'ptov 0x926f87000': kernel virtual address of PTE page
+     crash> vtop 0x561a84a202f8
+     ...
+     PTE: 0x926f87100 => 0xef980207ffffff8b
+     → page-aligned base = 0x926f87000
 
-  --validity 0x561a84a202f8
-      → From crash log: virtual address that triggered a page fault
+ --kvaddr ffff8a26a6f87000
+   → Kernel virtual address of the same PTE page (via direct map)
+
+     crash> ptov 0x926f87000
+     VIRTUAL           PHYSICAL
+     ffff8a26a6f87000  926f87000
+
+ --validity 0x561a84a202f8
+   → The *virtual address* that caused a page fault or crash
+     (e.g. from logs or RIP context).
+
+     [1517658.618535] aide: Corrupted page table at address 561a84a202f8
+     → Use: --validity 0x561a84a202f8
 """
 
     parser = argparse.ArgumentParser(
@@ -52,11 +66,11 @@ Examples:
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--phys", type=lambda x: int(x, 16),
-            help="Physical base address of the PTE page (512 entries)")
+            help="Scan all 512 entries in a PTE page using the base physical address of a page table (e.g. from 'vtop' → PTE address masked with 0xfff)")
     group.add_argument("--kvaddr", type=lambda x: int(x, 16),
-            help="Kernel virtual address (e.g. direct-mapped) of the PTE page")
+            help="Scan all 512 entries in a PTE page using the kernel virtual address of a page table (e.g. from 'ptov <phys>')")
     group.add_argument("--validity", type=lambda x: int(x, 16),
-            help="Validate PTE entry for a virtual address")
+            help="Validate PTE entry for a virtual address that caused  a page fault")
 
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     parser.add_argument("-d", "--debug", action="store_true", help="Debug output")
