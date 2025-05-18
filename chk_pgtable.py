@@ -356,7 +356,7 @@ def analyze_faulting_va(fault_va, verbose=False, debug=False):
         print(f"  → {bad_pte} reserved-bit errors {'✅' if bad_pte == 0 else '❌'}\n")
 
         # Scan PMD page
-        pmd_match = re.search(r"PMD:\s+[0-9a-f]+ => ([0-9a-f]+)", output)
+        pmd_match = re.search(r"PMD:\s+([0-9a-fx]+)\s+=>\s+([0-9a-fx]+)", output)
         if not pmd_match:
             raise RuntimeError("Could not extract PMD address from vtop")
         pmd_val = int(pmd_match.group(1), 16)
