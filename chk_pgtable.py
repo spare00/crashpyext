@@ -129,11 +129,11 @@ def is_pte_valid(pte_addr, pte_val, verbose=False, debug=False):
         print("  Flags Bits (Bits 0-11):       ────────────────────────────────────────────────┘")
 
     if reserved != 0:
-        print("\n❌ Invalid: Reserved bits 52–62 are set.")
+        print(red("\n❌ Invalid: Reserved bits 52–62 are set."))
     elif phys_addr > max_phys_addr:
-        print("\n❌ Invalid: Physical address exceeds CPU-supported limit.")
+        print(red("\n❌ Invalid: Physical address exceeds CPU-supported limit."))
     elif not (flags & 0x1):
-        print("\n❌ Invalid: Not present (P bit not set).")
+        print(red("\n❌ Invalid: Not present (P bit not set)."))
     else:
         print("\n✅ PTE is valid.")
 
