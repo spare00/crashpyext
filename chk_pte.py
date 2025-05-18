@@ -168,13 +168,50 @@ def read_pte_page_via_rd(phys_addr, debug=False):
 
     return entries
 
+def is_hugepage_mapping(vaddr, debug=False):
+    """
+    Checks if the given virtual address is backed by a PMD-level huge page.
+
+    Returns:
+        True if hugepage is used, False otherwise
+    """
+    output = exec_crash_command(f"vtop 0x{vaddr:x}")
+    if debug:
+        print("→ Raw vtop output for hugepage check:")
+        print(output)
+
+    match = re.search(r"PMD:\s+[0-9a-fx]+\s+=>\s+([0-9a-fA-Fx]+)", output)
+    if not match:
+        return False
+
+    pmd_entry = int(match.group(1), 16)
+    return (pmd_entry & (1 << 7)) != 0  # bit 7 = huge page
+
 def scan_pte_page(addr, is_phys=False, verbose=False, debug=False):
     try:
         if is_phys:
             phys_addr = addr
             if debug:
                 print(f"→ Using physical address: 0x{phys_addr:x}")
+
+            # 🧠 Resolve virtual address to check if it's a hugepage
+            output = exec_crash_command(f"ptov 0x{phys_addr:x}")
+            match = re.search(r"([0-9a-fA-F]+)\s+%x" % phys_addr, output, re.IGNORECASE)
+            if not match:
+                print(f"⚠️  Warning: Could not resolve virtual address for phys 0x{phys_addr:x} — skipping hugepage check.")
+            else:
+                kvaddr = int(match.group(1), 16)
+                if is_hugepage_mapping(kvaddr, debug=debug):
+                    print(f"⚠️  Skipping scan: Physical page 0x{phys_addr:x} is mapped via a 2MB huge page (PMD-level).")
+                    print(f"   PTE entries are unused in this mapping.")
+                    return
+
         else:
+            # Input is a virtual address (kvaddr)
+            if is_hugepage_mapping(addr, debug=debug):
+                print(f"⚠️  Skipping scan: VA 0x{addr:x} is mapped via a 2MB huge page (PMD-level).")
+                print(f"   PTE entries are unused in this mapping.")
+                return
             phys_addr = resolve_kernel_virt_to_phys(addr, debug)
 
         entries = read_pte_page_via_rd(phys_addr, debug)
