@@ -82,6 +82,18 @@ def is_hugepage_mapping(vaddr, debug=False):
     pmd_entry = int(match.group(1), 16)
     return (pmd_entry & (1 << 7)) != 0  # bit 7 = huge page
 
+def format_pte_binary(pte_val):
+    """Format a 64-bit PTE entry for annotated binary display"""
+    binstr = f"{pte_val:064b}"
+    grouped = (
+        f"{binstr[0]} "             # NX (bit 63)
+        f"{binstr[1:12]} "          # Reserved (52–62)
+        f"{binstr[12:52]} "         # Physical Addr (12–51)
+        f"{binstr[52:]}"            # Flags (0–11)
+    )
+    return grouped
+
+
 def is_pte_valid(pte_addr, pte_val, verbose=False, debug=False):
     flags = pte_val & 0xfff
     nx_bit = (pte_val >> 63) & 0x1
@@ -103,16 +115,27 @@ def is_pte_valid(pte_addr, pte_val, verbose=False, debug=False):
     print(f"  → NX             : {nx_bit}")
     print(f"  → Reserved[52–62]: 0x{reserved:x}")
     print(f"  → Physical Addr  : 0x{phys_addr:x}")
-    print(f"  → Max Phys Addr  : 0x{max_phys_addr:x} ({x86_phys_bits} bits)\n")
+    print(f"  → Max Phys Addr  : 0x{max_phys_addr:x} ({x86_phys_bits} bits)")
+
+    if verbose:
+        binary_output = format_pte_binary(pte_val)
+
+        print("\n=== Breakdown of PTE binary bits ===")
+        print(f"  Binary:           {binary_output}")
+        print("                    ^           ^                           ^                   ^")
+        print("  NX Bit (Bit 63): ─┘           |                           |                   |")
+        print("  Reserved Bits (Bits 52-62): ──┘                           |                   |")
+        print("  Physical Address Bits (Bits 12-51):  ─────────────────────┘                   |")
+        print("  Flags Bits (Bits 0-11):       ────────────────────────────────────────────────┘")
 
     if reserved != 0:
-        print("❌ Invalid: Reserved bits 52–62 are set.")
+        print("\n❌ Invalid: Reserved bits 52–62 are set.")
     elif phys_addr > max_phys_addr:
-        print("❌ Invalid: Physical address exceeds CPU-supported limit.")
+        print("\n❌ Invalid: Physical address exceeds CPU-supported limit.")
     elif not (flags & 0x1):
-        print("❌ Invalid: Not present (P bit not set).")
+        print("\n❌ Invalid: Not present (P bit not set).")
     else:
-        print("✅ PTE is valid.")
+        print("\n✅ PTE is valid.")
 
     return reserved == 0 and phys_addr <= max_phys_addr and (flags & 0x1)
 
