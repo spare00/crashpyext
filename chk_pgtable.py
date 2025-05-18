@@ -82,24 +82,6 @@ def is_hugepage_mapping(vaddr, debug=False):
     pmd_entry = int(match.group(1), 16)
     return (pmd_entry & (1 << 7)) != 0  # bit 7 = huge page
 
-def resolve_vtop(vaddr, debug=False):
-    output = exec_crash_command(f"vtop 0x{vaddr:x}")
-    if debug:
-        print("→ Raw output from crash vtop:")
-        print(output)
-
-    if "PTE:" not in output:
-        raise RuntimeError("vtop output does not contain a PTE entry")
-
-    match = re.search(r"PTE:\s+([0-9a-fx]+)\s+=>\s+([0-9a-fx]+)", output)
-    if not match:
-        raise RuntimeError("Failed to parse PTE line from vtop output")
-
-    pte_addr = int(match.group(1), 16)
-    pte_val = int(match.group(2), 16)
-
-    return pte_addr, pte_val
-
 def is_pte_valid(pte_addr, pte_val, verbose=False, debug=False):
     flags = pte_val & 0xfff
     nx_bit = (pte_val >> 63) & 0x1
@@ -365,25 +347,12 @@ def main():
             analyze_faulting_va(args.fault_va, verbose=args.verbose, debug=args.debug)
         except Exception as e:
             print(f"❌ Error processing faulting VA: {e}")
-            sys.exit(1)
     elif args.validate_pte:
-        # Minimal context, validate a single raw PTE
-        ok = is_pte_valid(pte_addr=0, pte_val=args.validate_pte, verbose=args.verbose, debug=args.debug)
-        if not ok:
-            sys.exit(1)
+        is_pte_valid(pte_addr=0, pte_val=args.validate_pte, verbose=args.verbose, debug=args.debug)
     elif args.pte_phys:
         scan_pte_page(args.pte_phys, verbose=args.verbose, debug=args.debug)
     elif args.pmd_phys:
         scan_pmd_page(args.pmd_phys, verbose=args.verbose, debug=args.debug)
-    elif args.validity:
-        try:
-            pte_addr, pte_val = resolve_vtop(args.validity, debug=args.debug)
-            ok = is_pte_valid(pte_addr, pte_val, verbose=args.verbose, debug=args.debug)
-            if not ok:
-                sys.exit(1)
-        except Exception as e:
-            print(f"❌ Error: {e}")
-            sys.exit(1)
 
 if __name__ == "__main__":
     main()
