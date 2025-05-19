@@ -11,36 +11,31 @@ import re
 import argparse
 from collections import defaultdict
 from crash import exec_crash_command
-
 patterns = {
-    'active_anon': r'active_anon:(\d+)',
-    'inactive_anon': r'inactive_anon:(\d+)',
-    'isolated_anon': r'isolated_anon:(\d+)',
-    'active_file': r'active_file:(\d+)',
-    'inactive_file': r'inactive_file:(\d+)',
-    'isolated_file': r'isolated_file:(\d+)',
-    'unevictable': r'unevictable:(\d+)',
-    'dirty': r'dirty:(\d+)',
-    'writeback': r'writeback:(\d+)',
-    'slab_reclaimable': r'slab_reclaimable:(\d+)',
-    'slab_unreclaimable': r'slab_unreclaimable:(\d+)',
-    'mapped': r'mapped:(\d+)',
-    'shmem': r'shmem:(\d+)',
-    'pagetables': r'pagetables:(\d+)',
-    'bounce': r'bounce:(\d+)',
-    'free': r'free:(\d+)',
-    'free_pcp': r'free_pcp:(\d+)',
-    'free_cma': r'free_cma:(\d+)',
+    'active_anon': r'active_anon:(\d+)(kB)?',
+    'inactive_anon': r'inactive_anon:(\d+)(kB)?',
+    'isolated_anon': r'isolated_anon:(\d+)(kB)?',
+    'active_file': r'active_file:(\d+)(kB)?',
+    'inactive_file': r'inactive_file:(\d+)(kB)?',
+    'isolated_file': r'isolated_file:(\d+)(kB)?',
+    'unevictable': r'unevictable:(\d+)(kB)?',
+    'dirty': r'dirty:(\d+)(kB)?',
+    'writeback': r'writeback:(\d+)(kB)?',
+    'slab_reclaimable': r'slab_reclaimable:(\d+)(kB)?',
+    'slab_unreclaimable': r'slab_unreclaimable:(\d+)(kB)?',
+    'mapped': r'mapped:(\d+)(kB)?',
+    'shmem': r'shmem:(\d+)(kB)?',
+    'pagetables': r'pagetables:(\d+)(kB)?',
+    'bounce': r'bounce:(\d+)(kB)?',
+    'free': r'free:(\d+)(kB)?',
+    'free_pcp': r'free_pcp:(\d+)(kB)?',
+    'free_cma': r'free_cma:(\d+)(kB)?',
     'pagecache': r'(\d+) total pagecache pages',
     'swapcache': r'(\d+) pages in swap cache',
     'reserved': r'(\d+) pages reserved',
     'total_pages_ram': r'(\d+) pages RAM',
     'free_swap': r'Free swap\s*=\s*(\d+)kB',
     'total_swap': r'Total swap\s*=\s*(\d+)kB',
-    'hugepages_total': r'hugepages_total=(\d+)',
-    'hugepages_free': r'hugepages_free=(\d+)',
-    'hugepages_surp': r'hugepages_surp=(\d+)',
-    'hugepages_size': r'hugepages_size=(\d+)kB',
 }
 
 def format_value(kb, unit):
@@ -50,6 +45,7 @@ def format_value(kb, unit):
         return kb / 1024
     elif unit == 'GB':
         return kb / 1024 / 1024
+    return kb
 
 def parse_oom_log(log_lines, debug=False, verbose=False):
     """
@@ -161,54 +157,52 @@ def display_usage(event_usage, include_swap, unit='GB'):
             print(f"{total_rss:>10.2f} {'RSS Total':>15}")
 
 def extract_and_display_meminfo_blocks(log_lines, show_unaccounted=False, show_full=False, unit='MB', verbose=False):
-    from collections import OrderedDict
+    log_data = "\n".join(log_lines)
+    mem_info_pattern = r'(\[.*?\])\s+Mem-Info:'
+    matches = list(re.finditer(mem_info_pattern, log_data))
 
-    mem_blocks = []
-    current_event = None
-    collecting = False
-    block = []
+    if not matches:
+        print("[INFO] No Mem-Info blocks found.")
+        return
 
-    # Collect Mem-Info blocks associated with OOM events
-    for line in log_lines:
-        if "invoked oom-killer" in line:
-            current_event = line.strip()
-            collecting = False
-        elif "Mem-Info:" in line and current_event:
-            collecting = True
-            block = [current_event]
-        elif collecting:
-            if line.strip() == "" or "Unreclaimable slab info:" in line:
-                mem_blocks.append((block[0], block[1:]))
-                collecting = False
-            else:
-                block.append(line.strip())
+    width = 15 if unit == 'KB' else 10
 
-    for timestamp, lines in mem_blocks:
+    for i, match in enumerate(matches):
+        start = match.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(log_data)
+        block_text = log_data[start:end]
+        timestamp = match.group(1)
+
         data = {}
         for field, pat in patterns.items():
-            for line in lines:
-                # Strip timestamp
-                content = line.split("] ", 1)[-1].strip()
-
-                match = re.search(pat, content)
-                if not match:
-                    continue
-
+            match = re.search(pat, block_text)
+            if match:
                 val = int(match.group(1))
-
+                is_kb = 'kB' in match.group(0)
                 if field in ('free_swap', 'total_swap'):
-                    mb_val = val / 1024  # Already in kB
+                    kb_val = val  # Already in kB
+                elif is_kb:
+                    kb_val = val
                 else:
-                    mb_val = val * 4 / 1024  # Convert pages to MB
+                    kb_val = val * 4  # From pages to kB
+                data[field] = kb_val
+            else:
+                data[field] = 0.0
 
-                if field not in data or mb_val > data[field]:
-                    data[field] = mb_val
+        hugepage_matches = re.findall(
+            r'hugepages_total=(\d+)\s+hugepages_free=(\d+)\s+hugepages_surp=\d+\s+hugepages_size=(\d+)kB',
+            block_text)
 
-        # Derived values
-        data['swap_used'] = max(0, data.get('total_swap', 0) - data.get('free_swap', 0))
-        data['hugepages_used'] = (
-            data.get('hugepages_total', 0) - data.get('hugepages_free', 0)
-        ) * (data.get('hugepages_size', 0) / 1024 / 1024)
+        huge_total_kb = huge_used_kb = 0
+        for total, free, size in hugepage_matches:
+            total = int(total)
+            free = int(free)
+            size = int(size)
+            huge_total_kb += total * size
+            huge_used_kb += (total - free) * size
+
+        data['hugepages_total_mem'] = huge_total_kb
+        data['hugepages_used_mem'] = huge_used_kb
 
         total = data.get('total_pages_ram', 0)
 
@@ -219,17 +213,15 @@ def extract_and_display_meminfo_blocks(log_lines, show_unaccounted=False, show_f
             ('Inactive File', data.get('inactive_file', 0)),
             ('Slab Reclaimable', data.get('slab_reclaimable', 0)),
             ('Slab Unreclaimable', data.get('slab_unreclaimable', 0)),
-            ('Shmem', data.get('shmem', 0)),
             ('Pagetables', data.get('pagetables', 0)),
             ('Free', data.get('free', 0)),
             ('Free Pcp', data.get('free_pcp', 0)),
             ('Pagecache', data.get('pagecache', 0)),
             ('Reserved', data.get('reserved', 0)),
-            ('Hugepages Total', data.get('hugepages_total', 0) * data.get('hugepages_size', 0) / 1024 / 1024),
-            ('Hugepages Used', data.get('hugepages_used', 0)),
-            ('Swap Total', data.get('total_swap', 0)),
-            ('Swap Free', data.get('free_swap', 0)),
-            ('Swap Used', data.get('swap_used', 0)),
+            ('Bounce', data.get('bounce', 0)),
+            ('Free CMA', data.get('free_cma', 0)),
+            ('Hugepages Total', data.get('hugepages_total_mem', 0)),
+            ('Hugepages Used', data.get('hugepages_used_mem', 0)),
         ])
 
         extended_fields = OrderedDict([
@@ -239,68 +231,51 @@ def extract_and_display_meminfo_blocks(log_lines, show_unaccounted=False, show_f
             ('Dirty', data.get('dirty', 0)),
             ('Writeback', data.get('writeback', 0)),
             ('Mapped', data.get('mapped', 0)),
-            ('Bounce', data.get('bounce', 0)),
-            ('Free CMA', data.get('free_cma', 0)),
+            ('Shmem', data.get('shmem', 0)),
             ('Swap cache', data.get('swapcache', 0)),
         ])
 
-        sum_base = sum(base_fields.values())
-        sum_extra = sum(extended_fields.values()) if show_unaccounted and show_full else 0
-        accounted = sum_base + sum_extra
-        unaccounted = total \
-            - data.get('active_anon', 0) \
-            - data.get('inactive_anon', 0) \
-            - data.get('isolated_anon', 0) \
-            - data.get('pagecache', 0) \
-            - data.get('swapcache', 0) \
-            - data.get('slab_reclaimable', 0) \
-            - data.get('slab_unreclaimable', 0) \
-            - data.get('pagetables', 0) \
-            - data.get('free', 0) \
-            - data.get('reserved', 0) \
-            - data.get('unevictable', 0) \
-            - data.get('bounce', 0) \
-            - data.get('free_cma', 0) \
-            - (data.get('hugepages_total', 0) * data.get('hugepages_size', 0) / 1024 / 1024)
+        swap_fields = OrderedDict([
+            ('Swap Total', data.get('total_swap', 0)),
+            ('Swap Free', data.get('free_swap', 0)),
+            ('Swap Used', max(0.0, data.get('total_swap', 0) - data.get('free_swap', 0))),
+        ])
 
-        # Output
+        unaccounted = total - (
+            data.get('active_anon', 0) +
+            data.get('inactive_anon', 0) +
+            data.get('isolated_anon', 0) +
+            data.get('active_file', 0) +
+            data.get('inactive_file', 0) +
+            data.get('isolated_file', 0) +
+            data.get('slab_reclaimable', 0) +
+            data.get('slab_unreclaimable', 0) +
+            data.get('pagetables', 0) +
+            data.get('free', 0) +
+            data.get('free_pcp', 0) +
+            data.get('reserved', 0) +
+            data.get('bounce', 0) +
+            data.get('free_cma', 0) +
+            data.get('pagecache', 0) +
+            data.get('swapcache', 0) +
+            data.get('hugepages_total_mem', 0)
+        )
+
         print(f"\nTimestamp: {timestamp}")
-        print(f"{'Category':<35}{unit:>8}")
-        print("=" * 43)
+        print(f"{'Category':<35}{unit:>{width}}")
+        print("=" * (35 + width))
         for k, v in base_fields.items():
-            print(f"{k:<35}{format_value(v, unit):>8.2f}")
-        if show_unaccounted and show_full:
+            print(f"{k:<35}{format_value(v, unit):>{width}.2f}")
+        if show_full:
             for k, v in extended_fields.items():
-                print(f"{k:<35}{format_value(v, unit):>8.2f}")
+                print(f"{k:<35}{format_value(v, unit):>{width}.2f}")
+        for k, v in swap_fields.items():
+            print(f"{k:<35}{format_value(v, unit):>{width}.2f}")
         if show_unaccounted:
-            print("-" * 43)
-            print(f"{'Unaccounted Memory':<35}{format_value(unaccounted, unit):>8.2f}")
-        print("=" * 43)
-        print(f"{'Total Memory':<35}{format_value(total, unit):>8.2f}")
-
-        if show_unaccounted and verbose:
-            # For breakdown display
-            components = OrderedDict([
-                ('Active Anon', data.get('active_anon', 0)),
-                ('Inactive Anon', data.get('inactive_anon', 0)),
-                ('Isolated Anon', data.get('isolated_anon', 0)),
-                ('Pagecache', data.get('pagecache', 0)),
-                ('Swapcache', data.get('swapcache', 0)),
-                ('Slab Reclaimable', data.get('slab_reclaimable', 0)),
-                ('Slab Unreclaimable', data.get('slab_unreclaimable', 0)),
-                ('Pagetables', data.get('pagetables', 0)),
-                ('Free', data.get('free', 0)),
-                ('Reserved', data.get('reserved', 0)),
-                ('Unevictable', data.get('unevictable', 0)),
-                ('Bounce', data.get('bounce', 0)),
-                ('Free CMA', data.get('free_cma', 0)),
-                ('Huge Pages', data.get('hugepages_total', 0) * data.get('hugepages_size', 0) / 1024 / 1024),
-            ])
-
-            terms_str = " - ".join(f"{format_value(v, unit):.2f}" for v in components.values())
-            formula_str = " - ".join(components.keys())
-            print(f"\nUnaccounted memory = Total Memory - {formula_str}")
-            print(f"{format_value(unaccounted, unit):.2f} = {format_value(total, unit):.2f} - {terms_str}")
+            print("-" * (35 + width))
+            print(f"{'Unaccounted Memory':<35}{format_value(unaccounted, unit):>{width}.2f}")
+        print("=" * (35 + width))
+        print(f"{'Total Memory':<35}{format_value(total, unit):>{width}.2f}")
 
 def extract_and_display_slab_info(log_lines, unit='MB'):
     current_event = None
@@ -371,7 +346,6 @@ def main():
     raw_log = exec_crash_command('log -T')
     log_lines = raw_log.splitlines()
     oom_events = parse_oom_log(log_lines, debug=args.debug, verbose=args.verbose)
-    event_usage = extract_rss_and_swap_usage(oom_events, include_swap=args.swap, debug=args.debug, verbose=args.verbose)
 
     show_meminfo = args.meminfo or args.unaccounted or args.full
     show_process = not show_meminfo or args.process
@@ -386,7 +360,7 @@ def main():
         )
         display_usage(event_usage, include_swap=args.swap, unit=args.unit)
 
-    if show_meminfo:
+    elif show_meminfo:
         extract_and_display_meminfo_blocks(
             log_lines,
             show_unaccounted=args.unaccounted,
