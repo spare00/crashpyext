@@ -9,6 +9,7 @@ Supports -s (include swap), -d (debug), -v (verbose).
 
 import re
 import argparse
+from collections import OrderedDict
 from collections import defaultdict
 from crash import exec_crash_command
 patterns = {
