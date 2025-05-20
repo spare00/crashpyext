@@ -265,6 +265,7 @@ def extract_and_display_meminfo_blocks(log_lines, show_unaccounted=False, show_f
         print(f"\nTimestamp: {timestamp}")
         print(f"{'Category':<35}{unit:>{width}}")
         print("=" * (35 + width))
+        print(f"{'Total Memory':<35}{format_value(total, unit):>{width}.2f}")
         for k, v in base_fields.items():
             print(f"{k:<35}{format_value(v, unit):>{width}.2f}")
         if show_full:
@@ -276,12 +277,12 @@ def extract_and_display_meminfo_blocks(log_lines, show_unaccounted=False, show_f
             print("-" * (35 + width))
             print(f"{'Unaccounted Memory':<35}{format_value(unaccounted, unit):>{width}.2f}")
         print("=" * (35 + width))
-        print(f"{'Total Memory':<35}{format_value(total, unit):>{width}.2f}")
 
 def extract_and_display_slab_info(log_lines, unit='MB'):
     current_event = None
     slab_entries = []
     collecting = False
+    found_any = False  # <-- NEW: track output
 
     for line in log_lines:
         content = line.split("] ", 1)[-1].strip()
@@ -301,18 +302,18 @@ def extract_and_display_slab_info(log_lines, unit='MB'):
             if content.startswith("[") or content.startswith("Tasks state"):
                 collecting = False
                 if slab_entries:
+                    found_any = True
                     print(f"\nEvent: {current_event}")
-                    print(f"Top Slab Usage (Unreclaimable):")
+                    print("Top Slab Usage (Unreclaimable):")
                     print(f"{f'Used ({unit})':>12}   Name")
                     top_entries = sorted(slab_entries, key=lambda x: x[1], reverse=True)[:10]
                     total = sum(x[1] for x in top_entries)
 
                     for name, used_mb in top_entries:
                         print(f"{format_value(used_mb, unit):>12.2f}   {name}")
-
                     print("-" * 34)
                     print(f"{format_value(total, unit):>12.2f}   Total Slab Usage")
-
+                slab_entries = []
                 continue
 
             parts = re.split(r'\s{2,}', content)
@@ -324,6 +325,9 @@ def extract_and_display_slab_info(log_lines, unit='MB'):
                     slab_entries.append((name, used_mb))
                 except ValueError:
                     continue
+
+    if not found_any:
+        print("[INFO] No unreclaimable slab data found in log.")
 
 def scan_lowmem_warnings(log_lines):
     lowmem_keywords = re.compile(
@@ -339,11 +343,11 @@ def scan_lowmem_warnings(log_lines):
             found = True
 
     if not found:
-        print("No low memory events detected in log -T.")
+        print("No low memory events detected in log.")
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Parse OOM logs from crash log -T")
+    parser = argparse.ArgumentParser(description="Parse OOM logs from crash log")
     parser.add_argument('-p', '--process', action='store_true', help="Show per-process memory usage (optional with -i/-u)")
     parser.add_argument('-s', '--swap', action='store_true', help="Include swap usage")
     parser.add_argument('-d', '--debug', action='store_true', help="Enable debug output")
@@ -361,13 +365,15 @@ def main():
 
     args = parser.parse_args()
 
-    raw_log = exec_crash_command('log -T')
+    raw_log = exec_crash_command('log')
     log_lines = raw_log.splitlines()
 
-    # Default behavior: scan for memory issues
-    if not (args.process or args.meminfo or args.unaccounted or args.full or args.slab):
+    no_analysis_flags = not any([args.process, args.meminfo, args.unaccounted, args.full, args.slab,args.swap])
+    if no_analysis_flags:
         scan_lowmem_warnings(log_lines)
         return
+    if args.swap and not args.process:
+        print("[WARN] --swap (-s) has no effect unless used with --process (-p).")
 
     oom_events = parse_oom_log(log_lines, debug=args.debug, verbose=args.verbose)
 
