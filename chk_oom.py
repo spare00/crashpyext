@@ -325,7 +325,24 @@ def extract_and_display_slab_info(log_lines, unit='MB'):
                 except ValueError:
                     continue
 
+def scan_lowmem_warnings(log_lines):
+    lowmem_keywords = re.compile(
+        r'oom-|Killed process|Mem-Info|allocation failure|Cannot allocate memory|out of memory',
+        re.IGNORECASE
+    )
+
+    found = False
+    print("\n[INFO] Low memory related log entries found:")
+    for line in log_lines:
+        if lowmem_keywords.search(line):
+            print(line)
+            found = True
+
+    if not found:
+        print("No low memory events detected in log -T.")
+
 def main():
+    import argparse
     parser = argparse.ArgumentParser(description="Parse OOM logs from crash log -T")
     parser.add_argument('-p', '--process', action='store_true', help="Show per-process memory usage (optional with -i/-u)")
     parser.add_argument('-s', '--swap', action='store_true', help="Include swap usage")
@@ -340,19 +357,21 @@ def main():
     unit_group.add_argument('-K', '--kilobytes', action='store_const', const='KB', dest='unit', help="Display values in kilobytes")
     unit_group.add_argument('-M', '--megabytes', action='store_const', const='MB', dest='unit', help="Display values in megabytes")
     unit_group.add_argument('-G', '--gigabytes', action='store_const', const='GB', dest='unit', help="Display values in gigabytes")
-    parser.set_defaults(unit='GB')  # Default to GB to match current behavior
+    parser.set_defaults(unit='GB')
 
     args = parser.parse_args()
 
     raw_log = exec_crash_command('log -T')
     log_lines = raw_log.splitlines()
+
+    # Default behavior: scan for memory issues
+    if not (args.process or args.meminfo or args.unaccounted or args.full or args.slab):
+        scan_lowmem_warnings(log_lines)
+        return
+
     oom_events = parse_oom_log(log_lines, debug=args.debug, verbose=args.verbose)
 
-    show_meminfo = args.meminfo or args.unaccounted or args.full
-    show_process = not show_meminfo or args.process
-
-    if show_process:
-        oom_events = parse_oom_log(log_lines, debug=args.debug, verbose=args.verbose)
+    if args.process:
         event_usage = extract_rss_and_swap_usage(
             oom_events,
             include_swap=args.swap,
@@ -361,7 +380,7 @@ def main():
         )
         display_usage(event_usage, include_swap=args.swap, unit=args.unit)
 
-    elif show_meminfo:
+    elif args.meminfo or args.unaccounted or args.full:
         extract_and_display_meminfo_blocks(
             log_lines,
             show_unaccounted=args.unaccounted,
@@ -370,7 +389,6 @@ def main():
             verbose=args.verbose
         )
 
-    # Show slab info only if -i/-u/-f/-p are not set
     if args.slab and not (args.meminfo or args.unaccounted or args.full or args.process):
         extract_and_display_slab_info(log_lines, unit=args.unit)
 
