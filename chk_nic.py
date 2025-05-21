@@ -1,5 +1,6 @@
 import re
 import argparse
+import crash
 from pykdump.API import *
 
 # Currently only support bnxt and tg3 drivers.
@@ -235,12 +236,22 @@ def analyze_bnxt(netdev_addr, buffer_size, verbose=False, debug=False):
         return None
 
 def analyze_tg3(dev_addr, buffer_size, verbose=False, debug=False):
+    DEFAULT_RING_SIZE = 1024
+    MAX_RING_SIZE = 8192
+    ERROR_LOG_LIMIT = 10
+
+    def log_read_error(addr, error_count, label="descriptor", limit=ERROR_LOG_LIMIT):
+        if error_count < limit:
+            print(f"⚠️  tg3: unreadable {label} at {hex(addr)}")
+        elif error_count == limit:
+            print(f"⚠️  tg3: Further unreadable {label}s suppressed...")
+
     try:
         netdev_size = get_struct_size("net_device")
         aligned_size = align_up(netdev_size, 32)
         tg3_addr = dev_addr + aligned_size
         if debug:
-            print(f"DEBUG: tg3 {hex(tg3_addr)}")
+            print(f"DEBUG: tg3 struct at {hex(tg3_addr)}")
 
         tg3 = readSU("struct tg3", tg3_addr)
 
@@ -260,13 +271,13 @@ def analyze_tg3(dev_addr, buffer_size, verbose=False, debug=False):
             napi_addr = tg3_addr + napi_off + i * napi_size
             napi = readSU("struct tg3_napi", napi_addr)
             if debug:
-                print(f"DEBUG: [NAPI {i}] tg3_napi {hex(napi_addr)}")
+                print(f"DEBUG: [NAPI {i}] struct tg3_napi at {hex(napi_addr)}")
 
             # RX analysis
             rx_rcb_ptr = int(napi.rx_rcb)
-            rx_ring_size = 1024  # conservative fallback
+            rx_ring_size = DEFAULT_RING_SIZE
 
-            if rx_rcb_ptr != 0 and rx_rcb_ptr != 0xffffffffffffffff:
+            if rx_rcb_ptr not in (0, 0xffffffffffffffff):
                 rx_count = 0
                 error_count = 0
                 for j in range(rx_ring_size):
@@ -278,37 +289,35 @@ def analyze_tg3(dev_addr, buffer_size, verbose=False, debug=False):
                             if verbose:
                                 print(f"[RX {i}:{j:04d}] addr_lo = {hex(val)}")
                     except:
-                        if error_count < 10:
-                            print(f"⚠️  tg3: unreadable RX descriptor at {hex(desc_addr)}")
-                        elif error_count == 10:
-                            print("⚠️  tg3: Further unreadable RX descriptors suppressed...")
+                        if verbose or debug:
+                            log_read_error(desc_addr, error_count, label="RX descriptor")
                         error_count += 1
                         continue
 
                 total_rx_buffers += rx_count
                 if debug:
-                    print(f"DEBUG: [NAPI {i}] Allocated buffer: {rx_count} / {rx_ring_size}")
+                    print(f"DEBUG: [NAPI {i}] RX buffers allocated: {rx_count} / {rx_ring_size}")
             else:
                 if debug:
-                    print(f"DEBUG: [NAPI {i}] rx_rcb_ptr = {hex(rx_rcb_ptr)} skipping")
+                    print(f"DEBUG: [NAPI {i}] rx_rcb_ptr = {hex(rx_rcb_ptr)} — skipping")
 
             # TX analysis
             tx_ring_ptr = int(napi.tx_ring)
             try:
                 tx_ring_size = readInt(napi_addr + tx_pending_off)
-                if tx_ring_size == 0 or tx_ring_size > 8192:
-                    tx_ring_size = 1024
+                if tx_ring_size == 0 or tx_ring_size > MAX_RING_SIZE:
+                    tx_ring_size = DEFAULT_RING_SIZE
                     if debug:
-                        print(f"DEBUG: [NAPI {i}] TX ring depth fallback to 1024")
+                        print(f"DEBUG: [NAPI {i}] TX ring depth fallback to {DEFAULT_RING_SIZE}")
                 else:
                     if debug:
                         print(f"DEBUG: [NAPI {i}] TX ring depth = {tx_ring_size}")
             except:
-                tx_ring_size = 1024
+                tx_ring_size = DEFAULT_RING_SIZE
                 if debug:
-                    print(f"DEBUG: [NAPI {i}] Failed to read tx_pending — fallback to 1024")
+                    print(f"DEBUG: [NAPI {i}] Failed to read tx_pending — fallback to {DEFAULT_RING_SIZE}")
 
-            if tx_ring_ptr != 0 and tx_ring_ptr != 0xffffffffffffffff:
+            if tx_ring_ptr not in (0, 0xffffffffffffffff):
                 tx_count = 0
                 error_count = 0
                 for j in range(tx_ring_size):
@@ -320,19 +329,19 @@ def analyze_tg3(dev_addr, buffer_size, verbose=False, debug=False):
                             if verbose:
                                 print(f"[TX {i}:{j:04d}] addr = {hex(val)}")
                     except:
-                        if error_count < 10:
-                            print(f"⚠️  tg3: unreadable TX descriptor at {hex(desc_addr)}")
-                        elif error_count == 10:
-                            print("⚠️  tg3: Further unreadable TX descriptors suppressed...")
+                        log_read_error(desc_addr, error_count, label="TX descriptor")
                         error_count += 1
                         continue
 
                 total_tx_buffers += tx_count
                 if debug:
-                    print(f"DEBUG: [NAPI {i}] Allocated buffer: {tx_count} / {tx_ring_size}")
+                    print(f"DEBUG: [NAPI {i}] TX buffers allocated: {tx_count} / {tx_ring_size}")
             else:
                 if debug:
                     print(f"DEBUG: [NAPI {i}] tx_ring_ptr = {hex(tx_ring_ptr)} — skipping")
+
+        if total_rx_buffers == 0 and total_tx_buffers == 0:
+            print("ℹ️  No RX/TX buffers found — descriptor memory may be unavailable in the dump.")
 
         return {
             "driver": "tg3",
@@ -537,6 +546,124 @@ def analyze_virtio_net(netdev_addr, buffer_size, verbose=False, debug=False):
         print(f"❌ Error analyzing virtio_net: {e}")
         return None
 
+def analyze_igb(dev_addr, buffer_size, verbose=False, debug=False):
+    DEFAULT_RING_SIZE = 1024
+    MAX_RING_SIZE = 8192
+    PTR_SIZE = 8  # 64-bit systems
+    ERROR_LOG_LIMIT = 10
+
+    def log_read_error(addr, error_count, label="descriptor", limit=ERROR_LOG_LIMIT):
+        if error_count < limit:
+            print(f"⚠️  igb: unreadable {label} at {hex(addr)}")
+        elif error_count == limit:
+            print(f"⚠️  igb: Further unreadable {label}s suppressed...")
+
+    try:
+        netdev_size = crash.struct_size("struct net_device")
+        aligned_size = ((netdev_size + 31) // 32) * 32
+        adapter_addr = dev_addr + aligned_size
+        if debug:
+            print(f"DEBUG: igb_adapter struct at {hex(adapter_addr)}")
+
+        adapter = readSU("struct igb_adapter", adapter_addr)
+
+        num_rx_queues = int(adapter.num_rx_queues)
+        num_tx_queues = int(adapter.num_tx_queues)
+
+        rx_ring_off = get_field_offset("igb_adapter", "rx_ring")
+        tx_ring_off = get_field_offset("igb_adapter", "tx_ring")
+
+        rx_desc_size = crash.struct_size("union e1000_rx_desc")
+        tx_desc_size = crash.struct_size("union e1000_tx_desc")
+        ring_struct_size = crash.struct_size("struct igb_ring")
+
+        desc_field_off = get_field_offset("igb_ring", "desc")
+        count_field_off = get_field_offset("igb_ring", "count")
+
+        total_rx_buffers = 0
+        total_tx_buffers = 0
+
+        # RX Rings
+        for i in range(num_rx_queues):
+            ring_ptr_addr = adapter_addr + rx_ring_off + i * PTR_SIZE
+            ring_ptr = readPtr(ring_ptr_addr)
+            if ring_ptr in (0, 0xffffffffffffffff):
+                if debug:
+                    print(f"DEBUG: RX ring {i} pointer is invalid ({hex(ring_ptr)})")
+                continue
+
+            ring_count = int.from_bytes(readmem(ring_ptr + count_field_off, 4), 'little')
+            ring_count = ring_count if 0 < ring_count <= MAX_RING_SIZE else DEFAULT_RING_SIZE
+
+            desc_ptr = readPtr(ring_ptr + desc_field_off)
+            rx_count = 0
+            error_count = 0
+
+            for j in range(ring_count):
+                desc_addr = desc_ptr + j * rx_desc_size
+                try:
+                    val = int.from_bytes(readmem(desc_addr, 8), 'little')  # addr in desc
+                    if val != 0:
+                        rx_count += 1
+                        if verbose:
+                            print(f"[RX {i}:{j:04d}] addr = {hex(val)}")
+                except:
+                    log_read_error(desc_addr, error_count, label="RX descriptor")
+                    error_count += 1
+                    continue
+
+            total_rx_buffers += rx_count
+            if debug:
+                print(f"DEBUG: [RX {i}] Buffers allocated: {rx_count} / {ring_count}")
+
+        # TX Rings
+        for i in range(num_tx_queues):
+            ring_ptr_addr = adapter_addr + tx_ring_off + i * PTR_SIZE
+            ring_ptr = readPtr(ring_ptr_addr)
+            if ring_ptr in (0, 0xffffffffffffffff):
+                if debug:
+                    print(f"DEBUG: TX ring {i} pointer is invalid ({hex(ring_ptr)})")
+                continue
+
+            ring_count = int.from_bytes(readmem(ring_ptr + count_field_off, 4), 'little')
+            ring_count = ring_count if 0 < ring_count <= MAX_RING_SIZE else DEFAULT_RING_SIZE
+
+            desc_ptr = readPtr(ring_ptr + desc_field_off)
+            tx_count = 0
+            error_count = 0
+
+            for j in range(ring_count):
+                desc_addr = desc_ptr + j * tx_desc_size
+                try:
+                    val = int.from_bytes(readmem(desc_addr, 8), 'little')  # addr in desc
+                    if val != 0:
+                        tx_count += 1
+                        if verbose:
+                            print(f"[TX {i}:{j:04d}] addr = {hex(val)}")
+                except:
+                    log_read_error(desc_addr, error_count, label="TX descriptor")
+                    error_count += 1
+                    continue
+
+            total_tx_buffers += tx_count
+            if debug:
+                print(f"DEBUG: [TX {i}] Buffers allocated: {tx_count} / {ring_count}")
+
+        if total_rx_buffers == 0 and total_tx_buffers == 0:
+            print("ℹ️  No RX/TX buffers found — descriptor memory may be unavailable in the dump.")
+
+        return {
+            "driver": "igb",
+            "rx_buffers": total_rx_buffers,
+            "tx_buffers": total_tx_buffers,
+            "rx_bytes": total_rx_buffers * buffer_size,
+            "tx_bytes": total_tx_buffers * buffer_size
+        }
+
+    except Exception as e:
+        print(f"❌ Error analyzing igb: {e}")
+        return None
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
@@ -616,6 +743,8 @@ def main():
                 result = analyze_ice(addr, buffer_size, args.verbose, args.debug)
             elif func_name == "virtnet_netdev":
                 result = analyze_virtio_net(addr, buffer_size, args.verbose, args.debug)
+            elif func_name == "igb_netdev_ops":
+                result = analyze_igb(addr, buffer_size, args.verbose, args.debug)
             else:
                 note = f"unsupported driver ({func_name})"
                 if args.debug:
