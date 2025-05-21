@@ -28,31 +28,6 @@ def get_buffer_size_from_mtu(mtu):
     else:
         return align_up(mtu + 128, 2048)
 
-def get_field_offset(struct_name, field_name):
-    output = exec_crash_command(f"struct {struct_name} -o")
-    for line in output.splitlines():
-        line = line.strip()
-        if not line or not line.startswith('['):
-            continue
-
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-
-        # Clean trailing semicolon and pointer/reference symbols
-        raw_field = parts[-1].rstrip(';')  # Remove semicolon
-        raw_field = raw_field.lstrip('*')  # Remove pointer mark
-        raw_field = raw_field.split('[')[0]  # Strip array index, e.g., napi[5] → napi
-
-        if raw_field == field_name:
-            try:
-                offset = int(parts[0][1:-1])
-                return offset
-            except ValueError:
-                continue
-
-    raise RuntimeError(f"Field {field_name} not found in struct {struct_name}")
-
 def parse_net_devices(debug=False):
     net_output = exec_crash_command("net")
     netdev_addrs = []
@@ -83,22 +58,22 @@ def analyze_bnxt(netdev_addr, buffer_size, verbose=False, debug=False):
             print(f"DEBUG: bnxt {hex(bnxt_addr)}")
 
         # Offset helpers
-        rx_ring_off = get_field_offset("bnxt", "rx_ring")
-        cp_off = get_field_offset("bnxt", "cp_nr_rings")
-        tx_ring_off = get_field_offset("bnxt", "tx_ring")
-        tx_nr_rings_off = get_field_offset("bnxt", "tx_nr_rings")
+        rx_ring_off = crash.member_offset("bnxt", "rx_ring")
+        cp_off = crash.member_offset("bnxt", "cp_nr_rings")
+        tx_ring_off = crash.member_offset("bnxt", "tx_ring")
+        tx_nr_rings_off = crash.member_offset("bnxt", "tx_nr_rings")
 
-        rx_ring_struct_off = get_field_offset("bnxt_rx_ring_info", "rx_ring_struct")
-        tx_ring_info_struct_off = get_field_offset("bnxt_tx_ring_info", "tx_ring_struct")
-        ring_mem_off = get_field_offset("bnxt_ring_struct", "ring_mem")
-        depth_off = get_field_offset("bnxt_ring_mem_info", "depth")
-        vmem_size_off = get_field_offset("bnxt_ring_mem_info", "vmem_size")
+        rx_ring_struct_off = crash.member_offset("bnxt_rx_ring_info", "rx_ring_struct")
+        tx_ring_info_struct_off = crash.member_offset("bnxt_tx_ring_info", "tx_ring_struct")
+        ring_mem_off = crash.member_offset("bnxt_ring_struct", "ring_mem")
+        depth_off = crash.member_offset("bnxt_ring_mem_info", "depth")
+        vmem_size_off = crash.member_offset("bnxt_ring_mem_info", "vmem_size")
 
         # RX setup
         rx_ring_ptr = readPtr(bnxt_addr + rx_ring_off)
         num_rx_rings = readU16(bnxt_addr + cp_off)
         rx_bd_size = crash.struct_size("bnxt_sw_rx_bd")
-        rx_data_off = get_field_offset("bnxt_sw_rx_bd", "data")
+        rx_data_off = crash.member_offset("bnxt_sw_rx_bd", "data")
         rx_ring_info_size = crash.struct_size("bnxt_rx_ring_info")
 
         total_rx_buffers = 0
@@ -160,7 +135,7 @@ def analyze_bnxt(netdev_addr, buffer_size, verbose=False, debug=False):
         num_tx_rings = readU16(bnxt_addr + tx_nr_rings_off)
         tx_ring_info_size = crash.struct_size("bnxt_tx_ring_info")
         tx_bd_size = crash.struct_size("tx_bd")
-        tx_data_off = get_field_offset("tx_bd", "tx_bd_haddr")
+        tx_data_off = crash.member_offset("tx_bd", "tx_bd_haddr")
 
         total_tx_buffers = 0
 
@@ -248,11 +223,11 @@ def analyze_tg3(dev_addr, buffer_size, verbose=False, debug=False):
 
         tg3 = readSU("struct tg3", tg3_addr)
 
-        napi_off = get_field_offset("tg3", "napi")
+        napi_off = crash.member_offset("tg3", "napi")
         napi_size = crash.struct_size("tg3_napi")
-        rx_rcb_off = get_field_offset("tg3_napi", "rx_rcb")
-        tx_ring_off = get_field_offset("tg3_napi", "tx_ring")
-        tx_pending_off = get_field_offset("tg3_napi", "tx_pending")
+        rx_rcb_off = crash.member_offset("tg3_napi", "rx_rcb")
+        tx_ring_off = crash.member_offset("tg3_napi", "tx_ring")
+        tx_pending_off = crash.member_offset("tg3_napi", "tx_pending")
 
         rx_desc_size = crash.struct_size("tg3_rx_buffer_desc")
         tx_desc_size = crash.struct_size("tg3_tx_buffer_desc")
@@ -375,8 +350,8 @@ def analyze_ice(dev_addr, buffer_size, verbose=False, debug=False):
         tx_ring_size = crash.struct_size("ice_tx_ring")
         rx_buf_size = crash.struct_size("ice_rx_buf")
         tx_buf_size = crash.struct_size("ice_tx_buf")
-        dma_off = get_field_offset("ice_rx_buf", "dma")
-        tx_dma_off = get_field_offset("ice_tx_buf", "dma")
+        dma_off = crash.member_offset("ice_rx_buf", "dma")
+        tx_dma_off = crash.member_offset("ice_tx_buf", "dma")
 
         total_rx_buffers = 0
         total_tx_buffers = 0
@@ -456,7 +431,7 @@ def analyze_ice(dev_addr, buffer_size, verbose=False, debug=False):
 def analyze_virtio_net(netdev_addr, buffer_size, verbose=False, debug=False):
     try:
         netdev = readSU("struct net_device", netdev_addr)
-        ml_priv_offset = get_field_offset("net_device", "ml_priv")
+        ml_priv_offset = crash.member_offset("net_device", "ml_priv")
         priv_ptr = readPtr(netdev_addr + ml_priv_offset)
         if priv_ptr == 0:
             if debug:
@@ -496,7 +471,7 @@ def analyze_virtio_net(netdev_addr, buffer_size, verbose=False, debug=False):
 
         for i in range(curr_qpairs):
             # RX ring analysis
-            rq_ptr = readPtr(priv_ptr + get_field_offset("virtnet_info", "rq") + i * 8)
+            rq_ptr = readPtr(priv_ptr + crash.member_offset("virtnet_info", "rq") + i * 8)
             if rq_ptr:
                 try:
                     rq = readSU("struct receive_queue", rq_ptr)
@@ -512,7 +487,7 @@ def analyze_virtio_net(netdev_addr, buffer_size, verbose=False, debug=False):
                         print(f"DEBUG: [RX {i}] error: {e}")
 
             # TX ring analysis
-            sq_ptr = readPtr(priv_ptr + get_field_offset("virtnet_info", "sq") + i * 8)
+            sq_ptr = readPtr(priv_ptr + crash.member_offset("virtnet_info", "sq") + i * 8)
             if sq_ptr:
                 try:
                     sq = readSU("struct send_queue", sq_ptr)
@@ -563,15 +538,15 @@ def analyze_igb(dev_addr, buffer_size, verbose=False, debug=False):
         num_rx_queues = int(adapter.num_rx_queues)
         num_tx_queues = int(adapter.num_tx_queues)
 
-        rx_ring_off = get_field_offset("igb_adapter", "rx_ring")
-        tx_ring_off = get_field_offset("igb_adapter", "tx_ring")
+        rx_ring_off = crash.member_offset("igb_adapter", "rx_ring")
+        tx_ring_off = crash.member_offset("igb_adapter", "tx_ring")
 
         rx_desc_size = crash.struct_size("union e1000_rx_desc")
         tx_desc_size = crash.struct_size("union e1000_tx_desc")
         ring_struct_size = crash.struct_size("struct igb_ring")
 
-        desc_field_off = get_field_offset("igb_ring", "desc")
-        count_field_off = get_field_offset("igb_ring", "count")
+        desc_field_off = crash.member_offset("igb_ring", "desc")
+        count_field_off = crash.member_offset("igb_ring", "count")
 
         total_rx_buffers = 0
         total_tx_buffers = 0
