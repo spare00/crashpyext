@@ -632,6 +632,116 @@ def analyze_igb(dev_addr, buffer_size, verbose=False, debug=False):
         print(f"❌ Error analyzing igb: {e}")
         return None
 
+def analyze_vmxnet3(dev_addr, buffer_size, verbose=False, debug=False):
+    DEFAULT_RING_SIZE = 512
+    MAX_QUEUES = 32
+    PTR_SIZE = 8
+
+    def log_read_error(addr, error_count, label="descriptor", limit=10):
+        if error_count < limit:
+            print(f"⚠️  vmxnet3: unreadable {label} at {hex(addr)}")
+        elif error_count == limit:
+            print(f"⚠️  vmxnet3: Further unreadable {label}s suppressed...")
+
+    try:
+        # Step 1: locate struct vmxnet3_adapter
+        netdev_size = crash.struct_size("struct net_device")
+        aligned_size = ((netdev_size + 31) // 32) * 32
+        adapter_addr = dev_addr + aligned_size
+        adapter = readSU("struct vmxnet3_adapter", adapter_addr)
+
+        num_rx_queues = int(adapter.num_rx_queues)
+        num_tx_queues = int(adapter.num_tx_queues)
+
+        if debug:
+            print(f"DEBUG: vmxnet3_adapter @ {hex(adapter_addr)}")
+            print(f"DEBUG: RX queues = {num_rx_queues}, TX queues = {num_tx_queues}")
+
+        rx_queue_base = adapter_addr + crash.member_offset("struct vmxnet3_adapter", "rx_queue")
+        tx_queue_base = adapter_addr + crash.member_offset("struct vmxnet3_adapter", "tx_queue")
+        rxq_size = crash.struct_size("struct vmxnet3_rx_queue")
+        txq_size = crash.struct_size("struct vmxnet3_tx_queue")
+        bufinfo_ptr_off_rx = crash.member_offset("struct vmxnet3_rx_queue", "buf_info")
+        bufinfo_ptr_off_tx = crash.member_offset("struct vmxnet3_tx_queue", "buf_info")
+
+        total_rx_buffers = 0
+        total_tx_buffers = 0
+
+        # RX ring analysis
+        for i in range(min(num_rx_queues, MAX_QUEUES)):
+            rxq_addr = rx_queue_base + i * rxq_size
+            buf_info_ptr0_addr = rxq_addr + bufinfo_ptr_off_rx
+
+            buf0_ptr = readPtr(buf_info_ptr0_addr)  # buf_info[0]
+            if buf0_ptr in (0, 0xffffffffffffffff):
+                if debug:
+                    print(f"DEBUG: RX queue {i} buf_info[0] is invalid")
+                continue
+
+            error_count = 0
+            rx_count = 0
+            for j in range(DEFAULT_RING_SIZE):
+                entry_addr = buf0_ptr + j * PTR_SIZE
+                try:
+                    val = readPtr(entry_addr)
+                    if val != 0:
+                        rx_count += 1
+                        if verbose:
+                            print(f"[RX {i}:{j:04d}] buf DMA = {hex(val)}")
+                except:
+                    log_read_error(entry_addr, error_count, label="RX buffer")
+                    error_count += 1
+                    continue
+
+            total_rx_buffers += rx_count
+            if debug:
+                print(f"DEBUG: RX queue {i} buffers allocated: {rx_count}")
+
+        # TX ring analysis
+        for i in range(min(num_tx_queues, MAX_QUEUES)):
+            txq_addr = tx_queue_base + i * txq_size
+            buf_info_ptr_addr = txq_addr + bufinfo_ptr_off_tx
+            buf_info_ptr = readPtr(buf_info_ptr_addr)
+
+            if buf_info_ptr in (0, 0xffffffffffffffff):
+                if debug:
+                    print(f"DEBUG: TX queue {i} buf_info is invalid")
+                continue
+
+            error_count = 0
+            tx_count = 0
+            for j in range(DEFAULT_RING_SIZE):
+                entry_addr = buf_info_ptr + j * PTR_SIZE
+                try:
+                    val = readPtr(entry_addr)
+                    if val != 0:
+                        tx_count += 1
+                        if verbose:
+                            print(f"[TX {i}:{j:04d}] buf DMA = {hex(val)}")
+                except:
+                    log_read_error(entry_addr, error_count, label="TX buffer")
+                    error_count += 1
+                    continue
+
+            total_tx_buffers += tx_count
+            if debug:
+                print(f"DEBUG: TX queue {i} buffers allocated: {tx_count}")
+
+        if total_rx_buffers == 0 and total_tx_buffers == 0:
+            print("ℹ️  No RX/TX buffers found — descriptor memory may be unavailable in the dump.")
+
+        return {
+            "driver": "vmxnet3",
+            "rx_buffers": total_rx_buffers,
+            "tx_buffers": total_tx_buffers,
+            "rx_bytes": total_rx_buffers * buffer_size,
+            "tx_bytes": total_tx_buffers * buffer_size
+        }
+
+    except Exception as e:
+        print(f"❌ Error analyzing vmxnet3: {e}")
+        return None
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
@@ -713,6 +823,8 @@ def main():
                 result = analyze_virtio_net(addr, buffer_size, args.verbose, args.debug)
             elif func_name == "igb_netdev_ops":
                 result = analyze_igb(addr, buffer_size, args.verbose, args.debug)
+            elif func_name == "vmxnet3_netdev_ops.85263":
+                result = analyze_vmxnet3(addr, buffer_size, args.verbose, args.debug)
             else:
                 note = f"unsupported driver ({func_name})"
                 if args.debug:
