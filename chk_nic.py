@@ -840,7 +840,7 @@ def main():
                 result = analyze_virtio_net(addr, buffer_size, args.verbose, args.debug)
             elif func_name == "igb_netdev_ops":
                 result = analyze_igb(addr, buffer_size, args.verbose, args.debug)
-            elif func_name == "vmxnet3_netdev_ops.85263":
+            elif func_name.startswith("vmxnet3_netdev_ops"):
                 result = analyze_vmxnet3(addr, buffer_size, args.verbose, args.debug)
             else:
                 note = f"unsupported driver ({func_name})"
