@@ -20,6 +20,15 @@ def log_error(msg):
 def align_up(size, align):
     return ((size + align - 1) // align) * align
 
+def format_value(kb, unit):
+    if unit == 'KB':
+        return kb
+    elif unit == 'MB':
+        return kb / 1024
+    elif unit == 'GB':
+        return kb / 1024 / 1024
+    return kb
+
 def get_buffer_size_from_mtu(mtu):
     if mtu <= 1500:
         return 2048
@@ -746,10 +755,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose RX/TX entry info")
+
+    unit_group = parser.add_mutually_exclusive_group()
+    unit_group.add_argument('-K', '--kilobytes', action='store_const', const='KB', dest='unit', help="Display values in kilobytes")
+    unit_group.add_argument('-M', '--megabytes', action='store_const', const='MB', dest='unit', help="Display values in megabytes")
+    unit_group.add_argument('-G', '--gigabytes', action='store_const', const='GB', dest='unit', help="Display values in gigabytes")
+    parser.set_defaults(unit='KB')
+
     args = parser.parse_args()
 
     print(f"{'Device':<12} {'Driver':<10} {'MTU':>6} {'RX Buffers':>12} {'TX Buffers':>12} "
-          f"{'RX Usage (KB)':>15} {'TX Usage (KB)':>15}")
+          f"{f'RX Usage ({args.unit})':>15} {f'TX Usage ({args.unit})':>15}")
+
     print("=" * 88)
 
     total_rx_buffers = 0
@@ -833,8 +850,10 @@ def main():
                 continue
 
             if result:
+                rx_usage = format_value(result['rx_bytes'] / 1024, args.unit)
+                tx_usage = format_value(result['tx_bytes'] / 1024, args.unit)
                 print(f"{name:<12} {result['driver']:<10} {mtu:>6} {result['rx_buffers']:>12} {result['tx_buffers']:>12} "
-                      f"{result['rx_bytes'] // 1024:>15,.2f} {result['tx_bytes'] // 1024:>15,.2f}")
+                      f"{rx_usage:>15,.2f} {tx_usage:>15,.2f}")
                 total_rx_buffers += result["rx_buffers"]
                 total_tx_buffers += result["tx_buffers"]
                 total_rx_bytes += result["rx_bytes"]
@@ -843,12 +862,16 @@ def main():
         except Exception as e:
             print(f"⚠️  Failed to analyze device at {hex(addr)}: {e}")
 
+    total_rx = format_value(total_rx_bytes / 1024, args.unit)
+    total_tx = format_value(total_rx_bytes / 1024, args.unit)
+    total_rx_tx = format_value((total_rx_bytes + total_tx_bytes) / 1024, args.unit)
+
     print("=" * 88)
     print(f"{'':<12} {'':<10} {'':>6} {total_rx_buffers:>12} {total_tx_buffers:>12} "
-          f"{total_rx_bytes // 1024:>15,.2f} {total_tx_bytes // 1024:>15,.2f}")
+          f"{total_rx:>15,.2f} {total_tx:>15,.2f}")
     print("=" * 88)
     print(f"{'TOTAL':<12} {'':<10} {'':>6} {'':>12} {'':>12} "
-          f"{'':>15} {(total_rx_bytes + total_tx_bytes) // 1024:>15,.2f}")
+          f"{'':>15} {total_rx_tx:>15,.2f}")
 
 
 if __name__ == "__main__":
