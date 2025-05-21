@@ -28,13 +28,6 @@ def get_buffer_size_from_mtu(mtu):
     else:
         return align_up(mtu + 128, 2048)
 
-def get_struct_size(struct_name):
-    output = exec_crash_command(f"struct {struct_name}")
-    for line in output.splitlines():
-        if "SIZE:" in line:
-            return int(line.split("SIZE:")[1].strip())
-    raise RuntimeError(f"Could not get size of {struct_name}")
-
 def get_field_offset(struct_name, field_name):
     output = exec_crash_command(f"struct {struct_name} -o")
     for line in output.splitlines():
@@ -83,7 +76,7 @@ def read_driver_symbol(netdev):
 
 def analyze_bnxt(netdev_addr, buffer_size, verbose=False, debug=False):
     try:
-        netdev_size = get_struct_size("net_device")
+        netdev_size = crash.struct_size("net_device")
         aligned_size = align_up(netdev_size, 32)
         bnxt_addr = netdev_addr + aligned_size
         if debug:
@@ -104,9 +97,9 @@ def analyze_bnxt(netdev_addr, buffer_size, verbose=False, debug=False):
         # RX setup
         rx_ring_ptr = readPtr(bnxt_addr + rx_ring_off)
         num_rx_rings = readU16(bnxt_addr + cp_off)
-        rx_bd_size = get_struct_size("bnxt_sw_rx_bd")
+        rx_bd_size = crash.struct_size("bnxt_sw_rx_bd")
         rx_data_off = get_field_offset("bnxt_sw_rx_bd", "data")
-        rx_ring_info_size = get_struct_size("bnxt_rx_ring_info")
+        rx_ring_info_size = crash.struct_size("bnxt_rx_ring_info")
 
         total_rx_buffers = 0
 
@@ -165,8 +158,8 @@ def analyze_bnxt(netdev_addr, buffer_size, verbose=False, debug=False):
         # TX setup
         tx_ring_ptr = readPtr(bnxt_addr + tx_ring_off)
         num_tx_rings = readU16(bnxt_addr + tx_nr_rings_off)
-        tx_ring_info_size = get_struct_size("bnxt_tx_ring_info")
-        tx_bd_size = get_struct_size("tx_bd")
+        tx_ring_info_size = crash.struct_size("bnxt_tx_ring_info")
+        tx_bd_size = crash.struct_size("tx_bd")
         tx_data_off = get_field_offset("tx_bd", "tx_bd_haddr")
 
         total_tx_buffers = 0
@@ -247,7 +240,7 @@ def analyze_tg3(dev_addr, buffer_size, verbose=False, debug=False):
             print(f"⚠️  tg3: Further unreadable {label}s suppressed...")
 
     try:
-        netdev_size = get_struct_size("net_device")
+        netdev_size = crash.struct_size("net_device")
         aligned_size = align_up(netdev_size, 32)
         tg3_addr = dev_addr + aligned_size
         if debug:
@@ -256,13 +249,13 @@ def analyze_tg3(dev_addr, buffer_size, verbose=False, debug=False):
         tg3 = readSU("struct tg3", tg3_addr)
 
         napi_off = get_field_offset("tg3", "napi")
-        napi_size = get_struct_size("tg3_napi")
+        napi_size = crash.struct_size("tg3_napi")
         rx_rcb_off = get_field_offset("tg3_napi", "rx_rcb")
         tx_ring_off = get_field_offset("tg3_napi", "tx_ring")
         tx_pending_off = get_field_offset("tg3_napi", "tx_pending")
 
-        rx_desc_size = get_struct_size("tg3_rx_buffer_desc")
-        tx_desc_size = get_struct_size("tg3_tx_buffer_desc")
+        rx_desc_size = crash.struct_size("tg3_rx_buffer_desc")
+        tx_desc_size = crash.struct_size("tg3_tx_buffer_desc")
 
         total_rx_buffers = 0
         total_tx_buffers = 0
@@ -357,7 +350,7 @@ def analyze_tg3(dev_addr, buffer_size, verbose=False, debug=False):
 
 def analyze_ice(dev_addr, buffer_size, verbose=False, debug=False):
     try:
-        netdev_size = get_struct_size("net_device")
+        netdev_size = crash.struct_size("net_device")
         aligned_size = align_up(netdev_size, 32)
         priv_addr = dev_addr + aligned_size
 
@@ -378,10 +371,10 @@ def analyze_ice(dev_addr, buffer_size, verbose=False, debug=False):
         if debug:
             print(f"DEBUG: VSI @ {hex(vsi_addr)} has {num_rxq} RX and {num_txq} TX queues")
 
-        rx_ring_size = get_struct_size("ice_rx_ring")
-        tx_ring_size = get_struct_size("ice_tx_ring")
-        rx_buf_size = get_struct_size("ice_rx_buf")
-        tx_buf_size = get_struct_size("ice_tx_buf")
+        rx_ring_size = crash.struct_size("ice_rx_ring")
+        tx_ring_size = crash.struct_size("ice_tx_ring")
+        rx_buf_size = crash.struct_size("ice_rx_buf")
+        tx_buf_size = crash.struct_size("ice_tx_buf")
         dma_off = get_field_offset("ice_rx_buf", "dma")
         tx_dma_off = get_field_offset("ice_tx_buf", "dma")
 
@@ -498,8 +491,8 @@ def analyze_virtio_net(netdev_addr, buffer_size, verbose=False, debug=False):
         rx_total = 0
         tx_total = 0
 
-        rxq_size = get_struct_size("receive_queue")
-        txq_size = get_struct_size("send_queue")
+        rxq_size = crash.struct_size("receive_queue")
+        txq_size = crash.struct_size("send_queue")
 
         for i in range(curr_qpairs):
             # RX ring analysis
