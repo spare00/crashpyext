@@ -230,11 +230,12 @@ def main():
         for trace, count in bt_counter.most_common():
             print(f"{count:<5}  {trace}")
     else:
-        print("\nPID    PPID   ST  COMM             CPU  ON_CPU")
+        print("\n   PID     PPID    ST  CPU  ON_CPU  COMM")
         print("==================================================")
         for state, tasks in results.items():
             for t in tasks:
-                print(f"{t['pid']:<6} {t['ppid']:<6} {t['ps']:<3} {t['comm']:<16} {t['cpu']:<4} {t['on_cpu']:<7}")
+                print(f"{t['pid']:>8} {t['ppid']:>8}  {t['ps']:<3} {t['cpu']:>3} {t['on_cpu']:>5}  {t['comm']:<16}")
 
 if __name__ == "__main__":
     main()
+
