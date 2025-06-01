@@ -4,6 +4,22 @@ from pykdump.API import *
 from LinuxDump import percpu
 import re
 
+SCHED_CLASSES = {
+    crash.sym2addr("fair_sched_class"): "CFS",
+    crash.sym2addr("rt_sched_class"): "RT",
+    crash.sym2addr("stop_sched_class"): "STOP",
+    crash.sym2addr("idle_sched_class"): "IDLE" if crash.symbol_exists("idle_sched_class") else None,
+    crash.sym2addr("dl_sched_class"): "DL" if crash.symbol_exists("dl_sched_class") else None,
+}
+SCHED_CLASSES = {k: v for k, v in SCHED_CLASSES.items() if k is not None}
+
+def get_sched_class(task):
+    try:
+        addr = Addr(task.sched_class)
+        return SCHED_CLASSES.get(addr, "UNKNOWN")
+    except:
+        return "UNKNOWN"
+
 def get_state_name(state):
     if state == 0:
         return "TASK_RUNNING"
@@ -29,25 +45,25 @@ def get_ps_code(task):
         exit_state = task.exit_state
         state = task.__state
 
-        if exit_state & 0x20:  # EXIT_ZOMBIE
+        if exit_state & 0x20:
             return "ZO"
-        elif exit_state & 0x10:  # EXIT_DEAD
+        elif exit_state & 0x10:
             return "DE"
-        elif state == 0x0000:  # TASK_RUNNING
+        elif state == 0x0000:
             return "RU"
-        elif state == 0x0402:  # TASK_IDLE
+        elif state == 0x0402:
             return "ID"
-        elif state & 0x0001:  # TASK_INTERRUPTIBLE
+        elif state & 0x0001:
             return "IN"
-        elif state & 0x0002:  # TASK_UNINTERRUPTIBLE
+        elif state & 0x0002:
             return "UN"
-        elif state & 0x0004:  # __TASK_STOPPED
+        elif state & 0x0004:
             return "ST"
-        elif state & 0x0008:  # __TASK_TRACED
+        elif state & 0x0008:
             return "TR"
-        elif state & 0x0200:  # TASK_WAKING
+        elif state & 0x0200:
             return "WA"
-        elif state & 0x0040:  # TASK_PARKED
+        elif state & 0x0040:
             return "PA"
         elif not task.mm:
             return "ID"
@@ -64,7 +80,7 @@ def parse_bt_output(bt_output, max_depth=5):
             trace.append(match.group(1))
     if not trace:
         return None
-    trace_tail = trace[:max_depth]  # get last frames from bottom up (latest calls)
+    trace_tail = trace[:max_depth]
     trace_tail.reverse()
     return ' -> '.join(trace_tail)
 
@@ -120,6 +136,7 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
                 on_cpu = getattr(task, 'on_cpu', 0)
                 cpu = getattr(task, 'cpu', -1)
                 ps_code = get_ps_code(task)
+                sched_class = get_sched_class(task)
             except Exception as e:
                 if debug:
                     print(f"[WARN] Error reading task at {addr:x}: {e}")
@@ -131,7 +148,7 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
                 continue
 
             if debug:
-                print(f"[DEBUG] PID={pid} COMM={comm} ST=0x{state_val:x} PS={ps_code} CPU={cpu} ON_CPU={on_cpu} ADDR={addr:x}")
+                print(f"[DEBUG] PID={pid} COMM={comm} ST=0x{state_val:x} PS={ps_code} CPU={cpu} ON_CPU={on_cpu} SCHED={sched_class} ADDR={addr:x}")
 
             results[state_name].append({
                 "pid": pid,
@@ -140,7 +157,8 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
                 "state_val": state_val,
                 "on_cpu": on_cpu,
                 "cpu": cpu,
-                "ps": ps_code
+                "ps": ps_code,
+                "sched": sched_class
             })
 
             if collect_bt:
@@ -169,6 +187,7 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
             on_cpu = getattr(task, 'on_cpu', 0)
             cpu = getattr(task, 'cpu', -1)
             ps_code = get_ps_code(task)
+            sched_class = get_sched_class(task)
         except Exception as e:
             if debug:
                 print(f"[WARN] Error reading idle task at {addr:x}: {e}")
@@ -180,7 +199,7 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
             continue
 
         if debug:
-            print(f"[DEBUG] PID={pid} COMM={comm} ST=0x{state_val:x} PS={ps_code} CPU={cpu} ON_CPU={on_cpu} ADDR={addr:x}")
+            print(f"[DEBUG] PID={pid} COMM={comm} ST=0x{state_val:x} PS={ps_code} CPU={cpu} ON_CPU={on_cpu} SCHED={sched_class} ADDR={addr:x}")
 
         results[state_name].append({
             "pid": pid,
@@ -189,7 +208,8 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
             "state_val": state_val,
             "on_cpu": on_cpu,
             "cpu": cpu,
-            "ps": ps_code
+            "ps": ps_code,
+            "sched": sched_class
         })
 
         if collect_bt:
@@ -230,11 +250,11 @@ def main():
         for trace, count in bt_counter.most_common():
             print(f"{count:<5}  {trace}")
     else:
-        print("\n   PID     PPID    ST  CPU  ON_CPU  COMM")
-        print("==================================================")
+        print("\n   PID     PPID    ST  CPU  ON_CPU  SCHED       COMM")
+        print("==============================================================")
         for state, tasks in results.items():
             for t in tasks:
-                print(f"{t['pid']:>8} {t['ppid']:>8}  {t['ps']:<3} {t['cpu']:>3} {t['on_cpu']:>5}  {t['comm']:<16}")
+                print(f"{t['pid']:>8} {t['ppid']:>8}  {t['ps']:<3} {t['cpu']:>3} {t['on_cpu']:>5} {t['sched']:>6}  {t['comm']:<16}")
 
 if __name__ == "__main__":
     main()
