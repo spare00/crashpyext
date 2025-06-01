@@ -84,6 +84,15 @@ def parse_bt_output(bt_output, max_depth=5):
     trace_tail.reverse()
     return ' -> '.join(trace_tail)
 
+def color_prio(prio, static_prio, sched):
+    RESET = "\033[0m"
+    if sched == "CFS" and static_prio != 120:
+        return f"\033[32m{prio:>5}{RESET}"  # Green
+    elif sched == "CFS" and prio != static_prio:
+        return f"\033[33m{prio:>5}{RESET}"  # Yellow
+    else:
+        return f"{prio:>5}"
+
 task_list_offset = crash.member_offset("struct task_struct", "tasks")
 thread_group_offset = crash.member_offset("struct task_struct", "thread_group")
 
@@ -120,6 +129,7 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
         except Exception as e:
             if debug:
                 print(f"[WARN] Cannot read thread group of PID {leader.pid}: {e}")
+            continue
 
         for task in thread_group:
             addr = Addr(task)
@@ -137,6 +147,8 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
                 cpu = getattr(task, 'cpu', -1)
                 ps_code = get_ps_code(task)
                 sched_class = get_sched_class(task)
+                prio = task.prio
+                static_prio = task.static_prio
             except Exception as e:
                 if debug:
                     print(f"[WARN] Error reading task at {addr:x}: {e}")
@@ -148,7 +160,7 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
                 continue
 
             if debug:
-                print(f"[DEBUG] PID={pid} COMM={comm} ST=0x{state_val:x} PS={ps_code} CPU={cpu} ON_CPU={on_cpu} SCHED={sched_class} ADDR={addr:x}")
+                print(f"[DEBUG] PID={pid} COMM={comm} ST=0x{state_val:x} PS={ps_code} CPU={cpu} ON_CPU={on_cpu} SCHED={sched_class} PRIO={prio} ADDR={addr:x}")
 
             results[state_name].append({
                 "pid": pid,
@@ -158,7 +170,10 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
                 "on_cpu": on_cpu,
                 "cpu": cpu,
                 "ps": ps_code,
-                "sched": sched_class
+                "sched": sched_class,
+                "prio": prio,
+                "static_prio": static_prio,
+                "addr": f"{addr:x}"
             })
 
             if collect_bt:
@@ -188,6 +203,8 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
             cpu = getattr(task, 'cpu', -1)
             ps_code = get_ps_code(task)
             sched_class = get_sched_class(task)
+            prio = task.prio
+            static_prio = task.static_prio
         except Exception as e:
             if debug:
                 print(f"[WARN] Error reading idle task at {addr:x}: {e}")
@@ -199,7 +216,7 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
             continue
 
         if debug:
-            print(f"[DEBUG] PID={pid} COMM={comm} ST=0x{state_val:x} PS={ps_code} CPU={cpu} ON_CPU={on_cpu} SCHED={sched_class} ADDR={addr:x}")
+            print(f"[DEBUG] PID={pid} COMM={comm} ST=0x{state_val:x} PS={ps_code} CPU={cpu} ON_CPU={on_cpu} SCHED={sched_class} PRIO={prio} ADDR={addr:x}")
 
         results[state_name].append({
             "pid": pid,
@@ -209,7 +226,10 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
             "on_cpu": on_cpu,
             "cpu": cpu,
             "ps": ps_code,
-            "sched": sched_class
+            "sched": sched_class,
+            "prio": prio,
+            "static_prio": static_prio,
+            "addr": f"{addr:x}"
         })
 
         if collect_bt:
@@ -250,11 +270,12 @@ def main():
         for trace, count in bt_counter.most_common():
             print(f"{count:<5}  {trace}")
     else:
-        print("\n   PID     PPID    ST  CPU  ON_CPU  SCHED       COMM")
-        print("==============================================================")
+        print("\n   PID     PPID    ST  CPU        TASK       ON_CPU SCHED PRIO       COMM")
+        print("==========================================================================")
         for state, tasks in results.items():
             for t in tasks:
-                print(f"{t['pid']:>8} {t['ppid']:>8}  {t['ps']:<3} {t['cpu']:>3} {t['on_cpu']:>5} {t['sched']:>6}  {t['comm']:<16}")
+                prio_colored = color_prio(t['prio'], t['static_prio'], t['sched'])
+                print(f"{t['pid']:>8} {t['ppid']:>8}  {t['ps']:<3} {t['cpu']:>3} {t['addr']:>14} {t['on_cpu']:>6} {t['sched']:>5} {prio_colored}  {t['comm']:<16}")
 
 if __name__ == "__main__":
     main()
