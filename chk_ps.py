@@ -24,8 +24,8 @@ SCHED_CLASSES = {
     crash.sym2addr("fair_sched_class"): "CFS",
     crash.sym2addr("rt_sched_class"): "RT",
     crash.sym2addr("stop_sched_class"): "STOP",
-    crash.sym2addr("idle_sched_class"): "IDLE" if crash.symbol_exists("idle_sched_class") else None,
-    crash.sym2addr("dl_sched_class"): "DL" if crash.symbol_exists("dl_sched_class") else None,
+    crash.sym2addr("idle_sched_class") if crash.symbol_exists("idle_sched_class") else None: "IDLE",
+    crash.sym2addr("dl_sched_class") if crash.symbol_exists("dl_sched_class") else None: "DL",
 }
 SCHED_CLASSES = {k: v for k, v in SCHED_CLASSES.items() if k is not None}
 
