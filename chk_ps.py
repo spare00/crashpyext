@@ -4,6 +4,22 @@ from pykdump.API import *
 from LinuxDump import percpu
 import re
 
+RHEL_VERSION = 8
+
+def get_rhel_version():
+    global RHEL_VERSION
+    sys_output = exec_crash_command("sys")
+    for line in sys_output.splitlines():
+        if "RELEASE" in line:
+            kernel_version = line.split()[-1]
+            if "el" in kernel_version:
+                try:
+                    RHEL_VERSION = int(kernel_version.split(".el")[1][0])
+                except (IndexError, ValueError):
+                    pass
+    print(f"Detected RHEL Version: {RHEL_VERSION} (Kernel: {kernel_version})")
+    return RHEL_VERSION
+
 SCHED_CLASSES = {
     crash.sym2addr("fair_sched_class"): "CFS",
     crash.sym2addr("rt_sched_class"): "RT",
@@ -19,6 +35,22 @@ def get_sched_class(task):
         return SCHED_CLASSES.get(addr, "UNKNOWN")
     except:
         return "UNKNOWN"
+
+def get_state(task):
+    try:
+        if RHEL_VERSION == 7:
+            return task.state
+        return task.__state
+    except:
+        return -1
+
+def get_cpu(task):
+    try:
+        if RHEL_VERSION == 7:
+            return task._cpu
+        return task.cpu
+    except:
+        return -1
 
 def get_state_name(state):
     if state == 0:
@@ -43,8 +75,7 @@ def get_state_name(state):
 def get_ps_code(task):
     try:
         exit_state = task.exit_state
-        state = task.__state
-
+        state = get_state(task)
         if exit_state & 0x20:
             return "ZO"
         elif exit_state & 0x10:
@@ -87,9 +118,9 @@ def parse_bt_output(bt_output, max_depth=5):
 def color_prio(prio, static_prio, sched):
     RESET = "\033[0m"
     if sched == "CFS" and static_prio != 120:
-        return f"\033[32m{prio:>5}{RESET}"  # Green
+        return f"\033[32m{prio:>5}{RESET}"
     elif sched == "CFS" and prio != static_prio:
-        return f"\033[33m{prio:>5}{RESET}"  # Yellow
+        return f"\033[33m{prio:>5}{RESET}"
     else:
         return f"{prio:>5}"
 
@@ -140,11 +171,11 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
             try:
                 pid = task.pid
                 comm = str(task.comm)
-                state_val = task.__state
+                state_val = get_state(task)
                 state_name = get_state_name(state_val)
                 ppid = task.real_parent.pid if task.real_parent else 0
                 on_cpu = getattr(task, 'on_cpu', 0)
-                cpu = getattr(task, 'cpu', -1)
+                cpu = get_cpu(task)
                 ps_code = get_ps_code(task)
                 sched_class = get_sched_class(task)
                 prio = task.prio
@@ -196,11 +227,11 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
         try:
             pid = task.pid
             comm = str(task.comm)
-            state_val = task.__state
+            state_val = get_state(task)
             state_name = get_state_name(state_val)
             ppid = task.real_parent.pid if task.real_parent else 0
             on_cpu = getattr(task, 'on_cpu', 0)
-            cpu = getattr(task, 'cpu', -1)
+            cpu = get_cpu(task)
             ps_code = get_ps_code(task)
             sched_class = get_sched_class(task)
             prio = task.prio
@@ -254,6 +285,8 @@ def main():
     parser.add_argument("--bt", action="store_true", help="Collect and group backtraces")
     parser.add_argument("--depth", type=int, default=5, help="Depth of backtrace tail to group on")
     args = parser.parse_args()
+
+    get_rhel_version()
 
     print("Collecting task list...")
     results, bt_counter = walk_task_list(
