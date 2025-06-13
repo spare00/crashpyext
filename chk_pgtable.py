@@ -164,6 +164,7 @@ def resolve_kernel_virt_to_phys(vaddr, debug=False):
     raise RuntimeError(f"Failed to extract physical address from vtop output for 0x{vaddr:x}")
 
 def scan_pte_page(phys_addr, verbose=False, debug=False):
+    phys_addr &= ~0xfff  # align to 4KB page
     try:
         if debug:
             print(f"→ Using physical address: 0x{phys_addr:x}")
@@ -248,6 +249,7 @@ def read_pmd_page_via_rd(phys_addr, debug=False):
     return entries
 
 def scan_pmd_page(phys_addr, verbose=False, debug=False):
+    phys_addr &= ~0xfff  # align to 4KB page
     try:
         if debug:
             print(f"→ Using PMD physical address: 0x{phys_addr:x}")
