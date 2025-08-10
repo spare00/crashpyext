@@ -325,8 +325,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Disassemble and annotate pushed register values")
     parser.add_argument("frames", metavar="N", type=int, nargs="+",
                         help="One frame number (exception RIP to frame), or a start and end range")
-    parser.add_argument("-l", "--lines", type=int, default=2,
-                    help="Number of lines to show from dis -s <addr> (default: 2)")
+    parser.add_argument("-l", "--lines", type=int, default=3,
+                    help="Number of lines to show from dis -s <addr> (default: 3)")
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
     args = parser.parse_args()
 
