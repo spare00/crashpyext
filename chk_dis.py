@@ -281,8 +281,20 @@ def get_bt_addresses_exception_to_frame(upto_frame, debug=False):
             target_lines = lines[start_index:idx + 1]
             break
     else:
-        print(f"[ERROR] Could not find 'exception RIP' or frame #{upto_frame}")
-        return [], [], None
+        # If no 'exception RIP' found, start from the beginning
+        if start_index is None:
+            print("[WARN] 'exception RIP' not found. Starting from the first frame.")
+            start_index = 0
+            for idx, line in enumerate(lines):
+                if line.strip().startswith(end_marker):
+                    target_lines = lines[start_index:idx + 1]
+                    break
+            else:
+                print(f"[ERROR] Could not find frame #{upto_frame} from start of backtrace.")
+                return [], [], None
+        else:
+            print(f"[ERROR] Could not find frame #{upto_frame} after 'exception RIP'.")
+            return [], [], None
 
     for line in target_lines:
         tokens = line.strip().split()
