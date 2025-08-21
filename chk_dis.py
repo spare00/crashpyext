@@ -348,11 +348,15 @@ if __name__ == "__main__":
         # Check for exception RIP
         bt_lines = exec_crash_command("bt").splitlines()
         exception_rip = None
+        is_exception_rip = False
         for line in bt_lines:
-            if 'RIP:' in line:
+            if 'exception RIP:' in line:
+                is_exception_rip = True
+            if is_exception_rip and 'RIP:' in line:
                 match = re.search(r'RIP:\s+([0-9a-fA-F]+)', line)
                 if match:
                     exception_rip = match.group(1)
+                    is_exception_rip = False
                     break
 
         if exception_rip:
@@ -381,5 +385,4 @@ if __name__ == "__main__":
         sys.exit(1)
 
     disassemble_addresses_with_push_values(addrs, frame_ids, deepest_frame, debug=args.debug)
-
 
