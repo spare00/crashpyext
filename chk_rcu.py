@@ -182,7 +182,7 @@ def get_per_cpu_rcu_data(rcu_ctx, rhel_version, hz, verbose=False, debug=False):
             if qs_pending and isinstance(since_gp, int) and since_gp >= qs_warn_jiffies:
                 warn_flag = " ⚠️"
 
-            gp_state_str = "⏳" if in_prog_cpu else "idle"
+            gp_state_str = "In progress" if in_prog_cpu else "idle"
             print(f"{cpu:<5} {gp_value:<18} {str(qs_pending):<12} {gp_state_str:<10} {since_gp_str:<20}{warn_flag}")
 
             if debug:
