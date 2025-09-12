@@ -764,6 +764,27 @@ def export_page_owner(out_path: str,
 
     print(f"[export_po] DONE: visited={visited}, emitted={emitted}, output={out_path}", file=sys.stderr)
 
+def _infer_force_mode_auto() -> str:
+    """
+    Heuristic: parse `sys` output to detect kernel release and choose r7/r8.
+    Returns: "r7" | "r8" | "auto" (fallback if we can't tell).
+    """
+    try:
+        out = x("sys")
+        # Try RELEASE: 3.10.0-...  or path .../modules/3.10.0-.../
+        m = re.search(r'RELEASE:\s*([0-9]+\.[0-9]+)\.', out)
+        if not m:
+            m = re.search(r'/modules/([0-9]+\.[0-9]+)\.', out)
+        if m:
+            ver = m.group(1)
+            if ver.startswith("3.10"):
+                return "r7"   # RHEL7
+            if ver.startswith("4.18") or ver.startswith("5.14"):
+                return "r8"   # RHEL8/9
+    except Exception:
+        pass
+    return "auto"
+
 # -------- CLI --------
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Export page_owner records (NDJSON) from vmcore via crash/epython.")
@@ -800,6 +821,11 @@ def main(argv=None):
     force_mode = "auto"
     if args.rhel7: force_mode = "r7"
     if args.rhel8: force_mode = "r8"
+
+    if force_mode == "auto":
+        inferred = _infer_force_mode_auto()
+        if inferred != "auto":
+            force_mode = inferred
 
     # Apply RAW override
     annotate = False if args.raw else bool(args.annotate)
