@@ -11,8 +11,62 @@
 #   [--calltrace-process PID] [--filter-module MOD] [--strict]
 #   [--detect-lines N] file
 #
-import argparse, json, sys, re
+import argparse
 from collections import defaultdict, Counter, OrderedDict
+import time, os
+
+# ---- logging/time helpers ----
+import sys, time, os, re, json
+from typing import List, Tuple, Optional
+
+def log(msg: str):
+    print(msg, file=sys.stderr, flush=True)
+
+def hms(sec: float) -> str:
+    h = int(sec // 3600); m = int((sec % 3600) // 60); s = int(sec % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+# Canonical kernel-text check (RHEL7+)
+def is_kernel_text64(a: int) -> bool:
+    # accept ffffffffXXXXXXXX, reject -1 sentinel
+    return (a >> 32) == 0xFFFFFFFF and a != 0xFFFFFFFFFFFFFFFF
+
+# Sym parsing regexes (shared)
+ADDRLINE_RE = re.compile(r'^\s*(ffffffff[0-9A-Fa-f]{8})\s+(?:\(\w\)\s+)?(.+?)\s*$')
+RHS_RE      = re.compile(r'^(?P<sym>[^\s]+(?:\s+\[[^\]]+\])?)(?:\s+/.+?:\s*\d+)?\s*$')
+
+def rhs_from_sym_line(line: str) -> str:
+    """Return 'name+off[/size] [mod]' from a `sym` output line, drop trailing src:line."""
+    if not line:
+        return ""
+    m = ADDRLINE_RE.match(line)
+    rhs = m.group(2) if m else line.strip()
+    m2 = RHS_RE.match(rhs)
+    return m2.group("sym") if m2 else rhs
+
+def _fmt_hms(sec: float) -> str:
+    h = int(sec // 3600); m = int((sec % 3600) // 60); s = int(sec % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def _file_size(path: str) -> int:
+    try: return os.path.getsize(path)
+    except Exception: return 0
+
+def _file_pos(f) -> int:
+    # Prefer the raw byte position of the underlying buffer
+    try:
+        buf = getattr(f, "buffer", None)
+        if buf is not None: return buf.tell()
+    except Exception:
+        pass
+    try: return f.tell()
+    except Exception: return 0
+
+def _fmt_dur(sec: float) -> str:
+    m, s = divmod(int(sec), 60)
+    h, m = divmod(m, 60)
+    ms = int((sec - int(sec))*1000)
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 # -------- crash symbolization (pykdump.API first) --------
 _HAS_CRASH = False
@@ -373,6 +427,12 @@ def make_argparser():
     p.add_argument("--depth", type=int, default=8, help="Frames per call-trace signature (default 8)")
     p.add_argument("--min-order", type=int, default=0, help="Ignore records with order < N")
     p.add_argument("--sample", type=int, default=1, help="Sample every Nth record (default 1)")
+    p.add_argument("--sym", action="store_true",
+                   help="Allow crash symbolization fallback when enriched fields are missing (default: off)")
+    p.add_argument("--progress", type=int, default=200000,
+                   help="Print progress every N lines (default 200000; 0 = disable)")
+    p.add_argument("--progress-sec", type=float, default=5.0,
+                   help="Also print progress at least every N seconds (default 5.0)")
     return p
 
 # -------- Units --------
@@ -520,6 +580,13 @@ def _valid_stack_for_print(addrs):
     return any_text and not all_percpu
 
 def analyze(path, args):
+    start_ts = time.perf_counter()
+    total_size = _file_size(path)
+    try:
+        total_size = os.path.getsize(path)
+    except Exception:
+        total_size = 0
+
     unit, div = _unit_and_div(args)
 
     order_pages = defaultdict(int)
@@ -549,8 +616,50 @@ def analyze(path, args):
     DEPTH = max(1, int(args.depth))
     TOPN  = max(1, int(args.top))
 
+    # Calltrace signature aggregators (prefer enriched frames 's')
+    sig_key_counts = Counter()   # tuple[str] -> count
+    sig_key_bytes  = Counter()   # tuple[str] -> total bytes
+    sig_key_sample = {}          # tuple[str] -> exemplar list[str]
+
     with open(path, "r", errors="ignore") as f:
+        lines_read = 0
+        last_log_ts = start_ts
         for ln in f:
+            lines_read += 1
+
+            # periodic progress
+            if args.progress or args.progress_sec > 0:
+                do_log = False
+                if args.progress and (lines_read % args.progress == 0):
+                    do_log = True
+                else:
+                    now = time.perf_counter()
+                    if args.progress_sec > 0 and (now - last_log_ts) >= args.progress_sec:
+                        do_log = True
+                if do_log:
+                    pos = _file_pos(f)
+                    elapsed = time.perf_counter() - start_ts
+                    rate = lines_read / elapsed if elapsed > 0 else 0.0
+
+                    pct_str = "   n/a"
+                    eta_str = "   n/a"
+                    if total_size > 0 and pos > 0:
+                        pct = (pos / total_size) * 100.0
+                        pct_str = f"{pct:5.1f}%"
+                        if pos < total_size and rate > 0:
+                            # ETA based on byte-rate when possible
+                            byte_rate = pos / elapsed if elapsed > 0 else 0.0
+                            if byte_rate > 0:
+                                eta = (total_size - pos) / byte_rate
+                                eta_str = _fmt_hms(eta)
+
+                    print(
+                        f"[analyze] {lines_read:,} lines  {pct_str}  "
+                        f"elapsed {_fmt_hms(elapsed)}  rate {rate:,.0f}/s  ETA {eta_str}",
+                        file=sys.stderr, flush=True
+                    )
+                    last_log_ts = time.perf_counter()
+
             if not ln or ln[0] != "{":
                 continue
             try:
@@ -584,30 +693,43 @@ def analyze(path, args):
                 per_pid_bytes[pid] += bytes_
 
             # RHEL7 traces → signatures
-            addrs = [a for a in (o.get("t") or []) if _is_kernel_text_addr(a)]
-            if kind == "r7" and addrs:
-                sig_key = tuple(addrs[:DEPTH])
-                if not sig_key:
-                    pass
-                else:
-                    sig_addr_bytes[sig_key] += bytes_
-                    sig_addr_seen[sig_key]  += 1
-                    if sig_key not in sig_addr_example:
-                        # keep up to DEPTH (for printing), but store what we got
-                        sig_addr_example[sig_key] = addrs[:DEPTH]
+            # Signatures (prefer enriched frames 's')
+            rhs_list = o.get("s")
+            if rhs_list:
+                key = tuple(rhs_list[:DEPTH])
+                if key:
+                    sig_key_counts[key] += 1
+                    sig_key_bytes[key]  += bytes_
+                    sig_key_sample.setdefault(key, rhs_list[:DEPTH])
+            elif args.sym and kind == "r7":
+                # optional crash fallback if user allowed
+                addrs = [a for a in (o.get("t") or []) if _is_kernel_addr(a)]
+                if addrs:
+                    key = tuple(_frame_rhs(a) for a in addrs[:DEPTH])  # uses crash
+                    if key:
+                        sig_key_counts[key] += 1
+                        sig_key_bytes[key]  += bytes_
+                        sig_key_sample.setdefault(key, list(key))
 
             # Modules (best-effort when inline PCs exist)
             if args.modules or args.filter_module or args.strict:
-                mod = None
-                if addrs:
-                    if args.strict:
-                        _, mod = first_allocator_module(addrs)
-                    else:
-                        for a in addrs:
-                            if not _is_kernel_addr(a): continue
-                            _, m = SYM.lookup(a)
-                            if m:
-                                mod = m; break
+                mod = o.get("mod")
+                if not mod:
+                    rhs_list = o.get("s")  # enriched frames
+                    if rhs_list:
+                        mod = _module_from_frames_rhs(rhs_list[:DEPTH], strict=args.strict)
+                    elif args.sym and kind == "r7":
+                        # only if user allowed crash fallback AND no enriched frames
+                        addrs = [a for a in (o.get("t") or []) if _is_kernel_addr(a)]
+                        if addrs:
+                            if args.strict:
+                                _, mod = first_allocator_module(addrs)
+                            else:
+                                # first module frame via crash, as last resort
+                                for a in addrs:
+                                    name, m = SYM.lookup(a)
+                                    if m:
+                                        mod = m; break
                 if mod:
                     per_module_pages[mod] += pages
                     per_module_bytes[mod] += bytes_
@@ -659,38 +781,35 @@ def analyze(path, args):
     if args.calltraces:
         print("\nTop 5 Call Traces:")
         print("=" * 50)
-        if not sig_addr_bytes:
-            print("(no inline traces; RHEL8+ exports use stack depot handles)")
+        if not sig_key_bytes:
+            print("(no enriched frames; re-run with --sym to allow crash symbolization fallback)")
         else:
-            top = sorted(sig_addr_bytes.items(), key=lambda kv: kv[1], reverse=True)[:TOPN]
-
-            # symbolise only the unique addresses we need (skip sentinel)
-            # Pre-symbolize only the unique addresses used in Top-N (skip sentinel)
-            needed = set()
-            for sig_key, _ in top:
-                for a in sig_addr_example.get(sig_key, sig_key):
-                    if a != 0xffffffffffffffff and _is_kernel_text_addr(a):
-                        needed.add(a)
-            for a in needed:
-                _ = _sym_one_line(a)  # warms caches inside crash
-
-            # Print
+            top = sorted(sig_key_bytes.items(), key=lambda kv: kv[1], reverse=True)[:TOPN]
             for rank, (sig_key, tot_b) in enumerate(top, 1):
-                seen = sig_addr_seen.get(sig_key, 0)
+                seen = sig_key_counts.get(sig_key, 0)
                 gb = tot_b / float(1024**3)
                 print(f"#{rank}: Seen {seen} times, {gb:.2f} GB")
-                for a in sig_addr_example.get(sig_key, sig_key):
-                    if not _is_kernel_text_addr(a):
-                        continue
-                    print(_display_for_addr(a))
+                for rhs in sig_key_sample.get(sig_key, sig_key):
+                    print(rhs if rhs.startswith("[<") or "+" in rhs or " [" in rhs else str(rhs))
                 print("-" * 50)
+
+    # Final timing
+    log(f"[analyze] DONE in {hms(time.perf_counter() - start_ts)}")
 
 def main():
     ap = make_argparser()
     args = ap.parse_args()
 
-    _try_import_crash(debug=args.debug)
-    _probe_crash_env(debug=args.debug)
+    # Only initialize crash if user asked for it
+    if args.sym:
+        _try_import_crash(debug=args.debug)
+        _probe_crash_env(debug=args.debug)
+    else:
+        # Ensure symbolization paths treat crash as unavailable
+        globals()['_HAS_CRASH'] = False
+        globals()['_crash_x'] = None
+        if args.debug:
+            print("[debug] --sym not set: analysis will avoid crash symbolization and prefer enriched fields.", file=sys.stderr, flush=True)
 
     if not _HAS_CRASH:
         msg = "[warn] Crash/pykdump API not available; symbolization will be minimal."

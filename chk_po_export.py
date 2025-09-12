@@ -10,7 +10,36 @@
 #   crash> extend -p chk_export_po.py
 #   crash> chk_export_po --out /tmp/page_owner.ndjson --state /tmp/po.state --progress 200000
 #
-import argparse, json, re, sys, os, struct
+import argparse, struct
+
+# ---- logging/time helpers ----
+import sys, time, os, re, json
+from typing import List, Tuple, Optional
+
+def log(msg: str):
+    print(msg, file=sys.stderr, flush=True)
+
+def hms(sec: float) -> str:
+    h = int(sec // 3600); m = int((sec % 3600) // 60); s = int(sec % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+# Canonical kernel-text check (RHEL7+)
+def is_kernel_text64(a: int) -> bool:
+    # accept ffffffffXXXXXXXX, reject -1 sentinel
+    return (a >> 32) == 0xFFFFFFFF and a != 0xFFFFFFFFFFFFFFFF
+
+# Sym parsing regexes (shared)
+ADDRLINE_RE = re.compile(r'^\s*(ffffffff[0-9A-Fa-f]{8})\s+(?:\(\w\)\s+)?(.+?)\s*$')
+RHS_RE      = re.compile(r'^(?P<sym>[^\s]+(?:\s+\[[^\]]+\])?)(?:\s+/.+?:\s*\d+)?\s*$')
+
+def rhs_from_sym_line(line: str) -> str:
+    """Return 'name+off[/size] [mod]' from a `sym` output line, drop trailing src:line."""
+    if not line:
+        return ""
+    m = ADDRLINE_RE.match(line)
+    rhs = m.group(2) if m else line.strip()
+    m2 = RHS_RE.match(rhs)
+    return m2.group("sym") if m2 else rhs
 
 # -------- crash API (pykdump.API only) --------
 from pykdump.API import exec_crash_command as crash_x, readSU, readmem
@@ -201,6 +230,71 @@ def _pc_addr_by_offset(pc_base: int, offset: int) -> int:
         raise RuntimeError("Failed to compute &page_cgroup[offset]")
     return a
 
+# --- small batched sym resolver (in-memory cache) ---
+from collections import OrderedDict
+
+_SYM_CACHE = OrderedDict()
+def _sym_lookup_many(addrs):
+    # Resolve missing addresses in one 'sym' call (best-effort)
+    miss = [a for a in addrs if a not in _SYM_CACHE]
+    if not miss:
+        return
+    # Build a bounded command to avoid arg-length issues
+    args = []
+    total = 4  # len("sym ")
+    for a in miss:
+        tok = f"{a:#x} "
+        if total + len(tok) > 2000:  # conservative
+            break
+        args.append(tok); total += len(tok)
+    if not args:
+        # fallback to singles
+        for a in miss[:32]:
+            try:
+                out = x(f"sym {a:#x}").splitlines()
+            except Exception: out = []
+            rhs = ""
+            for ln in out:
+                if re.match(r'^\s*(ffffffff[0-9A-Fa-f]{8})\s+', ln):
+                    rhs = re.sub(r'^\s*(?:0x)?[0-9a-fA-F]+(?:\s+\(\w\))?\s*', '', ln).strip()
+                    rhs = re.sub(r'(?:\s+/.+?:\s*\d+)\s*$', '', rhs)
+                    break
+            _SYM_CACHE[a] = rhs or f"{a:#x}"
+        return
+    try:
+        out = x("sym " + "".join(args).strip())
+        lines = str(out).splitlines()
+        # Walk lines; pick those that start with address, map in same order we passed
+        it = iter([int(s,16) for s in re.findall(r'(ffffffff[0-9A-Fa-f]{8})', " ".join(args))])
+        current = None
+        for ln in lines:
+            m = re.match(r'^\s*(ffffffff[0-9A-Fa-f]{8})\s+(.*)$', ln)
+            if not m: continue
+            if current is None:
+                try: current = next(it)
+                except StopIteration: break
+            rhs = m.group(2)
+            rhs = re.sub(r'(?:\s+/.+?:\s*\d+)\s*$', '', rhs).strip()
+            _SYM_CACHE[current] = rhs or f"0x{current:x}"
+            current = None
+    except Exception:
+        # On failure, do a couple singles to make progress
+        for a in miss[:16]:
+            if a in _SYM_CACHE: continue
+            try:
+                out = x(f"sym {a:#x}").splitlines()
+            except Exception: out = []
+            rhs = ""
+            for ln in out:
+                if re.match(r'^\s*(ffffffff[0-9A-Fa-f]{8})\s+', ln):
+                    rhs = re.sub(r'^\s*(?:0x)?[0-9a-fA-F]+(?:\s+\(\w\))?\s*', '', ln).strip()
+                    rhs = re.sub(r'(?:\s+/.+?:\s*\d+)\s*$', '', rhs)
+                    break
+            _SYM_CACHE[a] = rhs or f"{a:#x}"
+
+def _sym_get(addr: int) -> str:
+    return _SYM_CACHE.get(addr, f"{addr:#x}")
+
 # -------- reading a single page_owner (fast path) --------
 def _read_owner_record(pc_addr: int):
     """
@@ -283,7 +377,246 @@ def export_page_owner(out_path: str,
                       resume: bool,
                       progress_every: int,
                       checkpoint_every: int,
-                      force_mode: str):
+                      force_mode: str,
+                      annotate: bool = True,
+                      frames: int = 8,
+                      modules: bool = True,
+                      sym_batch: int = 256):
+    """
+    Export page_owner records to NDJSON from crash/epython, optionally enriched.
+
+    Base behavior:
+      • visits mem_sections and reads struct page_cgroup/page_owner fields directly
+      • emits RHEL7 records with inline trace PCs; RHEL8+ records with stack depot handle
+      • buffered writes and periodic checkpointing (resumeable)
+
+    Enrichment (RHEL7 only, default ON):
+      • "s": ["name+off[/size] [mod?]", ...] for up to `frames`
+      • "mod": best-effort module tag (range-based first, then from frames)
+      • only resolves canonical kernel-text PCs (ffffffffXXXXXXXX)
+      • batched `sym` with small cache (minimal overhead)
+
+    Args:
+      out_path: output NDJSON
+      sections_range: "A:B" or None for all
+      stride: visit every Nth page
+      max_records: stop after N emitted (0 = unlimited)
+      pps_override: pages-per-section (0 = default)
+      state_path: checkpoint path (optional)
+      resume: resume from checkpoint and append
+      progress_every: visited-page interval for stderr progress (0 = off)
+      checkpoint_every: page interval for atomic checkpoint writes
+      force_mode: "auto" | "r7" | "r8"
+      annotate: enrich RHEL7 records inline (default True)
+      frames: frames per record to symbolize (default 8)
+      modules: infer module tag ("mod") (default True)
+      sym_batch: max addresses per batched sym call (default 256)
+    """
+    import tempfile
+    from collections import OrderedDict
+
+    # ---------- atomic state writes ----------
+    def _atomic_write_json(path, obj):
+        if not path:
+            return
+        d = os.path.dirname(path) or "."
+        with tempfile.NamedTemporaryFile("w", dir=d, delete=False) as tf:
+            json.dump(obj, tf)
+            tmp = tf.name
+        os.replace(tmp, path)
+
+    # ---------- module ranges (no 'km' / no 'mod -S') ----------
+    # Parse "mod" table: columns include NAME, BASE, SIZE; compute [BASE, BASE+SIZE)
+    _RANGES_READY = False
+    _ALLOW = []   # list of (start,end) allowed text ranges for symbolization
+    _MODS  = []   # (start,end,name)
+    _KTXT  = (0, 0)
+
+    def _try_load_ranges_once():
+        nonlocal _RANGES_READY, _ALLOW, _MODS, _KTXT
+        if _RANGES_READY:
+            return
+        st = et = 0
+        try:
+            st = _find_hex(x("p/x &_stext")) or 0
+            et = _find_hex(x("p/x &_etext")) or 0
+        except Exception:
+            st = et = 0
+        _KTXT = (st, et)
+
+        allow = []
+        if st and et and st < et:
+            allow.append((st, et))
+
+        mods = []
+        if modules:
+            try:
+                out = x("mod")
+                lines = [ln.strip() for ln in str(out).splitlines() if ln.strip()]
+                # find header line
+                hdr_idx = -1
+                for i, ln in enumerate(lines):
+                    if re.search(r'\bMODULE\b', ln, re.I) and re.search(r'\bBASE\b', ln, re.I) and re.search(r'\bSIZE\b', ln, re.I):
+                        hdr_idx = i; break
+                if hdr_idx >= 0:
+                    hdr = re.split(r'\s+', lines[hdr_idx])
+                    # map column names to indices
+                    name_i = next((i for i,t in enumerate(hdr) if t.upper().startswith("NAME")), None)
+                    base_i = next((i for i,t in enumerate(hdr) if t.upper().startswith("BASE")), None)
+                    size_i = next((i for i,t in enumerate(hdr) if t.upper().startswith("SIZE")), None)
+                    # parse rows
+                    for ln in lines[hdr_idx+1:]:
+                        toks = re.split(r'\s+', ln)
+                        if not toks or len(toks) < 4: continue
+                        try:
+                            # fallback indices if header parse failed
+                            ni = name_i if name_i is not None else 1
+                            bi = base_i if base_i is not None else max(0, len(toks)-3)
+                            si = size_i if size_i is not None else max(0, len(toks)-2)
+                            name = toks[ni]
+                            base = int(toks[bi], 16)
+                            size = int(toks[si], 0)
+                            end  = base + size if size > 0 else 0
+                            if end and end > base:
+                                allow.append((base, end))
+                                mods.append((base, end, name))
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+        _ALLOW = allow
+        _MODS  = mods
+        _RANGES_READY = True
+
+    def _addr_in_allowed(a: int) -> bool:
+        if not _RANGES_READY:
+            _try_load_ranges_once()
+        if _ALLOW:
+            for lo, hi in _ALLOW:
+                if lo <= a < hi:
+                    return True
+            return False
+        # No ranges? Fallback to crude top-32-bit check, but also drop tiny low offsets.
+        if (a >> 32) != 0xFFFFFFFF or a == 0xFFFFFFFFFFFFFFFF:
+            return False
+        # If we know _stext, also check it's not below it
+        if _KTXT[0] and a < _KTXT[0]:
+            return False
+        return True
+
+    def _addr_module(a: int):
+        if not modules:
+            return None
+        if not _RANGES_READY:
+            _try_load_ranges_once()
+        for lo, hi, nm in _MODS:
+            if lo <= a < hi:
+                return nm
+        st, et = _KTXT
+        if st and et and st <= a < et:
+            return "vmlinux"
+        return None
+
+    # ---------- small batched sym resolver (with validity gate) ----------
+    _SYM_CACHE = OrderedDict()
+
+    def _sym_batch_resolve(addrs, max_cmd_len=2000):
+        todo = [a for a in addrs if a not in _SYM_CACHE and is_kernel_text64(a)]
+        if not todo:
+            return
+        args = []
+        total = 4  # "sym "
+        for a in todo[:max(32, int(sym_batch))]:
+            tok = f"{a:#x} "
+            if total + len(tok) > max_cmd_len:
+                break
+            args.append(tok); total += len(tok)
+        if not args:
+            a = todo[0]
+            try:
+                out = x(f"sym {a:#x}")
+                line = ""
+                for ln in str(out).splitlines():
+                    if ADDRLINE_RE.match(ln):
+                        line = ln; break
+                _SYM_CACHE[a] = rhs_from_sym_line(line) or f"{a:#x}"
+            except Exception:
+                _SYM_CACHE[a] = f"{a:#x}"
+            return
+        try:
+            out = x("sym " + "".join(args).strip())
+            lines = str(out).splitlines()
+            i = 0
+            seq = [int(s, 16) for s in re.findall(r'(ffffffff[0-9A-Fa-f]{8})', " ".join(args))]
+            for ln in lines:
+                if i >= len(seq): break
+                if ADDRLINE_RE.match(ln):
+                    _SYM_CACHE[seq[i]] = rhs_from_sym_line(ln) or f"{seq[i]:#x}"
+                    i += 1
+            # best-effort singles for a few misses
+            while i < len(seq) and i < 16:
+                a = seq[i]
+                if a in _SYM_CACHE:
+                    i += 1; continue
+                try:
+                    out1 = x(f"sym {a:#x}")
+                    line = ""
+                    for ln in str(out1).splitlines():
+                        if ADDRLINE_RE.match(ln):
+                            line = ln; break
+                    _SYM_CACHE[a] = rhs_from_sym_line(line) or f"{a:#x}"
+                except Exception:
+                    _SYM_CACHE[a] = f"{a:#x}"
+                i += 1
+        except Exception:
+            for a in todo[:16]:
+                if a in _SYM_CACHE: continue
+                try:
+                    out1 = x(f"sym {a:#x}")
+                    line = ""
+                    for ln in str(out1).splitlines():
+                        if ADDRLINE_RE.match(ln):
+                            line = ln; break
+                    _SYM_CACHE[a] = rhs_from_sym_line(line) or f"{a:#x}"
+                except Exception:
+                    _SYM_CACHE[a] = f"{a:#x}"
+
+    # ---------- compute offsets once; fully mode-aware (no RHEL8 probes on --rhel7) ----------
+    def _compute_offsets_once_respecting_mode():
+        if force_mode == "r7":
+            # Only compute fields needed for r7; avoid probing r8 fields entirely.
+            # page_cgroup size (optional)
+            try:
+                out = x("p/x sizeof(struct page_cgroup)")
+                _OFF["page_cgroup_sz"] = _find_hex(out) or 0
+            except Exception:
+                _OFF["page_cgroup_sz"] = 0
+            # ext.owner (must)
+            _OFF["pc_owner"] = _offsetof("&(((struct page_cgroup *)0)->ext.owner)")
+            # ext.flags (optional)
+            try:
+                _OFF["pc_flags"] = _offsetof("&(((struct page_cgroup *)0)->ext.flags)")
+            except Exception:
+                _OFF["pc_flags"] = None
+            # r8-only fields: force None; do not probe
+            _OFF["pc_handle"] = None
+            _OFF["pc_pid"] = None
+            # page_owner fields
+            _OFF["po_order"] = _offsetof("&(((struct page_owner *)0)->order)")
+            _OFF["po_gfp"]   = _offsetof("&(((struct page_owner *)0)->gfp_mask)")
+            _OFF["po_nr"]    = _offsetof("&(((struct page_owner *)0)->nr_entries)")
+            _OFF["po_tr0"]   = _offsetof("&(((struct page_owner *)0)->trace_entries[0])")
+            # PAGE_EXT_OWNER bit index (optional)
+            try:
+                out = x("p PAGE_EXT_OWNER")
+                _OFF["PAGE_EXT_OWNER_bit"] = int(out.split()[-1], 0)
+            except Exception:
+                _OFF["PAGE_EXT_OWNER_bit"] = -1
+        else:
+            # default: keep original behavior (may probe r8 fields)
+            _compute_offsets_once()
+
     rows = _sections_slice(sections_range)
     pps  = pps_override if pps_override else DEFAULT_PPS
 
@@ -299,12 +632,14 @@ def export_page_owner(out_path: str,
         except Exception:
             pass
 
-    # precompute offsets once
-    _compute_offsets_once()
+    _compute_offsets_once_respecting_mode()
 
     emitted = 0
     visited = 0
     since_ckpt = 0
+
+    frames = max(1, int(frames))
+    sym_batch = max(32, int(sym_batch))
 
     try:
         start_sec_idx = state.get("sec_idx", 0) if resume else 0
@@ -336,6 +671,73 @@ def export_page_owner(out_path: str,
                         pass
                     else:
                         payload["pfn"] = pfn
+
+                        # --- Enrichment (RHEL7) ---
+                        # 1) fast module tag via mod/vmlinux ranges if available
+                        # 2) batch symbolize ALL canonical kernel-text PCs in first `frames`
+                        # 3) build "s": pretty frames; leave non-kernel addrs as hex
+                        # 4) if "mod" missing, derive from first frame with [module]
+                        if annotate and kind == "r7":
+                            pcs = payload.get("t") or []
+
+                            # 1) Module tag from ranges if available (keeps your fast path)
+                            if modules and pcs:
+                                m = _addr_module(int(pcs[0]))
+                                if m and m != "vmlinux":
+                                    payload["mod"] = m
+
+                            # 2) Symbolize frames: resolve ALL canonical kernel-text addrs,
+                            #    not just those passing the range gate. This prevents hex-only frames.
+                            #    Canonical = upper 32 bits are 0xFFFFFFFF and not 0xffffffffffffffff.
+                            need = []
+                            for a in pcs[:frames]:
+                                a = int(a)
+                                if a == 0 or a == 0xFFFFFFFFFFFFFFFF:
+                                    continue
+                                if (a >> 32) != 0xFFFFFFFF:
+                                    continue  # not kernel text; leave as hex
+                                if a not in _SYM_CACHE:
+                                    need.append(a)
+
+                            if need:
+                                _sym_batch_resolve(need)  # batch first
+                                # best-effort singles for any leftovers
+                                for a in need:
+                                    if a in _SYM_CACHE:
+                                        continue
+                                    try:
+                                        out1 = x(f"sym {a:#x}")
+                                        line = ""
+                                        for ln in str(out1).splitlines():
+                                            if ADDRLINE_RE.match(ln):
+                                                line = ln; break
+                                        _SYM_CACHE[a] = rhs_from_sym_line(line) or f"{a:#x}"
+                                    except Exception:
+                                        _SYM_CACHE[a] = f"{a:#x}"
+
+                            # 3) Build pretty frames. For canonical kernel addrs, prefer cache; else hex.
+                            frames_out = []
+                            for a in pcs[:frames]:
+                                a = int(a)
+                                if a == 0 or a == 0xFFFFFFFFFFFFFFFF:
+                                    continue
+                                if (a >> 32) == 0xFFFFFFFF:
+                                    frames_out.append(_SYM_CACHE.get(a, f"{a:#x}"))
+                                else:
+                                    frames_out.append(f"{a:#x}")  # user-space or data ptrs, keep hex
+
+                            if frames_out:
+                                payload["s"] = frames_out
+
+                            # 4) If we still don't have 'mod', infer it from the pretty frames (first '[mod]')
+                            if modules and "mod" not in payload and payload.get("s"):
+                                for rhs in payload["s"]:
+                                    if rhs.endswith("]") and "[" in rhs:
+                                        mod = rhs[rhs.rfind("[")+1:-1]
+                                        if mod and mod != "vmlinux":
+                                            payload["mod"] = mod
+                                            break
+
                         out_f.write(json.dumps(payload) + "\n")
                         emitted += 1
                         if (emitted % 8192) == 0:
@@ -347,14 +749,12 @@ def export_page_owner(out_path: str,
                     print(f"[export_po] visited={visited} emitted={emitted} sec={sec.nr} off={off} pfn={pfn}", file=sys.stderr)
 
                 if state_path and since_ckpt >= checkpoint_every:
-                    with open(state_path, "w") as sf:
-                        json.dump({"sec_idx": si, "offset": off}, sf)
+                    _atomic_write_json(state_path, {"sec_idx": si, "offset": off})
                     since_ckpt = 0
 
             start_off = 0
             if state_path:
-                with open(state_path, "w") as sf:
-                    json.dump({"sec_idx": si+1, "offset": 0}, sf)
+                _atomic_write_json(state_path, {"sec_idx": si+1, "offset": 0})
 
     except StopIteration:
         pass
@@ -376,14 +776,34 @@ def main(argv=None):
     ap.add_argument("--resume", action="store_true", help="Resume from --state and append to --out")
     ap.add_argument("--progress", type=int, default=0, help="Print progress every N pages visited (stderr)")
     ap.add_argument("--checkpoint", type=int, default=50000, help="Write state every N pages visited (default 50000)")
+
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--rhel7", action="store_true", help="Force RHEL7 inline owner mode only")
     g.add_argument("--rhel8", action="store_true", help="Force RHEL8+ stack-depot mode only")
+
+    # DEFAULT: enriched output ON
+    ap.add_argument("--annotate", action="store_true", default=True,
+                    help="Inline-enrich records (add 's' frames for RHEL7 and 'mod' when possible) [default]")
+    ap.add_argument("--frames", type=int, default=8,
+                    help="Max frames to annotate per record (RHEL7 only; default 8)")
+    ap.add_argument("--modules", action="store_true", default=True,
+                    help="Infer module tag using address ranges or frame strings [default]")
+    ap.add_argument("--sym-batch", type=int, default=256,
+                    help="Max addresses per batched 'sym' resolve when annotating (default 256)")
+
+    # RAW mode (turns enrichment off)
+    ap.add_argument("--raw", action="store_true",
+                    help="Disable inline enrichment (equivalent to --no-annotate --no-modules)")
+
     args = ap.parse_args(argv)
 
     force_mode = "auto"
     if args.rhel7: force_mode = "r7"
     if args.rhel8: force_mode = "r8"
+
+    # Apply RAW override
+    annotate = False if args.raw else bool(args.annotate)
+    modules  = False if args.raw else bool(args.modules)
 
     export_page_owner(out_path=args.out,
                       sections_range=args.sections,
@@ -394,7 +814,11 @@ def main(argv=None):
                       resume=bool(args.resume),
                       progress_every=max(0, int(args.progress)),
                       checkpoint_every=max(1000, int(args.checkpoint)),
-                      force_mode=force_mode)
+                      force_mode=force_mode,
+                      annotate=annotate,
+                      frames=max(1, int(args.frames)),
+                      modules=modules,
+                      sym_batch=max(32, int(args.sym_batch)))
 
 # crash entrypoint
 def chk_export_po(*argv):
