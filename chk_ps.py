@@ -1,39 +1,92 @@
+#!/usr/bin/env epython3
+# -*- coding: utf-8 -*-
+
 import argparse
+import sys
 from collections import defaultdict, Counter
+import re
+
+# pykdump/crash is only available inside crash epython
 from pykdump.API import *
 from LinuxDump import percpu
-import re
 
 RHEL_VERSION = 8
 
+def _is_tty():
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
+
 def get_rhel_version():
+    """
+    Detect RHEL major from 'sys' command output.
+    Falls back to existing global value if parsing fails.
+    """
     global RHEL_VERSION
-    sys_output = exec_crash_command("sys")
+    kernel_version = "unknown"
+    try:
+        sys_output = exec_crash_command("sys")
+    except Exception as e:
+        print(f"[WARN] 'sys' command failed: {e}")
+        return RHEL_VERSION
+
     for line in sys_output.splitlines():
         if "RELEASE" in line:
-            kernel_version = line.split()[-1]
-            if "el" in kernel_version:
+            # Examples:
+            #   4.18.0-513.24.1.el8_9.x86_64
+            #   3.10.0-1160.el7.x86_64
+            parts = line.split()
+            if parts:
+                kernel_version = parts[-1]
+            m = re.search(r'\.el(\d+)', line)
+            if m:
                 try:
-                    RHEL_VERSION = int(kernel_version.split(".el")[1][0])
-                except (IndexError, ValueError):
+                    RHEL_VERSION = int(m.group(1))
+                except ValueError:
                     pass
+            break
+
     print(f"Detected RHEL Version: {RHEL_VERSION} (Kernel: {kernel_version})")
     return RHEL_VERSION
 
-SCHED_CLASSES = {
-    crash.sym2addr("fair_sched_class"): "CFS",
-    crash.sym2addr("rt_sched_class"): "RT",
-    crash.sym2addr("stop_sched_class"): "STOP",
-    crash.sym2addr("idle_sched_class") if crash.symbol_exists("idle_sched_class") else None: "IDLE",
-    crash.sym2addr("dl_sched_class") if crash.symbol_exists("dl_sched_class") else None: "DL",
-}
-SCHED_CLASSES = {k: v for k, v in SCHED_CLASSES.items() if k is not None}
+def _build_sched_classes():
+    """
+    Resolve known sched_class symbols present in this kernel.
+    Avoids KeyError by conditionally inserting available ones.
+    """
+    mapping = {}
+    try:
+        mapping[crash.sym2addr("fair_sched_class")] = "CFS"
+    except Exception:
+        pass
+    try:
+        mapping[crash.sym2addr("rt_sched_class")] = "RT"
+    except Exception:
+        pass
+    try:
+        mapping[crash.sym2addr("stop_sched_class")] = "STOP"
+    except Exception:
+        pass
+    try:
+        if crash.symbol_exists("idle_sched_class"):
+            mapping[crash.sym2addr("idle_sched_class")] = "IDLE"
+    except Exception:
+        pass
+    try:
+        if crash.symbol_exists("dl_sched_class"):
+            mapping[crash.sym2addr("dl_sched_class")] = "DL"
+    except Exception:
+        pass
+    return mapping
+
+SCHED_CLASSES = _build_sched_classes()
 
 def get_sched_class(task):
     try:
         addr = Addr(task.sched_class)
         return SCHED_CLASSES.get(addr, "UNKNOWN")
-    except:
+    except Exception:
         return "UNKNOWN"
 
 def get_state(task):
@@ -41,91 +94,210 @@ def get_state(task):
         if RHEL_VERSION == 7:
             return task.state
         return task.__state
-    except:
+    except Exception:
         return -1
+
+# Detect available members only once
+HAS_TASK_CPU   = False
+HAS_TASK__CPU  = False
+HAS_TI_CPU     = False
+
+def _detect_cpu_members():
+    global HAS_TASK_CPU, HAS_TASK__CPU, HAS_TI_CPU
+    try:
+        crash.member_offset("struct task_struct", "cpu")
+        HAS_TASK_CPU = True
+    except:
+        pass
+    try:
+        crash.member_offset("struct task_struct", "_cpu")
+        HAS_TASK__CPU = True
+    except:
+        pass
+    try:
+        crash.member_offset("struct thread_info", "cpu")
+        HAS_TI_CPU = True
+    except:
+        pass
+
+def _cpu_from_comm(comm):
+    # e.g. kworker/1:3 → CPU=1
+    m = re.match(r'^kworker/(\d+):', comm)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            pass
+    return None
 
 def get_cpu(task):
+    """
+    Robust + fast CPU extraction:
+      1) task.cpu (if present)
+      2) task._cpu (older builds)
+      3) thread_info.cpu (if available; direct or via stack)
+      4) heuristic from kworker name
+    Returns int CPU, or -1 if unknown.
+    """
+    # 1) task.cpu
+    if HAS_TASK_CPU:
+        try:
+            return int(task.cpu)
+        except:
+            pass
+
+    # 2) task._cpu
+    if HAS_TASK__CPU:
+        try:
+            return int(task._cpu)
+        except:
+            pass
+
+    # 3) thread_info.cpu
+    if HAS_TI_CPU:
+        try:
+            return int(task.thread_info.cpu)
+        except:
+            try:
+                ti = readSU("struct thread_info", task.stack)
+                return int(ti.cpu)
+            except:
+                pass
+
+    # 4) heuristic for kworkers
     try:
-        if RHEL_VERSION == 7:
-            return task._cpu
-        return task.cpu
+        comm = str(task.comm)
+        kcpu = _cpu_from_comm(comm)
+        if kcpu is not None:
+            return kcpu
     except:
-        return -1
+        pass
+
+    return -1
 
 def get_state_name(state):
-    if state == 0:
-        return "TASK_RUNNING"
-    elif state & 0x1:
-        return "TASK_INTERRUPTIBLE"
-    elif state & 0x2:
-        return "TASK_UNINTERRUPTIBLE"
-    elif state & 0x4:
-        return "__TASK_STOPPED"
-    elif state & 0x8:
-        return "__TASK_TRACED"
-    elif state & 0x10:
-        return "EXIT_DEAD"
-    elif state & 0x20:
-        return "EXIT_ZOMBIE"
-    elif state & 0x40:
-        return "TASK_DEAD"
-    else:
+    # Basic mapping — keep behavior consistent with your original
+    try:
+        if state == 0:
+            return "TASK_RUNNING"
+        elif state & 0x1:
+            return "TASK_INTERRUPTIBLE"
+        elif state & 0x2:
+            return "TASK_UNINTERRUPTIBLE"
+        elif state & 0x4:
+            return "__TASK_STOPPED"
+        elif state & 0x8:
+            return "__TASK_TRACED"
+        elif state & 0x10:
+            return "EXIT_DEAD"
+        elif state & 0x20:
+            return "EXIT_ZOMBIE"
+        elif state & 0x40:
+            return "TASK_DEAD"
+        else:
+            return "UNKNOWN"
+    except Exception:
         return "UNKNOWN"
 
-def get_ps_code(task):
+def get_ps_code(task, debug=False):
+    """
+    ps-like state code. On this RHEL7 build, crash treats TASK_DEAD (0x40)
+    with any non-zero exit_state as ZO. Keep that behavior here.
+    """
     try:
-        exit_state = task.exit_state
-        state = get_state(task)
-        if exit_state & 0x20:
+        # Robust ints
+        try:
+            exit_state = int(getattr(task, 'exit_state', 0))
+        except Exception:
+            try:
+                es = getattr(task, 'exit_state', 0)
+                exit_state = int(getattr(es, 'value', 0))
+            except Exception:
+                try:
+                    exit_state = int(str(es), 0)
+                except Exception:
+                    exit_state = 0
+
+        state = int(get_state(task))
+
+        # Match crash behavior seen in your dump:
+        # TASK_DEAD + any exit_state => ZO
+        if (state & 0x40):  # TASK_DEAD
+            if exit_state != 0:
+                if debug: print(f"[DEBUG] classify ZO: state=0x{state:x} exit_state=0x{exit_state:x}")
+                return "ZO"
+            else:
+                # Rare, but keep DE fallback if TASK_DEAD with no exit_state
+                if debug: print(f"[DEBUG] classify DE: state=0x{state:x} exit_state=0x{exit_state:x}")
+                return "DE"
+
+        # Remaining mappings (same as before)
+        if exit_state & 0x20:   # EXIT_ZOMBIE (classic)
             return "ZO"
-        elif exit_state & 0x10:
+        if exit_state & 0x10:   # EXIT_DEAD
             return "DE"
-        elif state == 0x0000:
+        if state == 0x0000:
             return "RU"
-        elif state == 0x0402:
+        if state == 0x0402:
             return "ID"
-        elif state & 0x0001:
+        if state & 0x0001:
             return "IN"
-        elif state & 0x0002:
+        if state & 0x0002:
             return "UN"
-        elif state & 0x0004:
+        if state & 0x0004:
             return "ST"
-        elif state & 0x0008:
+        if state & 0x0008:
             return "TR"
-        elif state & 0x0200:
+        if state & 0x0200:
             return "WA"
-        elif state & 0x0040:
-            return "PA"
-        elif not task.mm:
+        if state & 0x0040:
+            # If we ever get here (no exit_state), treat as DE
+            return "DE"
+
+        if not getattr(task, 'mm', None):
             return "ID"
-        else:
-            return "NE"
-    except:
+
+        return "NE"
+    except Exception:
         return "NE"
 
 def parse_bt_output(bt_output, max_depth=5):
+    """
+    Extract the function names from crash's 'bt -s PID' output.
+    We strip the bottom-up order and return a 'tail' chain joined by ' -> '.
+
+    Example 'bt' line patterns vary, so keep regex permissive:
+      #0 [ffff...] func_name+0x.../0x...  or
+      #1 [ffff...] func_name
+    """
     trace = []
-    for line in bt_output.strip().splitlines():
-        match = re.search(r']\s+([a-zA-Z0-9_\.]+)', line)
-        if match:
-            trace.append(match.group(1))
+    for line in (bt_output or "").splitlines():
+        # grab token after the ']'
+        m = re.search(r'\]\s+([a-zA-Z0-9_\.]+)', line)
+        if not m:
+            # alternate form: '#0  func'
+            m = re.search(r'#\d+\s+([a-zA-Z0-9_\.]+)', line)
+        if m:
+            trace.append(m.group(1))
     if not trace:
         return None
-    trace_tail = trace[:max_depth]
-    trace_tail.reverse()
-    return ' -> '.join(trace_tail)
+    # Bottom-up tail (reverse the head of stack frames)
+    tail = trace[:max_depth]
+    tail.reverse()
+    return ' -> '.join(tail)
 
-def color_prio(prio, static_prio, sched):
-    RESET = "\033[0m"
+def colorize(s, color_code, enable=True):
+    if not enable:
+        return s
+    return f"\033[{color_code}m{s}\033[0m"
+
+def color_prio(prio, static_prio, sched, enable=True):
     if sched == "CFS" and static_prio != 120:
-        return f"\033[32m{prio:>5}{RESET}"
+        return colorize(f"{prio:>5}", "32", enable)  # green
     elif sched == "CFS" and prio != static_prio:
-        return f"\033[33m{prio:>5}{RESET}"
+        return colorize(f"{prio:>5}", "33", enable)  # yellow
     else:
         return f"{prio:>5}"
-
-task_list_offset = crash.member_offset("struct task_struct", "tasks")
-thread_group_offset = crash.member_offset("struct task_struct", "thread_group")
 
 def get_idle_tasks():
     idle_tasks = []
@@ -138,90 +310,40 @@ def get_idle_tasks():
         print(f"[ERROR] Failed to retrieve idle tasks: {e}")
     return idle_tasks
 
+def _read_thread_group(leader, debug=False):
+    group = [leader]
+    try:
+        threads = readSUListFromHead(Addr(leader.thread_group), "thread_group", "struct task_struct")
+        for t in threads:
+            if t is None:
+                continue
+            group.append(t)
+    except Exception as e:
+        if debug:
+            print(f"[WARN] Cannot read thread group of PID {getattr(leader, 'pid', -1)}: {e}")
+    return group
+
 def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=False, depth=5):
     results = defaultdict(list)
     bt_counter = Counter()
     seen = set()
 
-    init_task = readSymbol("init_task")
+    try:
+        init_task = readSymbol("init_task")
+    except Exception as e:
+        print(f"[ERROR] Cannot read init_task: {e}")
+        return results, bt_counter
 
     try:
         leaders = readSUListFromHead(Addr(init_task.tasks), "tasks", "struct task_struct")
     except Exception as e:
-        print(f"Error reading task list: {e}")
+        print(f"[ERROR] Error reading task list: {e}")
         return results, bt_counter
 
-    for leader in leaders:
-        thread_group = [leader]
-
-        try:
-            threads = readSUListFromHead(Addr(leader.thread_group), "thread_group", "struct task_struct")
-            thread_group.extend(threads)
-        except Exception as e:
-            if debug:
-                print(f"[WARN] Cannot read thread group of PID {leader.pid}: {e}")
-            continue
-
-        for task in thread_group:
-            addr = Addr(task)
-            if addr in seen:
-                continue
-            seen.add(addr)
-
-            try:
-                pid = task.pid
-                comm = str(task.comm)
-                state_val = get_state(task)
-                state_name = get_state_name(state_val)
-                ppid = task.real_parent.pid if task.real_parent else 0
-                on_cpu = getattr(task, 'on_cpu', 0)
-                cpu = get_cpu(task)
-                ps_code = get_ps_code(task)
-                sched_class = get_sched_class(task)
-                prio = task.prio
-                static_prio = task.static_prio
-            except Exception as e:
-                if debug:
-                    print(f"[WARN] Error reading task at {addr:x}: {e}")
-                continue
-
-            if filter_code and ps_code != filter_code:
-                continue
-            if only_active and (ps_code != "RU" or on_cpu != 1):
-                continue
-
-            if debug:
-                print(f"[DEBUG] PID={pid} COMM={comm} ST=0x{state_val:x} PS={ps_code} CPU={cpu} ON_CPU={on_cpu} SCHED={sched_class} PRIO={prio} ADDR={addr:x}")
-
-            results[state_name].append({
-                "pid": pid,
-                "ppid": ppid,
-                "comm": comm,
-                "state_val": state_val,
-                "on_cpu": on_cpu,
-                "cpu": cpu,
-                "ps": ps_code,
-                "sched": sched_class,
-                "prio": prio,
-                "static_prio": static_prio,
-                "addr": f"{addr:x}"
-            })
-
-            if collect_bt:
-                try:
-                    bt_output = exec_crash_command(f"bt -s {pid}")
-                    trace = parse_bt_output(bt_output, max_depth=depth)
-                    if trace:
-                        bt_counter[trace] += 1
-                except Exception as e:
-                    if debug:
-                        print(f"[WARN] Failed to collect bt for PID {pid}: {e}")
-                    continue
-
-    for task in get_idle_tasks():
+    def _record_task(task):
         addr = Addr(task)
         if addr in seen:
-            continue
+            return
         seen.add(addr)
 
         try:
@@ -230,24 +352,25 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
             state_val = get_state(task)
             state_name = get_state_name(state_val)
             ppid = task.real_parent.pid if task.real_parent else 0
-            on_cpu = getattr(task, 'on_cpu', 0)
+            on_cpu = int(getattr(task, 'on_cpu', 0))
             cpu = get_cpu(task)
-            ps_code = get_ps_code(task)
+            ps_code = get_ps_code(task,debug)
             sched_class = get_sched_class(task)
             prio = task.prio
             static_prio = task.static_prio
         except Exception as e:
             if debug:
-                print(f"[WARN] Error reading idle task at {addr:x}: {e}")
-            continue
+                print(f"[WARN] Error reading task at {addr:x}: {e}")
+            return
 
         if filter_code and ps_code != filter_code:
-            continue
+            return
         if only_active and (ps_code != "RU" or on_cpu != 1):
-            continue
+            return
 
         if debug:
-            print(f"[DEBUG] PID={pid} COMM={comm} ST=0x{state_val:x} PS={ps_code} CPU={cpu} ON_CPU={on_cpu} SCHED={sched_class} PRIO={prio} ADDR={addr:x}")
+            print(f"[DEBUG] PID={pid} COMM={comm} ST=0x{state_val:x} PS={ps_code} CPU={cpu} "
+                  f"ON_CPU={on_cpu} SCHED={sched_class} PRIO={prio} ADDR={addr:x}")
 
         results[state_name].append({
             "pid": pid,
@@ -272,21 +395,43 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
             except Exception as e:
                 if debug:
                     print(f"[WARN] Failed to collect bt for PID {pid}: {e}")
-                continue
+
+    # Walk all leaders and their thread groups
+    for leader in leaders:
+        for task in _read_thread_group(leader, debug=debug):
+            _record_task(task)
+
+    # Ensure idle tasks are considered (some builds hide them from the lists)
+    for task in get_idle_tasks():
+        _record_task(task)
 
     return results, bt_counter
 
+def _default_sort_key(task):
+    # Sort RU tasks first, then on_cpu desc, then CPU, then PID
+    ps_rank = {"RU": 0, "IN": 1, "UN": 2, "WA": 3, "ST": 4, "TR": 5, "ID": 6, "PA": 7, "DE": 8, "ZO": 9, "NE": 10}
+    return (
+        ps_rank.get(task.get("ps"), 99),
+        -int(task.get("on_cpu", 0)),
+        int(task.get("cpu", -1)),
+        int(task.get("pid", 0)),
+    )
+
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Crash/epython task list analyzer")
     parser.add_argument("--state", help="Filter tasks by state code (e.g., RU, IN, UN)")
-    parser.add_argument("--active", action="store_true", help="Only show active RU tasks")
+    parser.add_argument("--active", action="store_true", help="Only show active RU tasks (on_cpu==1)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     parser.add_argument("-d", "--debug", action="store_true", help="Debug output")
     parser.add_argument("--bt", action="store_true", help="Collect and group backtraces")
     parser.add_argument("--depth", type=int, default=5, help="Depth of backtrace tail to group on")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
+    parser.add_argument("--sort", choices=["default", "pid", "cpu"], help="Sort order for text output")
     args = parser.parse_args()
 
+    # Initialize kernel/RHEL detection first
     get_rhel_version()
+    _detect_cpu_members()
 
     print("Collecting task list...")
     results, bt_counter = walk_task_list(
@@ -300,8 +445,10 @@ def main():
     if args.bt:
         print("\nBacktrace pattern summary:")
         print("==========================")
-        for trace, count in bt_counter.most_common():
+        # Deterministic order: by count desc, then lexicographically
+        for trace, count in sorted(bt_counter.items(), key=lambda kv: (-kv[1], kv[0])):
             print(f"{count:<5}  {trace}")
+        return
     else:
         print("\n   PID     PPID    ST  CPU        TASK       ON_CPU SCHED PRIO       COMM")
         print("==========================================================================")
