@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 # chk_cg.py — Inspect CPU/Memory cgroup limits for a task from a vmcore (crash epython).
-# Works with crash via pykdump.API / pykdump.
+# RHEL-focused, works inside crash via pykdump.API / pykdump.
+#
+# Usage inside crash:
+#   epython chk_cg.py <PID|TASK_POINTER>
+#
+# Example:
+#   epython chk_cg.py 22774
+#   epython chk_cg.py 0xffffa0b8412e4000
 
 import sys, re, argparse
 
+# ---------------- colors ----------------
 class C:
     RED    = "\033[31m"
     GREEN  = "\033[32m"
@@ -15,28 +23,87 @@ class C:
 # ---------------- crash/pykdump glue ----------------
 _CRASH = None
 _CRASH_IMPORT_ERR = None
+
 def _init_crash():
     global _CRASH, _CRASH_IMPORT_ERR
     try:
         from pykdump.API import exec_crash_command as _exec
-        _CRASH = _exec; return
+        _CRASH = _exec
+        return
     except Exception as e_api:
         try:
             from pykdump import exec_crash_command as _exec
-            _CRASH = _exec; return
+            _CRASH = _exec
+            return
         except Exception as e_base:
             _CRASH = None
             _CRASH_IMPORT_ERR = f"pykdump.API err={repr(e_api)} ; pykdump err={repr(e_base)}"
 
 def x(cmd: str) -> str:
-    if _CRASH is None: _init_crash()
+    if _CRASH is None:
+        _init_crash()
     if _CRASH is None:
         print(f"[ERROR] pykdump not available; cannot run crash command.\n{_CRASH_IMPORT_ERR}", file=sys.stderr)
         sys.exit(2)
     out = _CRASH(cmd)
     return out if isinstance(out, str) else str(out)
 
-# ---------------- helpers ----------------
+# ---------------- struct member probing (version-safe) ----------------
+_STRUCT_FIELD_CACHE = {}
+
+def member_offset(typename: str, member: str):
+    """
+    Return byte offset of 'member' in 'typename', or None if absent.
+    Uses crash 'offset' command; if your epython exposes crash.member_offset, uses that.
+    """
+    # Try Python binding if present
+    try:
+        import crash as _cr
+        if hasattr(_cr, "member_offset"):
+            off = _cr.member_offset(typename, member)
+            return int(off) if off is not None and off != -1 else None
+    except Exception:
+        pass
+    # Fallback: textual 'offset <type> <member>' and parse
+    out = x(f"offset {typename} {member}")
+    line = out.strip().splitlines()[-1] if out.strip() else ""
+    m = re.search(r'=\s*(0x[0-9a-fA-F]+|\d+)', line)
+    if not m:
+        return None
+    return int(m.group(1), 0)
+
+def has_member(typename: str, member: str) -> bool:
+    key = (typename, member)
+    if key in _STRUCT_FIELD_CACHE:
+        return _STRUCT_FIELD_CACHE[key]
+    off = member_offset(typename, member)
+    ok = off is not None
+    _STRUCT_FIELD_CACHE[key] = ok
+    return ok
+
+# ---- RT helpers ----
+# Common policy constants (RHEL7/8/9)
+SCHED_NORMAL = 0
+SCHED_FIFO   = 1
+SCHED_RR     = 2
+SCHED_BATCH  = 3
+SCHED_IDLE   = 5
+SCHED_DEADLINE = 6  # if present
+
+def is_rt_policy(pol: int) -> bool:
+    return pol in (SCHED_FIFO, SCHED_RR)
+
+def policy_name(pol: int) -> str:
+    return {
+        SCHED_NORMAL: "SCHED_NORMAL",
+        SCHED_FIFO:   "SCHED_FIFO",
+        SCHED_RR:     "SCHED_RR",
+        SCHED_BATCH:  "SCHED_BATCH",
+        SCHED_IDLE:   "SCHED_IDLE",
+        SCHED_DEADLINE: "SCHED_DEADLINE",
+    }.get(pol, f"{pol}")
+
+# ---------------- small helpers ----------------
 def last_line(txt: str) -> str:
     lines = [l for l in (txt or "").splitlines() if l.strip()]
     return lines[-1].strip() if lines else ""
@@ -45,41 +112,45 @@ def parse_p(text: str) -> str:
     line = last_line(text)
     return line.split("=", 1)[1].strip() if "=" in line else line
 
+def p_eval(expr: str) -> str:
+    return parse_p(x(f"p {expr}"))
+
 ADDR_RE = re.compile(r'(0x)?([0-9a-fA-F]{16,})')
+
 def addr_only(s: str) -> str:
-    """Extract bare hex address (as '0x...') from crash/gdb output like '(type *) 0xffff...'."""
-    if s is None: return None
+    """Extract bare hex address (as '0x...') from strings like '(type *) 0xffff...'."""
+    if s is None:
+        return None
     m = ADDR_RE.search(s)
-    if not m: return None
-    hexpart = m.group(2).lower()
-    return "0x" + hexpart
+    if not m:
+        return None
+    return "0x" + m.group(2).lower()
 
 def to_int(s: str):
-    if s is None: return None
+    if s is None:
+        return None
     # prefer raw address if present
     a = addr_only(s)
     if a:
-        try: return int(a, 16)
-        except Exception: pass
+        try:
+            return int(a, 16)
+        except Exception:
+            pass
     t = re.sub(r'^\(.*?\)\s*', '', s.strip())
     tok = t.split()[-1]
     try:
-        if tok.lower().startswith(("0x","ffff")): return int(tok, 16)
+        if tok.lower().startswith(("0x", "ffff")):
+            return int(tok, 16)
         return int(tok, 10)
     except Exception:
         return None
-
-def is_ptr_text(s: str) -> bool:
-    return addr_only(s) is not None
-
-def p_eval(expr: str) -> str:
-    return parse_p(x(f"p {expr}"))
 
 def normalize_target(arg: str) -> str:
     if re.fullmatch(r'\d+', arg):
         tp = task_ptr_from_pid(int(arg))
         if not tp:
-            print(f"[ERROR] Cannot resolve TASK pointer for PID {arg}", file=sys.stderr); sys.exit(1)
+            print(f"[ERROR] Cannot resolve TASK pointer for PID {arg}", file=sys.stderr)
+            sys.exit(1)
         return tp
     return arg if arg.startswith("0x") else ("0x" + arg)
 
@@ -102,21 +173,77 @@ def task_ptr_from_pid(pid: int) -> str:
     return ptr
 
 def fmt_ns(v) -> str:
-    try: return f"{int(v)} ns"
-    except Exception: return str(v)
+    try:
+        return f"{int(v)} ns"
+    except Exception:
+        return str(v)
 
 def fmt_bytes(v) -> str:
-    try: b = int(v)
-    except Exception: return str(v)
-    units = ["B","KiB","MiB","GiB","TiB"]; k=0; val=float(b)
-    while val>=1024.0 and k<len(units)-1: val/=1024.0; k+=1
+    try:
+        b = int(v)
+    except Exception:
+        return str(v)
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    k, val = 0, float(b)
+    while val >= 1024.0 and k < len(units) - 1:
+        val /= 1024.0
+        k += 1
     return f"{val:.2f} {units[k]} ({b} bytes)"
 
+# ---------------- kernfs/cgroup helpers ----------------
+def _extract_cstr(val: str) -> str:
+    """From '0xffff... \"name\"' return 'name'."""
+    if not isinstance(val, str):
+        return str(val)
+    m = re.search(r'"([^"]*)"', val)
+    if m:
+        return m.group(1)
+    if ADDR_RE.search(val):
+        return ""
+    return val.strip()
+
+def cgroup_name_from_css(css_ptr_text: str):
+    """Return (name, cgroup_ptr_addr, kn_ptr_addr).
+       Works if css_ptr_text is either a CSS or a task_group (root_task_group)."""
+    css_addr = addr_only(css_ptr_text)
+    if not css_addr:
+        return (None, None, None)
+    # First try CSS path
+    cg = p_eval(f"((struct cgroup_subsys_state *){css_addr})->cgroup")
+    cg_addr = addr_only(cg)
+    if not cg_addr:
+        # Fallback: treat input as task_group and go via ->css.cgroup
+        cg2 = p_eval(f"((struct task_group *){css_addr})->css.cgroup")
+        cg_addr = addr_only(cg2)
+        if not cg_addr:
+            return (None, None, None)
+    kn = p_eval(f"((struct cgroup *){cg_addr})->kn")
+    kn_addr = addr_only(kn)
+    if not kn_addr:
+        return (None, cg_addr, None)
+    nm = p_eval(f"((struct kernfs_node *){kn_addr})->name")
+    name = _extract_cstr(nm) or "/"
+    return (name, cg_addr, kn_addr)
+
+def cgroup_path_from_kn(kn_addr: str):
+    parts = []
+    cur = kn_addr
+    hops = 0
+    while cur and hops < 16:
+        nm = _extract_cstr(p_eval(f"((struct kernfs_node *){cur})->name"))
+        if nm and nm != "/" and not ADDR_RE.fullmatch(nm):
+            parts.append(nm)
+        parent = p_eval(f"((struct kernfs_node *){cur})->parent")
+        cur = addr_only(parent)
+        hops += 1
+    # If no parts, we're at the root cgroup
+    return "/" if kn_addr else ("/" + "/".join(reversed(parts)) if parts else None)
+
+# ---------------- page size & scaling ----------------
 def page_size():
-    """Derive PAGE_SIZE without poking gdb symbols; parse `sys` output."""
+    """Derive PAGE_SIZE without poking symbols; parse `sys` output."""
     try:
         out = x("sys")
-        # Typical line: "PAGE SIZE: 4096"
         for ln in out.splitlines():
             if "PAGE SIZE" in ln:
                 m = re.search(r'PAGE SIZE:\s*(\d+)', ln)
@@ -124,69 +251,32 @@ def page_size():
                     return int(m.group(1))
     except Exception:
         pass
-    return 4096  # safe default for x86_64 if parsing fails
+    return 4096  # safe default for x86_64
 
 def scale_pages_to_bytes_if_needed(usage, limit, watermark):
     """
-    If values look like page counts (small numbers), convert to bytes.
-    Heuristic: if limit exists and is < 1<<20 and PAGE_SIZE in [4K..64K], treat as pages.
+    If values look like page counts (small integers), convert to bytes.
+    Heuristic: values < 2^20 are treated as page counts.
     """
     ps = page_size()
     def maybe_scale(v):
         if v is None:
             return None
-        # If clearly a gigantic 'unlimited' value, leave as-is.
         if v >= (1 << 60):
             return v
-        # Heuristic: numbers < ~1M are very likely page counts in this context.
         return v * ps if v < (1 << 20) else v
     return maybe_scale(usage), maybe_scale(limit), maybe_scale(watermark), ps
-
-# ---------------- kernfs/cgroup helpers ----------------
-def _extract_cstr(val: str) -> str:
-    """From crash 'p' output like '0xffff... \"name\"' return 'name'."""
-    if not isinstance(val, str):
-        return str(val)
-    m = re.search(r'"([^"]*)"', val)
-    if m:
-        return m.group(1)
-    # if there are no quotes and it starts with an address, drop it
-    if ADDR_RE.search(val):
-        return ""
-    return val.strip()
-
-def cgroup_name_from_css(css_ptr_text: str):
-    """Return (name, cgroup_ptr, kn_ptr). Accepts css text with casts."""
-    css_addr = addr_only(css_ptr_text)
-    if not css_addr: return (None, None, None)
-    cg = p_eval(f"((struct cgroup_subsys_state *){css_addr})->cgroup")
-    cg_addr = addr_only(cg)
-    if not cg_addr: return (None, None, None)
-    kn = p_eval(f"((struct cgroup *){cg_addr})->kn")
-    kn_addr = addr_only(kn)
-    if not kn_addr: return (None, cg_addr, None)
-    nm = p_eval(f"((struct kernfs_node *){kn_addr})->name")
-    name = _extract_cstr(nm)
-    return (name, cg_addr, kn_addr)
-
-def cgroup_path_from_kn(kn_addr: str):
-    parts=[]; cur=kn_addr; hops=0
-    while cur and hops<16:
-        nm = _extract_cstr(p_eval(f"((struct kernfs_node *){cur})->name"))
-        if nm and nm!="/" and not ADDR_RE.fullmatch(nm):
-            parts.append(nm)
-        parent = p_eval(f"((struct kernfs_node *){cur})->parent")
-        cur = addr_only(parent); hops+=1
-    return "/" + "/".join(reversed(parts)) if parts else None
 
 # ---------------- CPU (CFS bandwidth) ----------------
 def collect_cpu(task_ptr: str):
     out = {}
     cpu_css = p_eval(f"((struct task_struct *){task_ptr})->cgroups->subsys[1]")
     out["cpu_css"] = cpu_css
+
     tg = p_eval(f"((struct task_struct *){task_ptr})->sched_task_group")
     tg_addr = addr_only(tg) or tg
     out["tg"] = tg_addr
+
     thr = to_int(p_eval(f"((struct task_struct *){task_ptr})->se->cfs_rq->throttled"))
     out["throttled"] = thr
 
@@ -194,29 +284,133 @@ def collect_cpu(task_ptr: str):
     quo = to_int(p_eval(f"((struct task_group *){tg_addr})->cfs_bandwidth.quota"))
     run = to_int(p_eval(f"((struct task_group *){tg_addr})->cfs_bandwidth.runtime"))
     out["period_ns"] = per; out["quota_ns"] = quo; out["runtime_ns"] = run
+    # classify unlimited quota here for later prints
+    out["quota_unlimited"] = (quo is None) or (quo == -1) or (isinstance(quo, int) and quo >= 10**15)
 
     name, cg, kn = cgroup_name_from_css(cpu_css)
     out["name"] = name
     out["path"] = cgroup_path_from_kn(kn) if kn else None
+    out["cgroup"] = cg
+    out["kn"] = kn
 
-    anc=[]; cur=tg_addr
+    # record task policy for display (normal/RT/deadline etc.)
+    try:
+        out["policy"] = to_int(p_eval(f"((struct task_struct *){task_ptr})->policy"))
+    except Exception:
+        pass
+
+    # Ancestors (closest → root)
+    anc = []
+    cur = tg_addr
     for _ in range(10):
         q = to_int(p_eval(f"((struct task_group *){cur})->cfs_bandwidth.quota"))
         p = to_int(p_eval(f"((struct task_group *){cur})->cfs_bandwidth.period"))
         anc.append((cur, q, p))
         pr = p_eval(f"((struct task_group *){cur})->parent")
         cur = addr_only(pr)
-        if not cur: break
-    out["ancestors"]=anc
+        if not cur:
+            break
+    out["ancestors"] = anc
 
+    # Tightest finite cap
     tight_ratio = None; tight_src = None
     for tg_i, q_i, p_i in anc:
-        # consider huge q_i as unlimited (root/static)
-        if q_i and p_i and q_i>0 and p_i>0 and q_i < 10**15:
-            r = q_i/float(p_i)
-            if tight_ratio is None or r<tight_ratio:
-                tight_ratio=r; tight_src=tg_i
-    out["tight_ratio"]=tight_ratio; out["tight_src"]=tight_src
+        if q_i and p_i and q_i > 0 and p_i > 0 and q_i < 10**15:
+            r = q_i / float(p_i)
+            if tight_ratio is None or r < tight_ratio:
+                tight_ratio = r; tight_src = tg_i
+    out["tight_ratio"] = tight_ratio; out["tight_src"] = tight_src
+
+    # --- Per-rq snapshot (only read members that exist on this kernel) ---
+    try:
+        rq = p_eval(f"((struct task_struct *){task_ptr})->se->cfs_rq")
+        rq_addr = addr_only(rq) or rq
+        out["cfs_rq"] = rq_addr
+        if rq_addr:
+            if has_member("cfs_rq", "runtime_remaining") and not out.get("quota_unlimited"):
+                rr = to_int(p_eval(f"((struct cfs_rq *){rq_addr})->runtime_remaining"))
+                out["rq_runtime_remaining"] = rr
+                quo_ns = out.get("quota_ns"); per_ns = out.get("period_ns")
+                if quo_ns and quo_ns > 0 and rr is not None and rr >= -(1<<62):
+                    used = quo_ns - (rr if rr > 0 else 0)
+                    if used < 0: used = 0
+                    if used > quo_ns: used = quo_ns
+                    out["rq_period_used_ns"] = used
+                    out["rq_period_used_pct"] = 100.0 * (used/float(quo_ns))
+            if has_member("cfs_rq", "nr_running"):
+                out["rq_nr_running"] = to_int(p_eval(f"((struct cfs_rq *){rq_addr})->nr_running"))
+            if has_member("cfs_rq", "throttled"):
+                out["rq_throttled_flag"] = to_int(p_eval(f"((struct cfs_rq *){rq_addr})->throttled"))
+            if has_member("cfs_rq", "throttle_count"):
+                out["rq_throttle_count"] = to_int(p_eval(f"((struct cfs_rq *){rq_addr})->throttle_count"))
+    except Exception:
+        pass
+
+    # --- Stable bandwidth stats from task_group->cfs_bandwidth ---
+    try:
+        bw = f"((struct task_group *){tg_addr})->cfs_bandwidth"
+        if has_member("cfs_bandwidth", "nr_periods"):
+            out["bw_nr_periods"] = to_int(p_eval(f"{bw}.nr_periods"))
+        if has_member("cfs_bandwidth", "nr_throttled"):
+            out["bw_nr_throttled"] = to_int(p_eval(f"{bw}.nr_throttled"))
+        if has_member("cfs_bandwidth", "throttled_time"):
+            out["bw_throttled_time"] = to_int(p_eval(f"{bw}.throttled_time"))
+    except Exception:
+        pass
+    return out
+
+def collect_rt(task_ptr: str):
+    """Gather RT policy/priority and RT bandwidth (group) if this is an RT task."""
+    out = {}
+    pol = to_int(p_eval(f"((struct task_struct *){task_ptr})->policy"))
+    out["policy"] = pol
+    out["policy_name"] = policy_name(pol)
+    if not is_rt_policy(pol):
+        return out
+
+    # Basic RT task attributes
+    if has_member("task_struct", "rt_priority"):
+        out["rt_priority"] = to_int(p_eval(f"((struct task_struct *){task_ptr})->rt_priority"))
+    if has_member("task_struct", "prio"):
+        out["prio"] = to_int(p_eval(f"((struct task_struct *){task_ptr})->prio"))
+
+    # RT bandwidth is anchored in the task_group
+    tg = p_eval(f"((struct task_struct *){task_ptr})->sched_task_group")
+    tg_addr = addr_only(tg) or tg
+    out["tg"] = tg_addr
+
+    rb = f"((struct task_group *){tg_addr})->rt_bandwidth"
+    if has_member("task_group", "rt_bandwidth"):
+        # These names are stable: rt_runtime (ns) and rt_period (ns)
+        if has_member("rt_bandwidth", "rt_runtime"):
+            out["rt_runtime_ns"] = to_int(p_eval(f"{rb}.rt_runtime"))
+        if has_member("rt_bandwidth", "rt_period"):
+            out["rt_period_ns"] = to_int(p_eval(f"{rb}.rt_period"))
+
+    # Optional per-CPU rt_rq glimpses (version-dependent; probe first)
+    # If we can reach an rq pointer from the task (via its CFS rq->rq, which exists even for RT on many builds),
+    # we can then read rq->rt fields.
+    try:
+        # Re-use se->cfs_rq->rq to get the rq (works across classes on many RHEL kernels)
+        if has_member("task_struct", "se") and has_member("sched_entity", "cfs_rq"):
+            cfsrq = p_eval(f"((struct task_struct *){task_ptr})->se->cfs_rq")
+            cfsrq_addr = addr_only(cfsrq)
+            if cfsrq_addr and has_member("cfs_rq", "rq"):
+                rq = p_eval(f"((struct cfs_rq *){cfsrq_addr})->rq")
+                rq_addr = addr_only(rq)
+                if rq_addr and has_member("rq", "rt"):
+                    # rq->rt is the embedded struct rt_rq
+                    # read a few safe members if they exist
+                    out["rt_rq_addr"] = rq_addr  # show the rq that hosts rt_rq
+                    if has_member("rt_rq", "rt_nr_running"):
+                        out["rt_nr_running"] = to_int(p_eval(f"((struct rq *){rq_addr})->rt.rt_nr_running"))
+                    if has_member("rt_rq", "rt_time"):
+                        out["rt_time"] = to_int(p_eval(f"((struct rq *){rq_addr})->rt.rt_time"))
+                    if has_member("rt_rq", "rt_throttled"):
+                        out["rt_throttled"] = to_int(p_eval(f"((struct rq *){rq_addr})->rt.rt_throttled"))
+    except Exception:
+        pass
+
     return out
 
 # ---------------- Memory (memcg) ----------------
@@ -224,18 +418,21 @@ def collect_mem(task_ptr: str):
     out = {}
     mem_css = p_eval(f"((struct task_struct *){task_ptr})->cgroups->subsys[4]")
     out["mem_css"] = mem_css
+
     name, cg, kn = cgroup_name_from_css(mem_css)
     out["name"] = name
     out["path"] = cgroup_path_from_kn(kn) if kn else None
+    out["cgroup"] = cg
+    out["kn"] = kn
 
     css_addr = addr_only(mem_css)
     if not css_addr:
-        out["note"] = "cannot parse mem css pointer"; return out
+        out["note"] = "cannot parse mem css pointer"
+        return out
 
     # On RHEL, mem_cgroup embeds 'struct cgroup_subsys_state css;' as first member.
-    # So memcg pointer == css address. Use bare address to avoid double casts.
+    # So memcg pointer == css address.
     mc_addr = css_addr
-    # Optional sanity (don’t fail script if it errors on this kernel):
     try:
         _ = p_eval(f"((struct mem_cgroup *){mc_addr})->css.cgroup")
     except Exception:
@@ -245,31 +442,33 @@ def collect_mem(task_ptr: str):
         for e in exprs:
             try:
                 v = to_int(p_eval(e))
-                if v is not None: return v, e
+                if v is not None:
+                    return v, e
             except Exception:
                 pass
         return None, None
 
+    # usage & limit
     usage, _ = try_int([
-        f"((struct mem_cgroup *){mc_addr})->memory.usage.counter",  # your kernel
-        f"((struct mem_cgroup *){mc_addr})->memory.usage",          # some builds
+        f"((struct mem_cgroup *){mc_addr})->memory.usage.counter",  # page_counter
+        f"((struct mem_cgroup *){mc_addr})->memory.usage",
         f"((struct mem_cgroup *){mc_addr})->memory.usage.value",
         f"((struct mem_cgroup *){mc_addr})->memory.usage_in_bytes",
         f"((struct mem_cgroup *){mc_addr})->memory.local_usage",
     ])
     limit, _ = try_int([
-        f"((struct mem_cgroup *){mc_addr})->memory.max",    # hard limit on your kernel
+        f"((struct mem_cgroup *){mc_addr})->memory.max",    # hard cap on this kernel
         f"((struct mem_cgroup *){mc_addr})->memory.limit",  # older trees
     ])
     fc, _ = try_int([f"((struct mem_cgroup *){mc_addr})->memory.failcnt"])
     wm, _ = try_int([f"((struct mem_cgroup *){mc_addr})->memory.watermark"])
-    # Detect page-based fields and scale to bytes if needed
+
+    # page-based → bytes
     usage_b, limit_b, wm_b, ps = scale_pages_to_bytes_if_needed(usage, limit, wm)
     out["usage_bytes"] = usage_b
     out["limit_bytes"] = limit_b
-    out["failcnt"] = fc
     out["watermark"] = wm_b
-    # Also keep the raw page counters for display
+    out["failcnt"] = fc
     out["usage_pages"] = usage
     out["limit_pages"] = limit
     out["watermark_pages"] = wm
@@ -278,68 +477,125 @@ def collect_mem(task_ptr: str):
 
 # ---------------- printing ----------------
 def print_cpu(cpu):
-    print(f"{C.BOLD}== CPU (CFS bandwidth) =={C.RESET}")
-    name = cpu.get("path") or cpu.get("name") or "(unknown)"
+    # Policy-agnostic CPU identity block
+    print(f"{C.BOLD}== CPU =={C.RESET}")
+
+    name = cpu.get("path") or cpu.get("name") or "/"
     print(f" cgroup : {C.CYAN}{name}{C.RESET}")
     print(f" css    : {cpu.get('cpu_css')}")
+    if cpu.get("cgroup"): print(f" cgrp   : {cpu.get('cgroup')}")
+    if cpu.get("kn"):     print(f" kn     : {cpu.get('kn')}")
     print(f" tg     : {cpu.get('tg')}")
-    per=cpu.get("period_ns"); quo=cpu.get("quota_ns")
+    if cpu.get("cfs_rq"): print(f" rq     : {cpu.get('cfs_rq')}")
+
+    # Show policy name (helps decide which section to print next)
+    polmap = {0:"SCHED_NORMAL",1:"SCHED_FIFO",2:"SCHED_RR",3:"SCHED_BATCH",5:"SCHED_IDLE",6:"SCHED_DEADLINE"}
+    policy = cpu.get("policy")
+    if policy is not None:
+        print(f" policy : {polmap.get(policy, str(policy))}")
+
+def print_cfs(cpu):
+    print(f"\n{C.BOLD}== CFS =={C.RESET}")
+
+    per = cpu.get("period_ns")
+    quo = cpu.get("quota_ns")
+    quo_unl = cpu.get("quota_unlimited")
+
     if per is not None: print(f" period : {fmt_ns(per)}")
     if quo is not None: print(f" quota  : {fmt_ns(quo)}")
-    if per and quo:
-        if quo > 0:
-            pct = 100.0*(quo/float(per))
-            if pct < 50:
-                color = C.RED
-            elif pct < 100:
-                color = C.YELLOW
-            else:
-                color = C.GREEN
-            print(f" budget : {color}{pct:.2f}% of one CPU{C.RESET}")
-        else:
+
+    if per and quo is not None:
+        if quo_unl or quo == 0:
             print(f" budget : {C.GREEN}unlimited/disabled{C.RESET}")
+        elif quo > 0:
+            pct = 100.0 * (quo / float(per))
+            color = C.RED if pct < 50 else (C.YELLOW if pct < 100 else C.GREEN)
+            print(f" budget : {color}{pct:.2f}% of one CPU{C.RESET}")
+
+    # Instantaneous throttle flag on this rq
     thr = cpu.get("throttled")
     if thr is not None:
-        if thr:
-            val = f"{C.BOLD}{C.YELLOW}YES{C.RESET}"
+        val = f"{C.BOLD}{C.YELLOW}YES{C.RESET}" if thr else f"{C.GREEN}no{C.RESET}"
+        print(f" throttled now  : {val}")
+
+    # Per-period usage snapshot (only when quota is finite)
+    if cpu.get("rq_period_used_ns") is not None and not quo_unl:
+        pct  = cpu["rq_period_used_pct"]
+        used = cpu["rq_period_used_ns"]
+        color = C.RED if pct >= 90.0 else (C.YELLOW if pct >= 50.0 else C.GREEN)
+        print(f" period usage    : {color}{pct:.2f}%{C.RESET}  ({fmt_ns(used)} of {fmt_ns(quo)})")
+
+    if cpu.get("rq_runtime_remaining") is not None and not quo_unl:
+        rr = cpu["rq_runtime_remaining"]
+        rr_line = f"{fmt_ns(rr)}"
+        if rr <= 0: rr_line = f"{C.YELLOW}{rr_line}{C.RESET}"
+        print(f" runtime remain  : {rr_line}")
+
+    if cpu.get("rq_nr_running") is not None:
+        print(f" rq nr_running   : {cpu['rq_nr_running']}")
+
+    if cpu.get("rq_throttle_count") is not None:
+        print(f" throttle_count  : {cpu['rq_throttle_count']}")
+
+    if cpu.get("rq_throttled_flag") is not None:
+        print(f" rq throttled    : {'YES' if cpu['rq_throttled_flag'] else 'no'}")
+
+    # Stable CFS bandwidth stats
+    if any(k in cpu for k in ("bw_nr_periods", "bw_nr_throttled", "bw_throttled_time")):
+        parts = []
+        if cpu.get("bw_nr_periods")    is not None: parts.append(f"periods={cpu['bw_nr_periods']}")
+        if cpu.get("bw_nr_throttled")  is not None: parts.append(f"throttled={cpu['bw_nr_throttled']}")
+        if cpu.get("bw_throttled_time")is not None: parts.append(f"throttled_time={cpu['bw_throttled_time']} ns")
+        print(" bw stats        : " + ", ".join(parts))
+
+def print_rt(rtinfo):
+    if rtinfo.get("policy") is None or rtinfo["policy"] not in (1, 2):
+        return  # not RT
+    print(f"\n{C.BOLD}== RT =={C.RESET}")
+    print(f" policy : {C.CYAN}{rtinfo.get('policy_name')}{C.RESET}")
+    if rtinfo.get("rt_priority") is not None: print(f" rt_prio: {rtinfo['rt_priority']}")
+    if rtinfo.get("prio")        is not None: print(f" prio   : {rtinfo['prio']}")
+    if rtinfo.get("rt_period_ns")  is not None: print(f" rt_period : {fmt_ns(rtinfo['rt_period_ns'])}")
+    if rtinfo.get("rt_runtime_ns") is not None: print(f" rt_runtime: {fmt_ns(rtinfo['rt_runtime_ns'])}")
+    if rtinfo.get("rt_period_ns") and rtinfo.get("rt_runtime_ns") is not None:
+        rt_per = rtinfo["rt_period_ns"]; rt_qu = rtinfo["rt_runtime_ns"]
+        if rt_qu < 0:
+            print(" rt budget : unlimited")
         else:
-            val = f"{C.GREEN}no{C.RESET}"
-        print(f" throttled now : {val}")
-    anc = cpu.get("ancestors") or []
-    if len(anc)>1:
-        print(" ancestors (closest → root):")
-        for tg, q, p in anc:
-            if q is None:
-                desc = f"  - tg={tg} quota=? period={p}"
-            elif q == -1 or (q is not None and q >= 10**15):
-                desc = f"  - tg={tg} quota=unlimited period={p} (unlimited)"
-            elif p and p>0:
-                desc = f"  - tg={tg} quota={q} period={p} (~{100.0*(q/float(p)):.2f}% CPU)"
-            else:
-                desc = f"  - tg={tg} quota={q} period={p}"
-            print(desc)
+            pct = 100.0 * (rt_qu/float(rt_per))
+            color = C.RED if pct < 50 else (C.YELLOW if pct < 100 else C.GREEN)
+            print(f" rt budget : {color}{pct:.2f}% of one CPU{C.RESET}")
+    if rtinfo.get("rt_rq_addr"):       print(f" rq      : {rtinfo['rt_rq_addr']}")
+    if rtinfo.get("rt_nr_running") is not None: print(f" rt_nr_running : {rtinfo['rt_nr_running']}")
+    if rtinfo.get("rt_throttled") is not None:  print(f" RT rq throttled : {'YES' if rtinfo['rt_throttled'] else 'no'}")
+    if rtinfo.get("rt_time") is not None:       print(f" rt_time       : {rtinfo['rt_time']} ns")
 
 def print_mem(mem):
-    print(f"\n{C.BOLD}== Memory (memcg) =={C.RESET}")
-    name = mem.get("path") or mem.get("name") or "(unknown)"
+    print(f"\n{C.BOLD}== Memory =={C.RESET}")
+    name = mem.get("path") or mem.get("name") or "/"
     print(f" cgroup : {C.CYAN}{name}{C.RESET}")
     print(f" css    : {mem.get('mem_css')}")
+    if mem.get("cgroup"): print(f" cgrp   : {mem.get('cgroup')}")
+    if mem.get("kn"):     print(f" kn     : {mem.get('kn')}")
+
     usage = mem.get("usage_bytes"); limit = mem.get("limit_bytes")
     up = mem.get("usage_pages"); lp = mem.get("limit_pages")
     wm = mem.get("watermark"); wmp = mem.get("watermark_pages")
     ps = mem.get("page_size") or 4096
+
     if usage is not None:
         line = f" usage  : {fmt_bytes(usage)}"
         if up is not None and usage == up * ps:
             line += f"  (pages: {up})"
         print(line)
-    else: print(" usage  : unavailable on this kernel (field layout differs)")
+    else:
+        print(" usage  : unavailable on this kernel (field layout differs)")
+
     if limit is not None:
-        if limit == -1 or limit >= (1<<60):
+        if limit == -1 or limit >= (1 << 60):
             print(f" limit  : {C.GREEN}unlimited{C.RESET}")
         else:
-            # warn if usage > 90% of limit
-            if usage and limit and usage/float(limit) > 0.9:
+            if usage and limit and usage / float(limit) > 0.9:
                 lim_str = f"{C.RED}{fmt_bytes(limit)}{C.RESET}"
             else:
                 lim_str = f"{C.CYAN}{fmt_bytes(limit)}{C.RESET}"
@@ -347,18 +603,21 @@ def print_mem(mem):
             if lp is not None and limit == lp * ps:
                 line += f"  (pages: {lp})"
             print(line)
-            # Show usage percentage when we know both
             if usage and limit and limit > 0:
-                pct = 100.0 * (usage/float(limit))
+                pct = 100.0 * (usage / float(limit))
                 color = C.RED if pct >= 90.0 else (C.YELLOW if pct >= 75.0 else C.GREEN)
                 print(f" usage% : {color}{pct:.2f}%{C.RESET}")
     else:
         print(" limit  : unavailable on this kernel (field layout differs)")
+
     if mem.get("failcnt") is not None:
-        print(f" failcnt: {mem.get('failcnt')}")
-    if mem.get("watermark") is not None:
-        line = f" watermark: {fmt_bytes(mem.get('watermark'))}"
-        if wmp is not None and mem.get("watermark") == wmp * ps:
+        fc = mem.get("failcnt")
+        fc_str = f"{C.RED}{fc}{C.RESET}" if fc and fc > 0 else str(fc)
+        print(f" failcnt: {fc_str}")
+
+    if wm is not None:
+        line = f" watermark: {fmt_bytes(wm)}"
+        if wmp is not None and wm == wmp * ps:
             line += f"  (pages: {wmp})"
         print(line)
 
@@ -371,12 +630,18 @@ def main():
     args = ap.parse_args()
 
     target = normalize_target(args.target[0])
-    comm = p_eval(f"((struct task_struct *){target})->comm")
+    comm = p_eval(f"((struct task_struct *){target})->comm") or ""
     pid  = to_int(p_eval(f"((struct task_struct *){target})->pid"))
-    comm_clean = (comm or "").strip().strip('"')
+    # strip quotes and any trailing NULs crash prints
+    comm_clean = comm.strip().strip('"').split('\x00', 1)[0]
     print(f"Task: {target}  PID: {pid}  COMM: {comm_clean}")
 
     cpu = collect_cpu(target); print_cpu(cpu)
+    rt  = collect_rt(target)
+    if rt.get("policy") in (1, 2):   # RT task -> show RT section
+        print_rt(rt)
+    else:                             # non-RT -> show CFS section
+        print_cfs(cpu)
     mem = collect_mem(target); print_mem(mem)
 
 if __name__ == "__main__":
