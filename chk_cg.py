@@ -190,17 +190,77 @@ def fmt_bytes(v) -> str:
         k += 1
     return f"{val:.2f} {units[k]} ({b} bytes)"
 
+def rt_caps_for_tg(tg_addr: str):
+    caps = {}
+    if not tg_addr:
+        return caps
+    if has_member("task_group", "rt_bandwidth"):
+        rb = f"((struct task_group *){tg_addr})->rt_bandwidth"
+        if has_member("rt_bandwidth", "rt_runtime"):
+            caps["rt_runtime_ns"] = to_int(p_eval(f"{rb}.rt_runtime"))
+        if has_member("rt_bandwidth", "rt_period"):
+            caps["rt_period_ns"]  = to_int(p_eval(f"{rb}.rt_period"))
+    return caps
+
+def print_hierarchy(cpu, policy):
+    print(f"\n{C.BOLD}== Hierarchy =={C.RESET}")
+    anc = cpu.get("ancestors") or []   # list of (tg_addr, cfs_quota, cfs_period), closest → root
+    if not anc:
+        print(" (no task_group ancestry discovered)")
+        return
+
+    for tg, cfs_q, cfs_p in anc:
+        line = f" tg={tg}"
+        # CFS view
+        if cfs_q is None:
+            cfs_desc = "CFS: quota=?"
+        elif cfs_q == -1 or (isinstance(cfs_q, int) and cfs_q >= 10**15):
+            cfs_desc = f"CFS: unlimited (period={cfs_p})"
+        elif cfs_p and cfs_p > 0:
+            pct = 100.0 * (cfs_q/float(cfs_p))
+            cfs_desc = f"CFS: quota={cfs_q} period={cfs_p} (~{pct:.2f}% CPU)"
+        else:
+            cfs_desc = f"CFS: quota={cfs_q} period={cfs_p}"
+        # RT view (guarded by offsets)
+        rt = rt_caps_for_tg(tg)
+        if "rt_runtime_ns" in rt and "rt_period_ns" in rt:
+            rr, rp = rt["rt_runtime_ns"], rt["rt_period_ns"]
+            if rr is not None and rp:
+                if rr < 0:
+                    rt_desc = "RT: unlimited"
+                else:
+                    rt_pct = 100.0 * (rr/float(rp))
+                    rt_desc = f"RT: runtime={rr} period={rp} (~{rt_pct:.2f}% CPU)"
+            else:
+                rt_desc = "RT: n/a"
+            line += f"  ;  {cfs_desc}  ;  {rt_desc}"
+        else:
+            line += f"  ;  {cfs_desc}"
+        print(" " + line)
+
 # ---------------- kernfs/cgroup helpers ----------------
 def _extract_cstr(val: str) -> str:
-    """From '0xffff... \"name\"' return 'name'."""
+    """Best-effort to extract the printable name from crash output.
+       Accepts: '0xffff... "name"', '"name"', or plain 'name'.
+       Returns '' if we only see an address (no printable string)."""
     if not isinstance(val, str):
         return str(val)
-    m = re.search(r'"([^"]*)"', val)
+    txt = val.strip()
+    # Prefer quoted content if present
+    m = re.search(r'"([^"]*)"', txt)
     if m:
         return m.group(1)
-    if ADDR_RE.search(val):
-        return ""
-    return val.strip()
+    # If it looks like: 0xffff... <maybe>name — try the last token
+    toks = txt.split()
+    if toks:
+        last = toks[-1].strip()
+        # Drop trailing commas/semicolons
+        last = last.rstrip(",;")
+        # If it's not a hex-looking token, take it as a name
+        if not ADDR_RE.fullmatch(last):
+            return last.strip('"')
+    # Address only or nothing printable
+    return ""
 
 def cgroup_name_from_css(css_ptr_text: str):
     """Return (name, cgroup_ptr_addr, kn_ptr_addr).
@@ -222,7 +282,7 @@ def cgroup_name_from_css(css_ptr_text: str):
     if not kn_addr:
         return (None, cg_addr, None)
     nm = p_eval(f"((struct kernfs_node *){kn_addr})->name")
-    name = _extract_cstr(nm) or "/"
+    name = _extract_cstr(nm)  # do NOT force "/"; let the caller decide fallback
     return (name, cg_addr, kn_addr)
 
 def cgroup_path_from_kn(kn_addr: str):
@@ -236,8 +296,8 @@ def cgroup_path_from_kn(kn_addr: str):
         parent = p_eval(f"((struct kernfs_node *){cur})->parent")
         cur = addr_only(parent)
         hops += 1
-    # If no parts, we're at the root cgroup
-    return "/" if kn_addr else ("/" + "/".join(reversed(parts)) if parts else None)
+    # Build only if we actually have components
+    return ("/" + "/".join(reversed(parts))) if parts else None
 
 # ---------------- page size & scaling ----------------
 def page_size():
@@ -480,7 +540,8 @@ def print_cpu(cpu):
     # Policy-agnostic CPU identity block
     print(f"{C.BOLD}== CPU =={C.RESET}")
 
-    name = cpu.get("path") or cpu.get("name") or "/"
+    # Prefer full path; else leaf name; else root only if kernel says so
+    name = cpu.get("path") or (cpu.get("name") if cpu.get("name") not in (None, "",) else None) or "/"
     print(f" cgroup : {C.CYAN}{name}{C.RESET}")
     print(f" css    : {cpu.get('cpu_css')}")
     if cpu.get("cgroup"): print(f" cgrp   : {cpu.get('cgroup')}")
@@ -572,7 +633,7 @@ def print_rt(rtinfo):
 
 def print_mem(mem):
     print(f"\n{C.BOLD}== Memory =={C.RESET}")
-    name = mem.get("path") or mem.get("name") or "/"
+    name = mem.get("path") or (mem.get("name") if mem.get("name") not in (None, "",) else None) or "/"
     print(f" cgroup : {C.CYAN}{name}{C.RESET}")
     print(f" css    : {mem.get('mem_css')}")
     if mem.get("cgroup"): print(f" cgrp   : {mem.get('cgroup')}")
@@ -638,10 +699,16 @@ def main():
 
     cpu = collect_cpu(target); print_cpu(cpu)
     rt  = collect_rt(target)
-    if rt.get("policy") in (1, 2):   # RT task -> show RT section
+
+    # Always show the hierarchy (both CFS and RT caps per tg when available)
+    print_hierarchy(cpu, rt.get("policy") if rt else cpu.get("policy"))
+
+    # Then class-specific section
+    if rt.get("policy") in (1, 2):
         print_rt(rt)
-    else:                             # non-RT -> show CFS section
+    else:
         print_cfs(cpu)
+
     mem = collect_mem(target); print_mem(mem)
 
 if __name__ == "__main__":
