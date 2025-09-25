@@ -153,7 +153,7 @@ def detect_soft_lockup():
                 locked_cpus.append(cpu)
 
         # Check RFLAGS bit 9 missing (interrupts disabled) and CS == 0010
-        rflags_suspicious = rflags != "N/A" and len(rflags) >= 6 and rflags[-6] != '2'
+        rflags_suspicious = if_bit_clear(rflags)
         cs_suspicious = cs == "0010"
         highlight = status == "⚠️ Soft Lockup" and rflags_suspicious and cs_suspicious
 
@@ -226,55 +226,134 @@ def get_cpu_rflags_cs_via_bt():
         print(f"❌ Failed to parse bt -a output: {e}")
         return []
 
+def if_bit_clear(rflags_str: str) -> bool:
+    """True if IF (bit 9) is clear; returns False if parsing fails."""
+    try:
+        return (int(rflags_str, 16) & 0x200) == 0
+    except Exception:
+        return False
+
+def is_hard_watchdog_enabled_default_true() -> bool:
+    """Best-effort read of watchdog_enabled hard-bit (0x01). Defaults to True if unknown."""
+    try:
+        if not symbol_exists("watchdog_enabled"):
+            return True
+        val = readSymbol("watchdog_enabled")
+        return (val & 0x01) != 0
+    except Exception:
+        return True
+
+def get_cpu_rflags_cs_via_bt_robust():
+    """
+    Robustly parse 'bt -a': for each 'CPU: N' block, search lines until the next 'CPU:' for RFLAGS and CS.
+    Returns list of tuples: (cpu, rflags_hex or 'N/A', cs_hex or 'N/A')
+    """
+    out = exec_crash_command("bt -a")
+    lines = out.splitlines()
+    cpu_info = []
+    i = 0
+    while i < len(lines):
+        m = re.search(r"\bCPU:\s*(\d+)\b", lines[i])
+        if not m:
+            i += 1
+            continue
+        cpu = int(m.group(1))
+        rflags = "N/A"
+        cs = "N/A"
+        i += 1
+        # scan until next CPU or EOF
+        while i < len(lines) and "CPU:" not in lines[i]:
+            if rflags == "N/A":
+                mrf = re.search(r"\bRFLAGS:\s*([0-9a-fA-F]+)\b", lines[i])
+                if mrf:
+                    rflags = mrf.group(1)
+            if cs == "N/A":
+                mcs = re.search(r"\bCS:\s*([0-9a-fA-F]{4})\b", lines[i])
+                if mcs:
+                    cs = mcs.group(1)
+            i += 1
+        cpu_info.append((cpu, rflags, cs))
+    return cpu_info
+
+def is_hard_watchdog_enabled():
+    try:
+        if not symbol_exists("watchdog_enabled"):
+            return True  # be permissive if symbol absent
+        val = readSymbol("watchdog_enabled")
+        return (val & 0x01) != 0  # hard watchdog bit
+    except:
+        return True
+
+def if_bit_clear(rflags_str: str) -> bool:
+    try:
+        return (int(rflags_str, 16) & 0x200) == 0
+    except:
+        return False
+
+def is_hard_watchdog_enabled():
+    try:
+        if not symbol_exists("watchdog_enabled"):
+            return True  # be permissive if symbol absent
+        val = readSymbol("watchdog_enabled")
+        return (val & 0x01) != 0  # hard watchdog bit
+    except:
+        return True
+
+def if_bit_clear(rflags_str: str) -> bool:
+    try:
+        return (int(rflags_str, 16) & 0x200) == 0
+    except:
+        return False
+
 def detect_hard_lockup():
-    """Detects hard lockups in a vmcore by analyzing per-CPU hrtimer values."""
+    """Detects hard lockups and classifies them as CONFIRMED / SUSPECT / NORMAL."""
     print("\n🔍 Checking for hard lockups in vmcore...\n")
 
-    interrupts, saved = get_hrtimer_values()
-    cpu_info = get_cpu_rflags_cs_via_bt()
+    hard_wd_on = is_hard_watchdog_enabled_default_true()
+    if not hard_wd_on:
+        print("⚠️ Hard watchdog appears disabled; equality may be inconclusive.\n")
 
+    interrupts, saved = get_hrtimer_values()
+    cpu_info = get_cpu_rflags_cs_via_bt_robust()
     if interrupts is None or saved is None:
         print("❌ Failed to read hrtimer values. Exiting.")
         return
 
-    print(f"{'CPU':<5} {'hrtimer_interrupts':<20} {'hrtimer_saved':<20} {'RFLAGS':<18} {'CS':<6} {'Status'}")
-    print("=" * 90)
+    # Map for quick lookup
+    info_map = {c: (rf, cs) for c, rf, cs in cpu_info}
 
-    locked_cpus = []
+    print(f"{'CPU':<5} {'hrtimer_interrupts':<20} {'hrtimer_saved':<20} {'RFLAGS':<18} {'CS':<6} {'Verdict'}")
+    print("=" * 98)
+
+    suspects, confirmed = [], []
     for cpu in range(len(interrupts)):
-        rflags = cs = "N/A"
-        for info in cpu_info:
-            if info[0] == cpu:
-                rflags, cs = info[1], info[2]
-                break
+        rflags, cs = info_map.get(cpu, ("N/A", "N/A"))
+        equal = interrupts[cpu] == saved[cpu]
+        kernel_cs = (cs == "0010")
+        irqs_off = if_bit_clear(rflags)  # True means IF=0
 
-        is_locked = interrupts[cpu] == saved[cpu]
+        if equal:
+            if kernel_cs:
+                # In kernel: equality is meaningful. IF=0 strengthens but IF=1 does not clear it.
+                verdict = "⚠️ CONFIRMED hard lockup"
+                if not irqs_off:
+                    verdict += " (IF=1)"
+                confirmed.append(cpu)
+            else:
+                verdict = "❓ SUSPECT (user CS)"
+                suspects.append(cpu)
+        else:
+            verdict = "✅ Normal"
 
-        # Check: bit 9 of RFLAGS (Interrupt Flag) is not set (6th hex digit is not 2/X2)
-        rflags_suspicious = False
-        if rflags != "N/A" and len(rflags) >= 6:
-            rflags_suspicious = rflags[-6] != '2'
-
-        cs_suspicious = (cs == "0010")
-
-        # Decide color
-        should_highlight = is_locked and rflags_suspicious and cs_suspicious
-        status = "⚠️ Hard Lockup" if is_locked else "✅ Normal"
-
-        line = f"{cpu:<5} {interrupts[cpu]:<20} {saved[cpu]:<20} {rflags:<18} {cs:<6} {status}"
-        if should_highlight:
-            line = f"\033[91m{line}\033[0m"  # wrap in red
-
-        print(line)
-
-        if is_locked:
-            locked_cpus.append(cpu)
+        print(f"{cpu:<5} {interrupts[cpu]:<20} {saved[cpu]:<20} {rflags:<18} {cs:<6} {verdict}")
 
     print("\n🔍 Analysis Complete.")
-    if locked_cpus:
-        print(f"⚠️ Hard lockup detected on CPUs: {', '.join(map(str, locked_cpus))}")
-    else:
-        print("✅ No hard lockup detected in vmcore.")
+    if confirmed:
+        print(f"⚠️ Hard lockup (CONFIRMED) on CPUs: {', '.join(map(str, confirmed))}")
+    if suspects:
+        print(f"❓ Hard lockup (SUSPECT) on CPUs: {', '.join(map(str, suspects))}")
+    if not confirmed and not suspects:
+        print("✅ No hard lockup indicated.")
 
 # --- Main ---
 if __name__ == "__main__":
