@@ -145,20 +145,3 @@ def analyze_qspinlock(qspinlock_addr, verbose=False, debug=False):
 
     print("========================\n")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Analyze qspinlock status in RHEL")
-    parser.add_argument("qspinlock_addr", type=lambda x: int(x, 16), help="Memory address of qspinlock (hex)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable detailed data")
-    parser.add_argument("-d", "--debug", action="store_true", help="Show debug data.")
-    parser.add_argument("-f", "--flowchart", action="store_true", help="Display qspinlock flowchart.")
-
-    args = parser.parse_args()
-
-    # Get basic info
-    RHEL_VERSION = get_rhel_version()
-
-    if args.flowchart:
-        show_qspinlock_flowchart()
-
-    analyze_qspinlock(args.qspinlock_addr, args.verbose, args.debug)
-

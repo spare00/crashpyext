@@ -148,15 +148,3 @@ def analyze_mutex(mutex_info):
         # Add number of waiters at the end
         print("\nNumber of waiters: ", len(mutex_info["waiters"]))
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Analyze mutex state in a VMcore.")
-    parser.add_argument("mutex", help="Mutex address or symbol name")
-    parser.add_argument("-l", "--list", action="store_true", help="List tasks waiting on the mutex")
-    args = parser.parse_args()
-
-    # Get basic info
-    rhel_version = get_rhel_version()
-    mutex_addr = resolve_address(args.mutex)
-    mutex_info = get_mutex_info(mutex_addr, args.list)
-    analyze_mutex(mutex_info)
-

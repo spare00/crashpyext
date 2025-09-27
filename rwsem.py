@@ -543,18 +543,3 @@ def analyze_rw_semaphore_from_vmcore(rw_semaphore_addr, list_waiters=False, verb
     if list_waiters:
         list_waiting_tasks(rwsem.wait_list)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Analyze rw_semaphore from VMcore.")
-    parser.add_argument("rw_semaphore_addr", type=lambda x: int(x, 16), help="Memory address of rw_semaphore (hex)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable detailed breakdown of bit fields.")
-    parser.add_argument("-d", "--raw", action="store_true", help="Show raw rw_semaphore structure data.")
-    parser.add_argument("-l", "--list", action="store_true", help="List tasks waiting on the rw_semaphore")
-
-    args = parser.parse_args()
-    DEBUG = args.raw
-
-    # Get basic info
-    RHEL_VERSION = get_rhel_version()
-
-    analyze_rw_semaphore_from_vmcore(args.rw_semaphore_addr, args.list, args.verbose, args.raw)
-
