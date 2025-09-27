@@ -20,6 +20,30 @@ class C:
     BOLD   = "\033[1m"
     RESET  = "\033[0m"
 
+# ---------------- kernel / RHEL version helpers ----------------
+_RHEL_MAJOR = None
+
+def _kernel_release_text():
+    """Parse 'sys' output; avoid gdb p utsname()->release (may fail in some vmcores)."""
+    try:
+        out = x("sys")
+        for ln in out.splitlines():
+            if ln.startswith("RELEASE:"):
+                return ln.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return ""  # keep empty; callers handle None-major
+
+def rhel_major():
+    """Return RHEL major as int (7, 8, 9...), or None if not detected."""
+    global _RHEL_MAJOR
+    if _RHEL_MAJOR is not None:
+        return _RHEL_MAJOR
+    rel = _kernel_release_text()
+    m = re.search(r'\.el(\d+)', rel)
+    _RHEL_MAJOR = int(m.group(1)) if m else None
+    return _RHEL_MAJOR
+
 # ---------------- crash/pykdump glue ----------------
 _CRASH = None
 _CRASH_IMPORT_ERR = None
@@ -146,13 +170,41 @@ def to_int(s: str):
         return None
 
 def normalize_target(arg: str) -> str:
+    # Pure PID
     if re.fullmatch(r'\d+', arg):
         tp = task_ptr_from_pid(int(arg))
         if not tp:
             print(f"[ERROR] Cannot resolve TASK pointer for PID {arg}", file=sys.stderr)
             sys.exit(1)
         return tp
-    return arg if arg.startswith("0x") else ("0x" + arg)
+
+    # task_struct pointer
+    if arg.startswith("0x"):
+        return arg
+
+    # COMM / substring match via crash ps
+    ps_out = x("ps")
+    matches = []
+    for ln in ps_out.splitlines():
+        if arg in ln:
+            toks = ln.split()
+            if not toks: continue
+            try:
+                pid = int(toks[0])
+            except ValueError:
+                continue
+            tp = task_ptr_from_pid(pid)
+            if tp:
+                matches.append((pid, tp, ln.strip()))
+    if not matches:
+        print(f"[ERROR] Cannot resolve target '{arg}' to a PID or task pointer", file=sys.stderr)
+        sys.exit(1)
+    if len(matches) > 1:
+        print(f"[WARN] Multiple matches for '{arg}':")
+        for pid, tp, line in matches:
+            print(f"  PID={pid} TASK={tp} :: {line}")
+        # Pick the first for now
+    return matches[0][1]
 
 def task_ptr_from_pid(pid: int) -> str:
     out = x(f"ps -p {pid}")
@@ -263,26 +315,65 @@ def _extract_cstr(val: str) -> str:
     return ""
 
 def cgroup_name_from_css(css_ptr_text: str):
-    """Return (name, cgroup_ptr_addr, kn_ptr_addr).
-       Works if css_ptr_text is either a CSS or a task_group (root_task_group)."""
+    """Return (name, cgroup_ptr_addr, kn_or_none).
+       RHEL8+/kernels with cgroup v2 kernfs: use ->kn.
+       RHEL7/v1: use ->dentry and ->name (no kn)."""
     css_addr = addr_only(css_ptr_text)
     if not css_addr:
         return (None, None, None)
-    # First try CSS path
-    cg = p_eval(f"((struct cgroup_subsys_state *){css_addr})->cgroup")
-    cg_addr = addr_only(cg)
+
+    # First resolve struct cgroup * from css or task_group
+    cg_addr = None
+    # Try CSS path
+    try:
+        cg = p_eval(f"((struct cgroup_subsys_state *){css_addr})->cgroup")
+        cg_addr = addr_only(cg)
+    except Exception:
+        pass
     if not cg_addr:
         # Fallback: treat input as task_group and go via ->css.cgroup
-        cg2 = p_eval(f"((struct task_group *){css_addr})->css.cgroup")
-        cg_addr = addr_only(cg2)
-        if not cg_addr:
-            return (None, None, None)
+        try:
+            cg2 = p_eval(f"((struct task_group *){css_addr})->css.cgroup")
+            cg_addr = addr_only(cg2)
+        except Exception:
+            pass
+    if not cg_addr:
+        return (None, None, None)
+
+    # Decide based on struct layout rather than only RHEL: probe member
+    use_kn = has_member("cgroup", "kn")
+    if not use_kn:
+        # RHEL7/v1 path: derive leaf name and path from dentry/name
+        name = None
+        # Prefer cgroup->name (if present)
+        if has_member("cgroup", "name"):
+            try:
+                nm = p_eval(f"((struct cgroup *){cg_addr})->name->name")
+                name = _extract_cstr(nm)
+            except Exception:
+                name = None
+        # Fallback to dentry->d_name.name
+        dentry_addr = None
+        if has_member("cgroup", "dentry"):
+            try:
+                dentry = p_eval(f"((struct cgroup *){cg_addr})->dentry")
+                dentry_addr = addr_only(dentry)
+                if not name and dentry_addr:
+                    name = _qstr_name_from_dentry(dentry_addr) or None
+            except Exception:
+                pass
+        # Build a v1 path if we have dentry
+        path = cgroup_path_from_dentry(dentry_addr) if dentry_addr else None
+        # Return without kn (v1 has none)
+        return (name, cg_addr, None if not use_kn else None)
+
+    # v2/kernfs path (RHEL8+ and any kernel with cgroup->kn)
     kn = p_eval(f"((struct cgroup *){cg_addr})->kn")
     kn_addr = addr_only(kn)
-    if not kn_addr:
-        return (None, cg_addr, None)
-    nm = p_eval(f"((struct kernfs_node *){kn_addr})->name")
-    name = _extract_cstr(nm)  # do NOT force "/"; let the caller decide fallback
+    name = None
+    if kn_addr:
+        nm = p_eval(f"((struct kernfs_node *){kn_addr})->name")
+        name = _extract_cstr(nm)
     return (name, cg_addr, kn_addr)
 
 def cgroup_path_from_kn(kn_addr: str):
@@ -298,6 +389,43 @@ def cgroup_path_from_kn(kn_addr: str):
         hops += 1
     # Build only if we actually have components
     return ("/" + "/".join(reversed(parts))) if parts else None
+
+def cgroup_path_for(cg_addr: str, kn_addr: str):
+    if kn_addr:
+        return cgroup_path_from_kn(kn_addr)
+    # v1 fallback via dentry (requires cg->dentry)
+    try:
+        if cg_addr and has_member("cgroup", "dentry"):
+            dentry = p_eval(f"((struct cgroup *){cg_addr})->dentry")
+            daddr = addr_only(dentry)
+            return cgroup_path_from_dentry(daddr) if daddr else None
+    except Exception:
+        pass
+    return None
+
+def _qstr_name_from_dentry(dentry_addr: str) -> str:
+    try:
+        nm = p_eval(f"((struct dentry *){dentry_addr})->d_name.name")
+        return _extract_cstr(nm)
+    except Exception:
+        return ""
+
+def cgroup_path_from_dentry(dentry_addr: str):
+    """Build a cgroup v1 path by walking dentry->d_parent up to root."""
+    parts = []
+    cur = dentry_addr
+    hops = 0
+    while cur and hops < 64:
+        name = _qstr_name_from_dentry(cur)
+        if name and name not in ("/",):
+            parts.append(name)
+        parent = addr_only(p_eval(f"((struct dentry *){cur})->d_parent"))
+        # stop at root (parent == self) or NULL
+        if not parent or parent == cur:
+            break
+        cur = parent
+        hops += 1
+    return ("/" + "/".join(reversed([p for p in parts if p]))) if parts else None
 
 # ---------------- page size & scaling ----------------
 def page_size():
@@ -349,7 +477,7 @@ def collect_cpu(task_ptr: str):
 
     name, cg, kn = cgroup_name_from_css(cpu_css)
     out["name"] = name
-    out["path"] = cgroup_path_from_kn(kn) if kn else None
+    out["path"] = cgroup_path_for(cg, kn)
     out["cgroup"] = cg
     out["kn"] = kn
 
@@ -479,9 +607,10 @@ def collect_mem(task_ptr: str):
     mem_css = p_eval(f"((struct task_struct *){task_ptr})->cgroups->subsys[4]")
     out["mem_css"] = mem_css
 
+    # Name/path (v1/v2 safe)
     name, cg, kn = cgroup_name_from_css(mem_css)
     out["name"] = name
-    out["path"] = cgroup_path_from_kn(kn) if kn else None
+    out["path"] = cgroup_path_for(cg, kn) if (cg or kn) else None
     out["cgroup"] = cg
     out["kn"] = kn
 
@@ -490,48 +619,92 @@ def collect_mem(task_ptr: str):
         out["note"] = "cannot parse mem css pointer"
         return out
 
-    # On RHEL, mem_cgroup embeds 'struct cgroup_subsys_state css;' as first member.
-    # So memcg pointer == css address.
     mc_addr = css_addr
-    try:
-        _ = p_eval(f"((struct mem_cgroup *){mc_addr})->css.cgroup")
-    except Exception:
-        pass
 
-    def try_int(exprs):
-        for e in exprs:
-            try:
-                v = to_int(p_eval(e))
-                if v is not None:
-                    return v, e
-            except Exception:
-                pass
-        return None, None
+    def try_int(expr):
+        try:
+            v = to_int(p_eval(expr))
+            return v
+        except Exception:
+            return None
 
-    # usage & limit
-    usage, _ = try_int([
-        f"((struct mem_cgroup *){mc_addr})->memory.usage.counter",  # page_counter
-        f"((struct mem_cgroup *){mc_addr})->memory.usage",
-        f"((struct mem_cgroup *){mc_addr})->memory.usage.value",
-        f"((struct mem_cgroup *){mc_addr})->memory.usage_in_bytes",
-        f"((struct mem_cgroup *){mc_addr})->memory.local_usage",
-    ])
-    limit, _ = try_int([
-        f"((struct mem_cgroup *){mc_addr})->memory.max",    # hard cap on this kernel
-        f"((struct mem_cgroup *){mc_addr})->memory.limit",  # older trees
-    ])
-    fc, _ = try_int([f"((struct mem_cgroup *){mc_addr})->memory.failcnt"])
-    wm, _ = try_int([f"((struct mem_cgroup *){mc_addr})->memory.watermark"])
+    usage_b = limit_b = wm_b = None
+    up = lp = wmp = None
+    fc = None
+    ps = page_size()
 
-    # page-based → bytes
-    usage_b, limit_b, wm_b, ps = scale_pages_to_bytes_if_needed(usage, limit, wm)
+    used_style = None  # "res" | "count" | "page"
+
+    maj = rhel_major()
+    has_res    = has_member("mem_cgroup", "res")
+    has_memory = has_member("mem_cgroup", "memory")
+    v2_hint    = has_member("cgroup", "kn") and kn is not None  # el8+/v2-style
+
+    # --------- Decide order without causing failed probes ----------
+    # If v2-ish (kn present) or RHEL8+, go straight to page_counter.
+    # If RHEL7, prefer res_counter, then count-style.
+    # If undetected, use structure hints: res → count → page.
+    try_page_first = (maj is not None and maj >= 8) or v2_hint
+
+    if try_page_first and has_memory:
+        # Style C: page_counter (el8+)
+        u = (try_int(f"((struct mem_cgroup *){mc_addr})->memory.usage.counter")
+             or try_int(f"((struct mem_cgroup *){mc_addr})->memory.usage")
+             or try_int(f"((struct mem_cgroup *){mc_addr})->memory.usage.value")
+             or try_int(f"((struct mem_cgroup *){mc_addr})->memory.usage_in_bytes")
+             or try_int(f"((struct mem_cgroup *){mc_addr})->memory.local_usage"))
+        l = (try_int(f"((struct mem_cgroup *){mc_addr})->memory.max")
+             or try_int(f"((struct mem_cgroup *){mc_addr})->memory.limit"))
+        f = try_int(f"((struct mem_cgroup *){mc_addr})->memory.failcnt")
+        w = try_int(f"((struct mem_cgroup *){mc_addr})->memory.watermark")
+        if any(v is not None for v in (u, l, w, f)):
+            usage_b, limit_b, wm_b, ps = scale_pages_to_bytes_if_needed(u, l, w)
+            up, lp, wmp = u, l, w
+            fc = f
+            used_style = "page"
+
+    if used_style is None:
+        # RHEL7 preference / or unknown: res_counter first if present
+        if has_res:
+            u = try_int(f"((struct mem_cgroup *){mc_addr})->res.usage")
+            l = try_int(f"((struct mem_cgroup *){mc_addr})->res.limit")
+            f = try_int(f"((struct mem_cgroup *){mc_addr})->res.failcnt")
+            if any(v is not None for v in (u, l, f)):
+                usage_b, limit_b, fc = u, l, f
+                used_style = "res"
+
+    if used_style is None and (maj == 7 or maj is None):
+        # Style B: legacy count-style (only on el7/unknown; skip entirely on el8+)
+        # Sentinel *once* — but only when we didn't pre-select page style
+        cnt = try_int(f"((struct mem_cgroup *){mc_addr})->memory.count.counter")
+        if cnt is not None:
+            lim = try_int(f"((struct mem_cgroup *){mc_addr})->memory.limit")
+            f   = try_int(f"((struct mem_cgroup *){mc_addr})->memory.failcnt")
+            wm  = try_int(f"((struct mem_cgroup *){mc_addr})->memory.watermark")
+
+            up, lp, wmp = cnt, lim, wm
+            usage_b, limit_b, wm_b, ps = scale_pages_to_bytes_if_needed(up, lp, wmp)
+            fc = f
+            used_style = "count"
+
+            # Hide absurd watermarks sometimes seen in vmcores
+            if wm_b is not None and wm_b > (1 << 56):
+                wm_b = None
+                wmp = None
+            if up is not None and up < 0:
+                up = 0
+                usage_b, _, _, _ = scale_pages_to_bytes_if_needed(up, lp, wmp)
+
+    # Finalize
     out["usage_bytes"] = usage_b
     out["limit_bytes"] = limit_b
-    out["watermark"] = wm_b
-    out["failcnt"] = fc
-    out["usage_pages"] = usage
-    out["limit_pages"] = limit
-    out["watermark_pages"] = wm
+    out["watermark"]   = wm_b
+    out["failcnt"]     = fc
+
+    out["usage_pages"] = up if used_style in ("count", "page") else None
+    out["limit_pages"] = lp if used_style in ("count", "page") else None
+    out["watermark_pages"] = wmp if used_style in ("count", "page") else None
+
     out["page_size"] = ps
     return out
 
@@ -562,13 +735,16 @@ def print_cfs(cpu):
     quo = cpu.get("quota_ns")
     quo_unl = cpu.get("quota_unlimited")
 
-    if per is not None: print(f" period : {fmt_ns(per)}")
-    if quo is not None: print(f" quota  : {fmt_ns(quo)}")
-
-    if per and quo is not None:
-        if quo_unl or quo == 0:
-            print(f" budget : {C.GREEN}unlimited/disabled{C.RESET}")
-        elif quo > 0:
+    # Prefer a clean statement when unlimited/disabled
+    if quo_unl or (quo is not None and quo == 0):
+        if per is not None:
+            print(" budget : " + C.GREEN + "unlimited/disabled" + C.RESET)
+        else:
+            print(" budget : " + C.GREEN + "unlimited/disabled" + C.RESET + " (period: n/a)")
+    else:
+        if per is not None: print(f" period : {fmt_ns(per)}")
+        if quo is not None: print(f" quota  : {fmt_ns(quo)}")
+        if per and quo is not None and quo > 0:
             pct = 100.0 * (quo / float(per))
             color = C.RED if pct < 50 else (C.YELLOW if pct < 100 else C.GREEN)
             print(f" budget : {color}{pct:.2f}% of one CPU{C.RESET}")
@@ -639,11 +815,15 @@ def print_mem(mem):
     if mem.get("cgroup"): print(f" cgrp   : {mem.get('cgroup')}")
     if mem.get("kn"):     print(f" kn     : {mem.get('kn')}")
 
-    usage = mem.get("usage_bytes"); limit = mem.get("limit_bytes")
-    up = mem.get("usage_pages"); lp = mem.get("limit_pages")
-    wm = mem.get("watermark"); wmp = mem.get("watermark_pages")
+    usage = mem.get("usage_bytes")
+    limit = mem.get("limit_bytes")
+    up = mem.get("usage_pages")
+    lp = mem.get("limit_pages")
+    wm = mem.get("watermark")
+    wmp = mem.get("watermark_pages")
     ps = mem.get("page_size") or 4096
 
+    # ---- usage ----
     if usage is not None:
         line = f" usage  : {fmt_bytes(usage)}"
         if up is not None and usage == up * ps:
@@ -652,8 +832,12 @@ def print_mem(mem):
     else:
         print(" usage  : unavailable on this kernel (field layout differs)")
 
+    # ---- limit ----
     if limit is not None:
-        if limit == -1 or limit >= (1 << 60):
+        # Legacy quirk: some el7 builds show limit=1 page meaning "no explicit limit"
+        if lp == 1 and usage is not None:
+            print(f" limit  : {C.GREEN}unlimited (legacy 1-page quirk){C.RESET}")
+        elif limit == -1 or limit >= (1 << 60):
             print(f" limit  : {C.GREEN}unlimited{C.RESET}")
         else:
             if usage and limit and usage / float(limit) > 0.9:
@@ -671,16 +855,22 @@ def print_mem(mem):
     else:
         print(" limit  : unavailable on this kernel (field layout differs)")
 
+    # ---- failcnt ----
     if mem.get("failcnt") is not None:
         fc = mem.get("failcnt")
         fc_str = f"{C.RED}{fc}{C.RESET}" if fc and fc > 0 else str(fc)
         print(f" failcnt: {fc_str}")
 
+    # ---- watermark ----
     if wm is not None:
-        line = f" watermark: {fmt_bytes(wm)}"
-        if wmp is not None and wm == wmp * ps:
-            line += f"  (pages: {wmp})"
-        print(line)
+        # Suppress absurd bogus watermarks seen in some el7 dumps
+        if wm > (1 << 56):  # ~64 PiB
+            print(" watermark: unavailable/invalid (bogus value in dump)")
+        else:
+            line = f" watermark: {fmt_bytes(wm)}"
+            if wmp is not None and wm == wmp * ps:
+                line += f"  (pages: {wmp})"
+            print(line)
 
 # ---------------- main ----------------
 def main():
@@ -694,7 +884,11 @@ def main():
     comm = p_eval(f"((struct task_struct *){target})->comm") or ""
     pid  = to_int(p_eval(f"((struct task_struct *){target})->pid"))
     # strip quotes and any trailing NULs crash prints
-    comm_clean = comm.strip().strip('"').split('\x00', 1)[0]
+    raw_comm = p_eval(f"((struct task_struct *){target})->comm") or ""
+    comm_s = raw_comm.strip().strip('"')
+    comm_clean = comm_s.split('\x00', 1)[0]
+    # drop non-printables
+    comm_clean = ''.join(ch for ch in comm_clean if 32 <= ord(ch) < 127)
     print(f"Task: {target}  PID: {pid}  COMM: {comm_clean}")
 
     cpu = collect_cpu(target); print_cpu(cpu)
