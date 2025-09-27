@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 import argparse
-import sys
 
 import qspinlock
 import mutex
 import rwsem
+import semaphore as sem
+
 
 def main():
     parser = argparse.ArgumentParser(description="Unified Lock Analyzer for VMcore")
@@ -35,6 +36,13 @@ def main():
     p_rw.add_argument("-v", "--verbose", action="store_true")
     p_rw.add_argument("-d", "--debug", action="store_true")
 
+    # sem (classic counting semaphore)
+    p_sem = subparsers.add_parser("sem", help="Analyze classic semaphore (struct semaphore)")
+    p_sem.add_argument("addr", help="Address or symbol")
+    p_sem.add_argument("-l", "--list", action="store_true")
+    p_sem.add_argument("-v", "--verbose", action="store_true")
+    p_sem.add_argument("-d", "--debug", action="store_true")
+
     args = parser.parse_args()
 
     if args.command == "qspinlock":
@@ -42,17 +50,13 @@ def main():
         if args.flowchart:
             qspinlock.show_qspinlock_flowchart()
         qspinlock.analyze_qspinlock(
-            qspinlock.resolve_address(args.addr),
-            args.verbose,
-            args.debug
+            qspinlock.resolve_address(args.addr), args.verbose, args.debug
         )
 
     elif args.command == "spinlock":
         qspinlock.RHEL_VERSION = qspinlock.get_rhel_version()
         qspinlock.analyze_spinlock(
-            qspinlock.resolve_address(args.addr),
-            args.verbose,
-            args.debug
+            qspinlock.resolve_address(args.addr), args.verbose, args.debug
         )
 
     elif args.command == "mutex":
@@ -65,11 +69,16 @@ def main():
         rwsem.RHEL_VERSION = rwsem.get_rhel_version()
         rwsem.DEBUG = args.debug
         rwsem.analyze_rw_semaphore_from_vmcore(
-            int(args.addr, 16),
-            args.list,
-            args.verbose,
-            args.debug
+            int(args.addr, 16), args.list, args.verbose, args.debug
         )
+
+    elif args.command == "sem":
+        sem.RHEL_VERSION = sem.get_rhel_version()
+        sem.DEBUG = args.debug
+        addr = sem.resolve_address(args.addr)
+        info = sem.get_semaphore_info(addr, args.list)
+        sem.analyze_semaphore(info, args.verbose)
+
 
 if __name__ == "__main__":
     main()
