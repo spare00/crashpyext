@@ -2,7 +2,7 @@
 
 import sys
 import argparse
-from pykdump.API import readSU  # Importing ePython API for VMcore analysis
+from pykdump.API import *
 
 # Global variable
 kernel_version = "Unknown"
