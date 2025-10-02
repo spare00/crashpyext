@@ -2,6 +2,7 @@
 
 import sys
 from pykdump.API import *  # exec_crash_command, readSU, symbol_exists, crash, percpu, etc.
+from typing import Optional, Tuple, List
 
 RHEL_VERSION = 8
 kernel_version = "Unknown"
@@ -137,8 +138,7 @@ def get_semaphore_info(sem_addr: int, list_waiters_flag: bool = False):
 
     return info
 
-
-def _classify(count: int, waiter_len: int | None) -> tuple[str, str, list[str]]:
+def _classify(count: int, waiter_len: Optional[int]) -> Tuple[str, str, List[str]]:
     """Return (state_type, description, issues[])"""
     issues = []
     if count > 0:
