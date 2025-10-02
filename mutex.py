@@ -59,10 +59,12 @@ def resolve_address(input_value):
         sys.exit(1)
 
 def get_task_state(task):
-    task_state_value = task.state if rhel_version >= 8 else task.__state
-    state_flags = [name for bit, name in task_state_array.items() if task_state_value & bit]
-    state = " | ".join(state_flags) if state_flags else f"Unknown ({task_state_value})"
-    return state
+    try:
+        # RHEL8+ kernels expose __state
+        return task.__state
+    except KeyError:
+        # On RHEL7 only "state" exists
+        return task.state
 
 def get_waiters(mutex):
     waiters = []
