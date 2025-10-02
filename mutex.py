@@ -1,6 +1,7 @@
 import pykdump.API as api
 import sys
 import argparse
+from pykdump.API import exec_crash_command
 
 # Global variable
 kernel_version = "Unknown"
