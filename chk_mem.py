@@ -169,7 +169,7 @@ def main():
     parser.add_argument("-K", action="store_const", dest="unit", const="K", help="Show memory in KiB")
     parser.add_argument("-M", action="store_const", dest="unit", const="M", help="Show memory in MiB")
     parser.add_argument("-G", action="store_const", dest="unit", const="G", help="Show memory in GiB")
-    parser.set_defaults(unit="K")
+    parser.set_defaults(unit="G")
     args = parser.parse_args()
 
     if not any([args.unaccounted]):
