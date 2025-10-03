@@ -205,7 +205,7 @@ def get_ps_code(task, debug=False):
     with any non-zero exit_state as ZO. Keep that behavior here.
     """
     try:
-        # Robust ints
+        es = None
         try:
             exit_state = int(getattr(task, 'exit_state', 0))
         except Exception:
@@ -214,7 +214,11 @@ def get_ps_code(task, debug=False):
                 exit_state = int(getattr(es, 'value', 0))
             except Exception:
                 try:
-                    exit_state = int(str(es), 0)
+                    # only attempt if es was set successfully
+                    if es is not None:
+                        exit_state = int(str(es), 0)
+                    else:
+                        exit_state = 0
                 except Exception:
                     exit_state = 0
 
@@ -281,9 +285,8 @@ def parse_bt_output(bt_output, max_depth=5):
             trace.append(m.group(1))
     if not trace:
         return None
-    # Bottom-up tail (reverse the head of stack frames)
-    tail = trace[:max_depth]
-    tail.reverse()
+    # Return the bottom-of-stack tail in natural call order
+    tail = trace[-max_depth:]
     return ' -> '.join(tail)
 
 def colorize(s, color_code, enable=True):
@@ -417,6 +420,19 @@ def _default_sort_key(task):
         int(task.get("pid", 0)),
     )
 
+SORT_KEYS = {
+    "pid":   lambda t: (int(t.get("pid", 0)),),
+    "ppid":  lambda t: (int(t.get("ppid", 0)), int(t.get("pid", 0))),
+    "st":    lambda t: (t.get("ps", ""), int(t.get("pid", 0))),
+    "cpu":   lambda t: (int(t.get("cpu", -1)), int(t.get("pid", 0))),
+    "task":  lambda t: (t.get("addr", ""),),
+    "on_cpu":lambda t: (-int(t.get("on_cpu", 0)), int(t.get("pid", 0))),
+    "sched": lambda t: (t.get("sched", ""), int(t.get("pid", 0))),
+    "prio":  lambda t: (int(t.get("prio", 0)), int(t.get("pid", 0))),
+    "comm":  lambda t: (t.get("comm", ""), int(t.get("pid", 0))),
+    "default": _default_sort_key,
+}
+
 def main():
     parser = argparse.ArgumentParser(description="Crash/epython task list analyzer")
     parser.add_argument("--state", help="Filter tasks by state code (e.g., RU, IN, UN)")
@@ -426,7 +442,12 @@ def main():
     parser.add_argument("--bt", action="store_true", help="Collect and group backtraces")
     parser.add_argument("--depth", type=int, default=5, help="Depth of backtrace tail to group on")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
-    parser.add_argument("--sort", choices=["default", "pid", "cpu"], help="Sort order for text output")
+    parser.add_argument(
+        "--sort",
+        choices=list(SORT_KEYS.keys()),
+        default="default",
+        help="Sort order for text output (columns: pid, ppid, st, cpu, task, on_cpu, sched, prio, comm, default)",
+    )
     args = parser.parse_args()
 
     # Initialize kernel/RHEL detection first
@@ -450,12 +471,20 @@ def main():
             print(f"{count:<5}  {trace}")
         return
     else:
+        # Flatten results then sort deterministically
+        all_tasks = []
+        for _state, tasks in results.items():
+            all_tasks.extend(tasks)
+
+        keyfn = SORT_KEYS.get(args.sort, _default_sort_key)
+        all_tasks.sort(key=keyfn)
+
+        use_color = (not args.no_color) and _is_tty()
         print("\n   PID     PPID    ST  CPU        TASK       ON_CPU SCHED PRIO       COMM")
         print("==========================================================================")
-        for state, tasks in results.items():
-            for t in tasks:
-                prio_colored = color_prio(t['prio'], t['static_prio'], t['sched'])
-                print(f"{t['pid']:>8} {t['ppid']:>8}  {t['ps']:<3} {t['cpu']:>3} {t['addr']:>14} {t['on_cpu']:>6} {t['sched']:>5} {prio_colored}  {t['comm']:<16}")
+        for t in all_tasks:
+            prio_colored = color_prio(t['prio'], t['static_prio'], t['sched'], enable=use_color)
+            print(f"{t['pid']:>8} {t['ppid']:>8}  {t['ps']:<3} {t['cpu']:>3} {t['addr']:>14} {t['on_cpu']:>6} {t['sched']:>5} {prio_colored}  {t['comm']:<16}")
 
 if __name__ == "__main__":
     main()
