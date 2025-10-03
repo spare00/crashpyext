@@ -15,6 +15,37 @@ RESET   = '\033[0m'
 
 PAGE_SIZE = 4096  # 4 KiB
 
+def get_vmalloc_memory_kb(debug=False):
+    """
+    Parse `kmem -v` output and sum the SIZE column (vmalloc/vmap allocations).
+    Returns total in KiB.
+    """
+    total_kb = 0
+    try:
+        output = exec_crash_command("kmem -v")
+    except Exception as e:
+        if debug:
+            print(f"[debug] kmem -v failed: {e}")
+        return 0
+
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or line.startswith("VMAP_AREA") or line.startswith("crash>"):
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            if debug:
+                print(f"[debug] skipping line: {line}")
+            continue
+        try:
+            size_val = int(parts[-1])  # SIZE column is last
+            total_kb += size_val // 1024
+        except ValueError:
+            if debug:
+                print(f"[debug] cannot parse size in line: {line}")
+            continue
+    return total_kb
+
 def scale_value(kb, unit):
     if unit == "K": return kb
     if unit == "M": return kb / 1024
@@ -56,11 +87,12 @@ def get_total_memory_from_kmem_i():
     for line in output.splitlines():
         if "TOTAL MEM" in line:
             parts = line.split()
-            try:
-                pages = int(parts[2])
-                return pages_to_kb(pages)
-            except (IndexError, ValueError):
-                continue
+            for token in parts:
+                try:
+                    pages = int(token)
+                    return pages_to_kb(pages)
+                except ValueError:
+                    continue
     return 0
 
 def get_hugepage_memory_kb(debug=False):
@@ -72,6 +104,7 @@ def get_hugepage_memory_kb(debug=False):
             continue
         parts = line.split()
         try:
+            # Format may be: HSTATE SIZE NODE TOTAL ...
             size_str = parts[1]
             total_pages = int(parts[3])
             if size_str.lower().endswith("kb"):
@@ -121,7 +154,8 @@ def get_accounted_memory_kb(stats, hugepage_kb, percpu_kb):
         pages_to_kb(stats.get("NR_PAGETABLE", 0)),
         pages_to_kb(stats.get("NR_SWAPCACHE", 0)),
         hugepage_kb,
-        percpu_kb
+        percpu_kb,
+        stats.get("VMALLOC_KB", 0)
     ])
 
 def print_unaccounted_formula(stats, total_kb, hugepage_kb, percpu_kb, unit):
@@ -169,6 +203,7 @@ def main():
     parser.add_argument("-K", action="store_const", dest="unit", const="K", help="Show memory in KiB")
     parser.add_argument("-M", action="store_const", dest="unit", const="M", help="Show memory in MiB")
     parser.add_argument("-G", action="store_const", dest="unit", const="G", help="Show memory in GiB")
+    parser.add_argument("--extras", action="store_true", help="Also show raw 'kmem -v' style extras (vmalloc, ioremap, etc.)")
     parser.set_defaults(unit="G")
     args = parser.parse_args()
 
@@ -182,6 +217,9 @@ def main():
     total_kb = get_total_memory_from_kmem_i()
     hugepage_kb = get_hugepage_memory_kb(debug=args.debug)
     percpu_kb = get_percpu_memory_kb()
+    vmalloc_kb = get_vmalloc_memory_kb(debug=args.debug)
+    stats["VMALLOC_KB"] = vmalloc_kb
+
     accounted_kb = get_accounted_memory_kb(stats, hugepage_kb, percpu_kb)
     unaccounted_kb = total_kb - accounted_kb
     scale = lambda val: scale_value(val, unit)
@@ -201,6 +239,7 @@ def main():
     print(f"{'Swap Cache':<30}{scale(pages_to_kb(stats.get('NR_SWAPCACHE', 0))):>20.2f}")
     print(f"{'Hugepages':<30}{scale(hugepage_kb):>20.2f}")
     print(f"{'Per-CPU Allocations':<30}{scale(percpu_kb):>20.2f}")
+    print(f"{'Vmalloc/Vmap':<30}{scale(vmalloc_kb):>20.2f}")
     print("-" * 50)
     print(f"{'Accounted Memory':<30}{scale(accounted_kb):>20.2f}")
     unaccounted_pct = (unaccounted_kb / total_kb) * 100
@@ -211,7 +250,6 @@ def main():
         color_start = color_end = ''
     print(f"{'Unaccounted Memory':<30}{scale(unaccounted_kb):>20.2f} {color_start}(%{unaccounted_pct:.2f}){color_end}")
 
-
     if args.debug:
         print("\n[debug] Parsed stats from 'kmem -V':")
         for k in sorted(stats):
@@ -219,6 +257,10 @@ def main():
 
     if args.verbose:
         print_unaccounted_formula(stats, total_kb, hugepage_kb, percpu_kb, unit)
+
+    if args.extras:
+        print("\n[extras] kmem -v output (raw pools not in accounted sum):\n")
+        print(exec_crash_command("kmem -v"))
 
 if __name__ == "__main__":
     main()
