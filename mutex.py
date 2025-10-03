@@ -60,11 +60,20 @@ def resolve_address(input_value):
 
 def get_task_state(task):
     try:
-        # RHEL8+ kernels expose __state
-        return task.__state
+        state_val = task.__state   # RHEL8+
     except KeyError:
-        # On RHEL7 only "state" exists
-        return task.state
+        state_val = task.state     # RHEL7 fallback
+
+    # Map numeric state to human-readable flags
+    states = []
+    for bit, name in task_state_array.items():
+        if state_val & bit:
+            states.append(name)
+
+    if not states:
+        return f"UNKNOWN({state_val})"
+
+    return "|".join(states)
 
 def get_waiters(mutex):
     waiters = []
