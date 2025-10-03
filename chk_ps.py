@@ -313,12 +313,24 @@ def get_idle_tasks():
         print(f"[ERROR] Failed to retrieve idle tasks: {e}")
     return idle_tasks
 
-def _read_thread_group(leader, debug=False):
-    group = [leader]
+def _read_thread_group(leader, seen, maxel=200000, debug=False):
+    """
+    Return all tasks in the thread_group of a leader.
+    Uses seen-set to prevent duplicate or circular walks.
+    """
+    group = []
     try:
-        threads = readSUListFromHead(Addr(leader.thread_group), "thread_group", "struct task_struct")
+        threads = readSUListFromHead(
+            Addr(leader.thread_group),
+            "thread_group",
+            "struct task_struct",
+            maxel=maxel # raise guard but still bounded
+        )
         for t in threads:
             if t is None:
+                continue
+            addr = Addr(t)
+            if addr in seen:
                 continue
             group.append(t)
     except Exception as e:
@@ -337,8 +349,15 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
         print(f"[ERROR] Cannot read init_task: {e}")
         return results, bt_counter
 
+    # Respect a higher limit via global or CLI (set in main via global var)
+    global LIST_MAXEL
     try:
-        leaders = readSUListFromHead(Addr(init_task.tasks), "tasks", "struct task_struct")
+        leaders = readSUListFromHead(
+            Addr(init_task.tasks),
+            "tasks",
+            "struct task_struct",
+            maxel=LIST_MAXEL
+        )
     except Exception as e:
         print(f"[ERROR] Error reading task list: {e}")
         return results, bt_counter
@@ -401,7 +420,8 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
 
     # Walk all leaders and their thread groups
     for leader in leaders:
-        for task in _read_thread_group(leader, debug=debug):
+        _record_task(leader)  # always include the leader
+        for task in _read_thread_group(leader, seen, maxel=LIST_MAXEL, debug=debug):
             _record_task(task)
 
     # Ensure idle tasks are considered (some builds hide them from the lists)
@@ -448,11 +468,21 @@ def main():
         default="default",
         help="Sort order for text output (columns: pid, ppid, st, cpu, task, on_cpu, sched, prio, comm, default)",
     )
+    parser.add_argument(
+        "--maxel",
+        type=int,
+        default=200000,
+        help="Safety bound when reading kernel lists (default: 200000)",
+    )
+
     args = parser.parse_args()
 
     # Initialize kernel/RHEL detection first
     get_rhel_version()
     _detect_cpu_members()
+    # make list guard configurable
+    global LIST_MAXEL
+    LIST_MAXEL = max(10000, int(args.maxel))
 
     print("Collecting task list...")
     results, bt_counter = walk_task_list(
