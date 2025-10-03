@@ -131,11 +131,52 @@ def get_percpu_memory_kb():
     except Exception:
         return 0
 
+def _fs_name_from_vma(vma):
+    try:
+        f = vma.vm_file
+        if not f:
+            return None
+        dentry = f.f_path.dentry
+        if not dentry or not dentry.d_sb or not dentry.d_sb.s_type:
+            return None
+        name = dentry.d_sb.s_type.name
+        return str(name) if name is not None else None
+    except Exception:
+        return None
+
+def get_process_shmem_kb(task_addr, debug=False):
+    try:
+        # Normalize to int for readSU
+        if isinstance(task_addr, str):
+            if task_addr.startswith("0x"):
+                task_addr = int(task_addr, 16)
+            else:
+                task_addr = int("0x" + task_addr, 16)
+
+        if debug:
+            print(f"[debug] normalized task_addr -> {hex(task_addr)} ({type(task_addr)})")
+
+        # Call readSU with int directly (no Addr())
+        task = readSU("struct task_struct", task_addr)
+        mm = task.mm
+        if not mm:
+            return 0
+
+        total_kb = 0
+        vma = mm.mmap
+        while vma:
+            flags = int(vma.vm_flags)
+            if flags & 0x00000008:  # VM_SHARED
+                total_kb += (int(vma.vm_end) - int(vma.vm_start)) // 1024
+            vma = vma.vm_next
+        return total_kb
+
+    except Exception as e:
+        if debug:
+            print(f"[debug] get_process_shmem_kb failed for {hex(task_addr) if isinstance(task_addr,int) else task_addr}: {e}")
+        return 0
+
 def get_top_processes(n=10, debug=False):
-    """
-    Use `ps -G` (thread group leaders only) from crash,
-    sort by RSS (column 8), return top-N processes.
-    """
     try:
         output = exec_crash_command("ps -G")
     except Exception as e:
@@ -149,12 +190,10 @@ def get_top_processes(n=10, debug=False):
         if not line or line.startswith("PID"):
             continue
 
-        # strip leading CPU-active marker if present
         if line.startswith(">"):
             line = line[1:].strip()
 
         parts = line.split()
-
         if len(parts) < 9:
             continue
 
@@ -162,36 +201,53 @@ def get_top_processes(n=10, debug=False):
             pid    = int(parts[0])
             ppid   = int(parts[1])
             cpu    = int(parts[2])
-            task   = parts[3]
+            task   = parts[3]   # save task_struct address
             state  = parts[4]
             mempct = parts[5]
-            vsz    = int(parts[6])   # column 7
-            rss    = int(parts[7])   # column 8
-            comm   = " ".join(parts[8:])  # column 9+
+            vsz    = int(parts[6])
+            rss    = int(parts[7])
+            comm   = " ".join(parts[8:])
 
             procs.append({
                 "pid": pid, "ppid": ppid, "cpu": cpu,
                 "task": task, "state": state,
-                "mempct": mempct, "vsz": vsz, "rss": rss, "comm": comm
+                "mempct": mempct, "vsz": vsz, "rss": rss,
+                "comm": comm
             })
         except Exception as e:
             if debug:
                 print(f"[debug] parse error: {e} in line: {line}")
             continue
 
+    # sort by RSS and trim
     procs.sort(key=lambda p: p["rss"], reverse=True)
-    return procs[:n]
+    top = procs[:n]
 
-def print_top_processes(n=10, debug=False):
+    # now compute shm only for top-N
+    for p in top:
+        p["shm"] = get_process_shmem_kb(p["task"], debug)
+
+    return top
+
+def print_top_processes(n=10, unit="K", debug=False):
     top = get_top_processes(n, debug)
     if not top:
         print("No process data available.")
         return
-    print("\nTop processes by RSS:")
-    print(f"{'PID':>8} {'PPID':>8} {'CPU':>4} {'RSS (KB)':>12} {'VSZ (KB)':>12}  COMM")
-    print("-" * 60)
+
+    def scale(val):
+        return scale_value(val, unit)
+
+    unit_label = f"{unit}iB"
+
+    print(f"\nTop processes by RSS (unit: {unit_label}):")
+    print(f"{'PID':>8} {'PPID':>8} {'CPU':>4} "
+          f"{'RSS':>12} {'VSZ':>12} {'SHM':>12}  COMM")
+    print("-" * 80)
+
     for p in top:
-        print(f"{p['pid']:>8} {p['ppid']:>8} {p['cpu']:>4} {p['rss']:>12} {p['vsz']:>12}  {p['comm']}")
+        print(f"{p['pid']:>8} {p['ppid']:>8} {p['cpu']:>4} "
+              f"{scale(p['rss']):>12.2f} {scale(p['vsz']):>12.2f} {scale(p.get('shm',0)):>12.2f}  {p['comm']}")
 
 def normalize_stats(stats):
 
@@ -332,7 +388,7 @@ def main():
         print(exec_crash_command("kmem -v"))
 
     if args.processes:
-        print_top_processes(10, debug=args.debug)
+        print_top_processes(10, unit=args.unit, debug=args.debug)
 
 if __name__ == "__main__":
     main()
