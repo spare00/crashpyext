@@ -131,6 +131,68 @@ def get_percpu_memory_kb():
     except Exception:
         return 0
 
+def get_top_processes(n=10, debug=False):
+    """
+    Use `ps -G` (thread group leaders only) from crash,
+    sort by RSS (column 8), return top-N processes.
+    """
+    try:
+        output = exec_crash_command("ps -G")
+    except Exception as e:
+        if debug:
+            print(f"[debug] Failed to run ps -G: {e}")
+        return []
+
+    procs = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or line.startswith("PID"):
+            continue
+
+        # strip leading CPU-active marker if present
+        if line.startswith(">"):
+            line = line[1:].strip()
+
+        parts = line.split()
+
+        if len(parts) < 9:
+            continue
+
+        try:
+            pid    = int(parts[0])
+            ppid   = int(parts[1])
+            cpu    = int(parts[2])
+            task   = parts[3]
+            state  = parts[4]
+            mempct = parts[5]
+            vsz    = int(parts[6])   # column 7
+            rss    = int(parts[7])   # column 8
+            comm   = " ".join(parts[8:])  # column 9+
+
+            procs.append({
+                "pid": pid, "ppid": ppid, "cpu": cpu,
+                "task": task, "state": state,
+                "mempct": mempct, "vsz": vsz, "rss": rss, "comm": comm
+            })
+        except Exception as e:
+            if debug:
+                print(f"[debug] parse error: {e} in line: {line}")
+            continue
+
+    procs.sort(key=lambda p: p["rss"], reverse=True)
+    return procs[:n]
+
+def print_top_processes(n=10, debug=False):
+    top = get_top_processes(n, debug)
+    if not top:
+        print("No process data available.")
+        return
+    print("\nTop processes by RSS:")
+    print(f"{'PID':>8} {'PPID':>8} {'CPU':>4} {'RSS (KB)':>12} {'VSZ (KB)':>12}  COMM")
+    print("-" * 60)
+    for p in top:
+        print(f"{p['pid']:>8} {p['ppid']:>8} {p['cpu']:>4} {p['rss']:>12} {p['vsz']:>12}  {p['comm']}")
+
 def normalize_stats(stats):
 
     if "NR_SLAB_RECLAIMABLE_B" not in stats and "NR_SLAB_RECLAIMABLE" in stats:
@@ -176,6 +238,7 @@ def print_unaccounted_formula(stats, total_kb, hugepage_kb, percpu_kb, unit):
         ("SwapCache", kb(p("NR_SWAPCACHE"))),
         ("HugePages", hugepage_kb),
         ("Percpu", percpu_kb),
+        ("Vmalloc/Vmap", stats.get("VMALLOC_KB", 0)),
     ]
 
     accounted = sum(val for _, val in fields)
@@ -193,11 +256,15 @@ def print_unaccounted_formula(stats, total_kb, hugepage_kb, percpu_kb, unit):
     print("Unaccounted memory formula (approx):")
     print(f"{'Unaccounted':<15}= {'Total Memory':<15}- " + " - ".join(name for name, _ in fields))
     print(f"{scale(unaccounted):<15.2f}= {scale(total_kb):<15.2f}- " + " - ".join(f"{scale(val):.2f}" for _, val in fields))
-    print("Note: This excludes reserved, vmalloc, directmap, early bootmem, and other special pools.\n")
+    print("Note: This excludes reserved, memmap, directmap, early bootmem, and other special pools.\n")
 
 def main():
     parser = argparse.ArgumentParser(description="Estimate unaccounted memory from VMcore.")
-    parser.add_argument("-u", "--unaccounted", action="store_true", help="Show summarized usage breakdown include unaccounted memory(default view)")
+    parser = argparse.ArgumentParser(description="Estimate unaccounted memory from VMcore.")
+    parser.add_argument("-i", "--info", action="store_true",
+                        help="Show summarized usage breakdown (default view if no option is given)")
+    parser.add_argument("-p", "--processes", action="store_true",
+                        help="Show top 10 processes by RSS (like ps | sort -nrk8 | head)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Show all parsed entries and meminfo-like summary")
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
     parser.add_argument("-K", action="store_const", dest="unit", const="K", help="Show memory in KiB")
@@ -207,8 +274,9 @@ def main():
     parser.set_defaults(unit="G")
     args = parser.parse_args()
 
-    if not any([args.unaccounted]):
-        args.unaccounted = True
+    # If no primary view option was chosen, default to -i
+    if not any([args.info, args.processes, args.extras]):
+        args.info = True
 
     stats = parse_kmem_V(debug=args.debug)
     normalize_stats(stats)
@@ -225,42 +293,46 @@ def main():
     scale = lambda val: scale_value(val, unit)
     unit_label = f"{unit}iB"
 
-    print(f"{'Category':<30}{f'Memory ({unit_label})':>20}")
-    print("-" * 50)
-    print(f"{'Total Memory':<30}{scale(total_kb):>20.2f}")
-    print(f"{'Active Anon':<30}{scale(pages_to_kb(stats.get('NR_ACTIVE_ANON', 0))):>20.2f}")
-    print(f"{'Inactive Anon':<30}{scale(pages_to_kb(stats.get('NR_INACTIVE_ANON', 0))):>20.2f}")
-    print(f"{'Slab Reclaimable':<30}{scale(bytes_to_kb(stats.get('NR_SLAB_RECLAIMABLE_B', 0))):>20.2f}")
-    print(f"{'Slab Unreclaimable':<30}{scale(bytes_to_kb(stats.get('NR_SLAB_UNRECLAIMABLE_B', 0))):>20.2f}")
-    print(f"{'Free Pages':<30}{scale(pages_to_kb(stats.get('NR_FREE_PAGES', 0))):>20.2f}")
-    print(f"{'Kernel Stacks':<30}{scale(stats.get('NR_KERNEL_STACK_KB', 0)):>20.2f}")
-    print(f"{'Page Tables':<30}{scale(pages_to_kb(stats.get('NR_PAGETABLE', 0))):>20.2f}")
-    print(f"{'Pagecache':<30}{scale(pages_to_kb(stats.get('NR_FILE_PAGES', 0))):>20.2f}")
-    print(f"{'Swap Cache':<30}{scale(pages_to_kb(stats.get('NR_SWAPCACHE', 0))):>20.2f}")
-    print(f"{'Hugepages':<30}{scale(hugepage_kb):>20.2f}")
-    print(f"{'Per-CPU Allocations':<30}{scale(percpu_kb):>20.2f}")
-    print(f"{'Vmalloc/Vmap':<30}{scale(vmalloc_kb):>20.2f}")
-    print("-" * 50)
-    print(f"{'Accounted Memory':<30}{scale(accounted_kb):>20.2f}")
-    unaccounted_pct = (unaccounted_kb / total_kb) * 100
-    if unaccounted_pct > 10:
-        color_start = RED  # red
-        color_end = RESET
-    else:
-        color_start = color_end = ''
-    print(f"{'Unaccounted Memory':<30}{scale(unaccounted_kb):>20.2f} {color_start}(%{unaccounted_pct:.2f}){color_end}")
+    if args.info:
+        print(f"{'Category':<30}{f'Memory ({unit_label})':>20}")
+        print("-" * 50)
+        print(f"{'Total Memory':<30}{scale(total_kb):>20.2f}")
+        print(f"{'Active Anon':<30}{scale(pages_to_kb(stats.get('NR_ACTIVE_ANON', 0))):>20.2f}")
+        print(f"{'Inactive Anon':<30}{scale(pages_to_kb(stats.get('NR_INACTIVE_ANON', 0))):>20.2f}")
+        print(f"{'Slab Reclaimable':<30}{scale(bytes_to_kb(stats.get('NR_SLAB_RECLAIMABLE_B', 0))):>20.2f}")
+        print(f"{'Slab Unreclaimable':<30}{scale(bytes_to_kb(stats.get('NR_SLAB_UNRECLAIMABLE_B', 0))):>20.2f}")
+        print(f"{'Free Pages':<30}{scale(pages_to_kb(stats.get('NR_FREE_PAGES', 0))):>20.2f}")
+        print(f"{'Kernel Stacks':<30}{scale(stats.get('NR_KERNEL_STACK_KB', 0)):>20.2f}")
+        print(f"{'Page Tables':<30}{scale(pages_to_kb(stats.get('NR_PAGETABLE', 0))):>20.2f}")
+        print(f"{'Pagecache':<30}{scale(pages_to_kb(stats.get('NR_FILE_PAGES', 0))):>20.2f}")
+        print(f"{'Swap Cache':<30}{scale(pages_to_kb(stats.get('NR_SWAPCACHE', 0))):>20.2f}")
+        print(f"{'Hugepages':<30}{scale(hugepage_kb):>20.2f}")
+        print(f"{'Per-CPU Allocations':<30}{scale(percpu_kb):>20.2f}")
+        print(f"{'Vmalloc/Vmap':<30}{scale(vmalloc_kb):>20.2f}")
+        print("-" * 50)
+        print(f"{'Accounted Memory':<30}{scale(accounted_kb):>20.2f}")
+        unaccounted_pct = (unaccounted_kb / total_kb) * 100 if total_kb else 0
+        if unaccounted_pct > 10:
+            color_start = RED  # red
+            color_end = RESET
+        else:
+            color_start = color_end = ''
+        print(f"{'Unaccounted Memory':<30}{scale(unaccounted_kb):>20.2f} {color_start}(%{unaccounted_pct:.2f}){color_end}")
 
     if args.debug:
         print("\n[debug] Parsed stats from 'kmem -V':")
         for k in sorted(stats):
             print(f"{k:<35}{stats[k]}")
 
-    if args.verbose:
+    if args.verbose and args.info:
         print_unaccounted_formula(stats, total_kb, hugepage_kb, percpu_kb, unit)
 
     if args.extras:
         print("\n[extras] kmem -v output (raw pools not in accounted sum):\n")
         print(exec_crash_command("kmem -v"))
+
+    if args.processes:
+        print_top_processes(10, debug=args.debug)
 
 if __name__ == "__main__":
     main()
