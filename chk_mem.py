@@ -326,12 +326,11 @@ def main():
     parser.add_argument("-K", action="store_const", dest="unit", const="K", help="Show memory in KiB")
     parser.add_argument("-M", action="store_const", dest="unit", const="M", help="Show memory in MiB")
     parser.add_argument("-G", action="store_const", dest="unit", const="G", help="Show memory in GiB")
-    parser.add_argument("--extras", action="store_true", help="Also show raw 'kmem -v' style extras (vmalloc, ioremap, etc.)")
     parser.set_defaults(unit="G")
     args = parser.parse_args()
 
     # If no primary view option was chosen, default to -i
-    if not any([args.info, args.processes, args.extras]):
+    if not any([args.info, args.processes]):
         args.info = True
 
     stats = parse_kmem_V(debug=args.debug)
@@ -382,10 +381,6 @@ def main():
 
     if args.verbose and args.info:
         print_unaccounted_formula(stats, total_kb, hugepage_kb, percpu_kb, unit)
-
-    if args.extras:
-        print("\n[extras] kmem -v output (raw pools not in accounted sum):\n")
-        print(exec_crash_command("kmem -v"))
 
     if args.processes:
         print_top_processes(10, unit=args.unit, debug=args.debug)
