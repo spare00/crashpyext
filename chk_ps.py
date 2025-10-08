@@ -268,26 +268,28 @@ def get_ps_code(task, debug=False):
 def parse_bt_output(bt_output, max_depth=5):
     """
     Extract the function names from crash's 'bt -s PID' output.
-    We strip the bottom-up order and return a 'tail' chain joined by ' -> '.
+    Return the last N (innermost) frames, shown from earliest to latest.
 
-    Example 'bt' line patterns vary, so keep regex permissive:
-      #0 [ffff...] func_name+0x.../0x...  or
-      #1 [ffff...] func_name
+    Example desired order:
+        __bmhook_send_event_common -> bmhook_scan_wait -> schedule_timeout -> schedule -> __schedule
     """
-    trace = []
+    funcs = []
     for line in (bt_output or "").splitlines():
-        # grab token after the ']'
+        # Match common crash bt line forms
         m = re.search(r'\]\s+([a-zA-Z0-9_\.]+)', line)
         if not m:
-            # alternate form: '#0  func'
             m = re.search(r'#\d+\s+([a-zA-Z0-9_\.]+)', line)
         if m:
-            trace.append(m.group(1))
-    if not trace:
+            funcs.append(m.group(1))
+
+    if not funcs:
         return None
-    # Return the bottom-of-stack tail in natural call order
-    tail = trace[-max_depth:]
-    return ' -> '.join(tail)
+
+    # Keep the *first* max_depth frames (bottom of stack)
+    tail = funcs[:max_depth]
+
+    # Reverse them to show "earlier → later" (caller → callee)
+    return ' -> '.join(reversed(tail))
 
 def colorize(s, color_code, enable=True):
     if not enable:
