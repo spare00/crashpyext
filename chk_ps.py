@@ -341,29 +341,59 @@ def _read_thread_group(leader, seen, maxel=200000, debug=False):
     return group
 
 def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=False, depth=5):
+    """
+    Cross-version task walker (RHEL7–10).
+    RHEL7–9: leader + thread_group
+    RHEL10+: leader + signal->thread_head with member 'thread_node'
+    """
     results = defaultdict(list)
     bt_counter = Counter()
     seen = set()
 
+    # --- robust member checks ---
+    def _has_member(typename, member):
+        try:
+            off = crash.member_offset(typename, member)
+            t = readSymbol("init_task")
+            getattr(t, member)  # ensure live access works
+            return isinstance(off, int) and off >= 0
+        except Exception:
+            return False
+
+    def _has_member_type(typename, member):
+        try:
+            crash.member_offset(typename, member)
+            return True
+        except Exception:
+            return False
+
+    # --- init_task and global ring ---
     try:
         init_task = readSymbol("init_task")
     except Exception as e:
         print(f"[ERROR] Cannot read init_task: {e}")
         return results, bt_counter
 
-    # Respect a higher limit via global or CLI (set in main via global var)
     global LIST_MAXEL
     try:
-        leaders = readSUListFromHead(
+        task_ring = readSUListFromHead(
             Addr(init_task.tasks),
             "tasks",
             "struct task_struct",
             maxel=LIST_MAXEL
         )
     except Exception as e:
-        print(f"[ERROR] Error reading task list: {e}")
+        print(f"[ERROR] Error reading global task list: {e}")
         return results, bt_counter
 
+    has_thread_group = _has_member("struct task_struct", "thread_group")
+    # Modern (RHEL10+) thread list pieces:
+    has_thread_node   = _has_member_type("struct task_struct", "thread_node")
+    has_signal_ptr    = _has_member_type("struct task_struct", "signal")
+    has_signal_head   = _has_member_type("struct signal_struct", "thread_head")
+    modern_threadlist = (not has_thread_group) and has_thread_node and has_signal_ptr and has_signal_head
+
+    # --- record helper ---
     def _record_task(task):
         addr = Addr(task)
         if addr in seen:
@@ -375,10 +405,20 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
             comm = str(task.comm)
             state_val = get_state(task)
             state_name = get_state_name(state_val)
-            ppid = task.real_parent.pid if task.real_parent else 0
+            # Prefer real_parent, then parent, then group_leader for threads
+            ppid = 0
+            try:
+                if getattr(task, "real_parent", None):
+                    ppid = task.real_parent.pid
+                elif getattr(task, "parent", None):
+                    ppid = task.parent.pid
+                elif getattr(task, "group_leader", None):
+                    ppid = task.group_leader.pid
+            except Exception:
+                ppid = 0
             on_cpu = int(getattr(task, 'on_cpu', 0))
             cpu = get_cpu(task)
-            ps_code = get_ps_code(task,debug)
+            ps_code = get_ps_code(task, debug)
             sched_class = get_sched_class(task)
             prio = task.prio
             static_prio = task.static_prio
@@ -407,7 +447,7 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
             "sched": sched_class,
             "prio": prio,
             "static_prio": static_prio,
-            "addr": f"{addr:x}"
+            "addr": f"{addr:x}",
         })
 
         if collect_bt:
@@ -420,13 +460,76 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
                 if debug:
                     print(f"[WARN] Failed to collect bt for PID {pid}: {e}")
 
-    # Walk all leaders and their thread groups
-    for leader in leaders:
-        _record_task(leader)  # always include the leader
-        for task in _read_thread_group(leader, seen, maxel=LIST_MAXEL, debug=debug):
-            _record_task(task)
+    # --- modern thread-group walker (RHEL10+) ---
+    def _walk_threads_modern(leader):
+        """
+        leader.signal.thread_head is a list_head anchoring all threads in the group;
+        each thread links with task->thread_node.
+        """
+        try:
+            sig = leader.signal
+            if not sig:
+                return
+            head = Addr(sig.thread_head)
+            threads = readSUListFromHead(
+                head,
+                "thread_node",              # member name inside struct task_struct
+                "struct task_struct",
+                maxel=LIST_MAXEL
+            )
+            for th in threads:
+                _record_task(th)
+        except Exception as e:
+            if debug:
+                pid = getattr(leader, "pid", -1)
+                print(f"[WARN] RHEL10 thread walk failed for leader PID {pid}: {e}")
 
-    # Ensure idle tasks are considered (some builds hide them from the lists)
+    # --- legacy thread-group walker (RHEL7–9) ---
+    def _walk_threads_legacy(leader):
+        try:
+            threads = readSUListFromHead(
+                Addr(leader.thread_group),
+                "thread_group",
+                "struct task_struct",
+                maxel=LIST_MAXEL
+            )
+            for th in threads:
+                _record_task(th)
+        except Exception as e:
+            if debug:
+                print(f"[WARN] Cannot read thread_group for PID {getattr(leader,'pid',-1)}: {e}")
+
+    # --- main traversal ---
+    if has_thread_group:
+        if debug:
+            print("[DEBUG] Using thread_group traversal (RHEL7–9 mode)")
+        for leader in task_ring:
+            _record_task(leader)
+            _walk_threads_legacy(leader)
+    else:
+        if debug:
+            print("[DEBUG] Using global tasks traversal (RHEL10 mode)")
+        # Always record everything we see in the global ring
+        for t in task_ring:
+            _record_task(t)
+
+        # If modern thread list is present, walk per-leader thread lists
+        if modern_threadlist:
+            if debug:
+                print("[DEBUG] Supplementing via signal->thread_head (RHEL10+)")
+            for t in task_ring:
+                try:
+                    # Only expand from Group Leaders to avoid redundant walks
+                    if getattr(t, "group_leader", None) == t:
+                        _walk_threads_modern(t)
+                except Exception:
+                    # be safe and continue
+                    continue
+        else:
+            if debug:
+                print("[DEBUG] No modern per-thread list detected; relying on global ring only")
+
+    # --- include idle tasks ---
     for task in get_idle_tasks():
         _record_task(task)
 
