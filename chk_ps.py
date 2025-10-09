@@ -496,7 +496,7 @@ def main():
     )
 
     if args.bt:
-        print("\nBacktrace pattern summary:")
+        print(f"\nBacktrace pattern summary({args.state} tasks):")
         print("==========================")
         # Deterministic order: by count desc, then lexicographically
         for trace, count in sorted(bt_counter.items(), key=lambda kv: (-kv[1], kv[0])):
