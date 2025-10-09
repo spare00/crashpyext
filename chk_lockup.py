@@ -5,22 +5,63 @@ from LinuxDump import percpu
 
 # Soft lockup detector starts
 def get_rhel_version():
-    """Determines the major RHEL version from the kernel release."""
+    """Determines the major RHEL version from the kernel release (handles el10+)."""
     sys_output = exec_crash_command("sys")
     kernel_version = "Unknown"
-    rhel_version = 8  # Default to RHEL 8
+    rhel_version = 8  # sensible default
+
+    # Look for something like: 6.12.0-55.28.1.el10_0.x86_64
+    # Accept .el9, .el9_4, .el10, .el10_1, etc.
+    el_re = re.compile(r"\.el(\d+)(?:[._]|$)")
 
     for line in sys_output.splitlines():
         if "RELEASE" in line:
             kernel_version = line.split()[-1]
-            if "el" in kernel_version:
+            m = el_re.search(kernel_version)
+            if m:
                 try:
-                    rhel_version = int(kernel_version.split(".el")[1][0])
-                except (IndexError, ValueError):
+                    rhel_version = int(m.group(1))
+                except ValueError:
                     pass
 
     print(f"Detected RHEL Version: {rhel_version} (Kernel: {kernel_version})")
     return rhel_version
+
+def get_cpu_rflags_cs_and_comm_via_bt():
+    """
+    Robustly parse 'bt -a' by CPU block; return list of (cpu, rflags_hex|'N/A', cs_hex|'N/A', comm|'Unknown').
+    Matches either COMM or COMMAND for task name.
+    """
+    out = exec_crash_command("bt -a")
+    lines = out.splitlines()
+    cpu_info = []
+    i = 0
+    while i < len(lines):
+        m = re.search(r"\bCPU:\s*(\d+)\b", lines[i])
+        if not m:
+            i += 1
+            continue
+        cpu = int(m.group(1))
+        rflags = "N/A"
+        cs = "N/A"
+        comm = "Unknown"
+        i += 1
+        while i < len(lines) and "CPU:" not in lines[i]:
+            if rflags == "N/A":
+                mrf = re.search(r"\bRFLAGS:\s*([0-9a-fA-F]+)\b", lines[i])
+                if mrf:
+                    rflags = mrf.group(1)
+            if cs == "N/A":
+                mcs = re.search(r"\bCS:\s*([0-9a-fA-F]{4})\b", lines[i])
+                if mcs:
+                    cs = mcs.group(1)
+            if comm == "Unknown":
+                mco = re.search(r'\bCOM(?:M|MAND):\s*"([^"]+)"', lines[i])
+                if mco:
+                    comm = mco.group(1)
+            i += 1
+        cpu_info.append((cpu, rflags, cs, comm))
+    return cpu_info
 
 def get_rflags_and_cs_from_bt():
     """Parses 'bt -a' to extract CPU, RFLAGS, and CS."""
@@ -94,11 +135,12 @@ def get_softlockup_values(rhel_version):
         return None, None, None, None, None
 
 def detect_soft_lockup():
+    """Detects soft lockups using per-CPU rq->clock and watchdog timestamps."""
     rhel_version = get_rhel_version()
     print(f"\n🔍 Checking for soft lockups in vmcore (RHEL {rhel_version})...")
 
     rq_time, touch_ts, period_ts, softlockup_thresh, is_watchdog_enabled = get_softlockup_values(rhel_version)
-    cpu_info = get_rflags_and_cs_from_bt()
+    cpu_info = get_cpu_rflags_cs_and_comm_via_bt()
 
     if None in (rq_time, touch_ts, softlockup_thresh):
         print("❌ Failed to read required values. Exiting.")
@@ -113,51 +155,50 @@ def detect_soft_lockup():
     max_now = max(rq_time)
     print(f"⏱️  Max rq->clock across CPUs: {max_now:.2f} sec\n")
 
-    print(f"{'CPU':<5} {'now (sec)':<12} {'behind(s)':>10} {'touch+%d' % softlockup_thresh:>15} {'Diff':>10} {'RFLAGS':>18} {'CS':>6} {'Status'}")
-    print("=" * 100)
+    header = f"{'CPU':<5} {'now (sec)':>10} {'behind(s)':>12} {'Since touch(s)':>16} {'RFLAGS':>18} {'CS':>8} {'Status':>16}"
+    print(header)
+    print("=" * len(header))
 
     locked_cpus = []
-    ULONG_MAX = 18446744073709551615
 
     for cpu in range(len(rq_time)):
-
         delta = max_now - rq_time[cpu]
-        plain_delta = f"{delta:.2f}"
-        behind_by_str = plain_delta.rjust(10)
+        behind_by_str = f"{delta:>12.2f}"
 
+        # Defaults
         rflags = cs = task_comm = "N/A"
         for entry in cpu_info:
             if entry[0] == cpu:
                 rflags, cs, task_comm = entry[1], entry[2], entry[3]
                 break
 
-        # Skip if it's swapper
+        # Skip idle CPUs
         if task_comm.startswith("swapper"):
             status = "Idle - Ignored"
-            diff_str = "-"
-            threshold_ts = "N/A"
-            line = f"{cpu:<5} {rq_time[cpu]:<12.2f} {'-':>10} {threshold_ts:>15} {diff_str:>10} {rflags:>18} {cs:>6} {status}"
+            elapsed_str = "-"
+            line = f"{cpu:<5} {rq_time[cpu]:>10.2f} {'-':>12} {elapsed_str:>16} {rflags:>18} {cs:>8} {status:>16}"
             print(line)
             continue
 
         if touch_ts[cpu] == 0:
             status = "Ignored"
-            diff_str = "-"
-            threshold_ts = "N/A"
+            elapsed_str = "-"
         else:
-            threshold_ts = touch_ts[cpu] + softlockup_thresh
-            diff = rq_time[cpu] - threshold_ts
-            diff_str = f"{diff:.2f}"
-            status = "✅ Normal" if diff <= 0 else "⚠️ Soft Lockup"
-            if status == "⚠️ Soft Lockup":
+            elapsed = rq_time[cpu] - touch_ts[cpu]
+            if elapsed > softlockup_thresh:
+                elapsed_str = f"\033[91m{elapsed:>16.2f}\033[0m"  # red if over threshold
+                status = "⚠️ Soft Lockup"
                 locked_cpus.append(cpu)
+            else:
+                elapsed_str = f"{elapsed:>16.2f}"
+                status = "✅ Normal"
 
-        # Check RFLAGS bit 9 missing (interrupts disabled) and CS == 0010
+        # Highlight suspicious CPUs (IF=0 + kernel CS)
         rflags_suspicious = if_bit_clear(rflags)
         cs_suspicious = cs == "0010"
         highlight = status == "⚠️ Soft Lockup" and rflags_suspicious and cs_suspicious
 
-        line = f"{cpu:<5} {rq_time[cpu]:<12.2f} {behind_by_str} {str(threshold_ts):>15} {diff_str:>10} {rflags:>18} {cs:>6} {status}"
+        line = f"{cpu:<5} {rq_time[cpu]:>10.2f} {behind_by_str} {elapsed_str} {rflags:>18} {cs:>8} {status:>16}"
         if highlight:
             line = f"\033[91m{line}\033[0m"
 
@@ -168,26 +209,6 @@ def detect_soft_lockup():
         print(f"⚠️ Soft lockup detected on CPUs: {', '.join(map(str, locked_cpus))}")
     else:
         print("✅ No soft lockup detected.")
-
-# Hard lockup detector starts
-def get_hrtimer_values():
-    """Fetches hrtimer_interrupts and hrtimer_interrupts_saved for each CPU correctly."""
-    if not symbol_exists("hrtimer_interrupts") or not symbol_exists("hrtimer_interrupts_saved"):
-        print("⚠️ Warning: Required symbols 'hrtimer_interrupts' or 'hrtimer_interrupts_saved' are missing.")
-        return None, None
-
-    try:
-        hrtimer_interrupts_addrs = percpu.get_cpu_var("hrtimer_interrupts")
-        hrtimer_interrupts_saved_addrs = percpu.get_cpu_var("hrtimer_interrupts_saved")
-
-        hrtimer_interrupts = [readULong(addr) for addr in hrtimer_interrupts_addrs]
-        hrtimer_interrupts_saved = [readULong(addr) for addr in hrtimer_interrupts_saved_addrs]
-
-        return hrtimer_interrupts, hrtimer_interrupts_saved
-
-    except Exception as e:
-        print(f"❌ Error: Failed to read hrtimer values: {e}")
-        return None, None
 
 def get_cpu_rflags_cs_via_bt():
     """Parses 'bt -a' to extract CPU, RFLAGS, and CS."""
@@ -299,12 +320,6 @@ def is_hard_watchdog_enabled():
     except:
         return True
 
-def if_bit_clear(rflags_str: str) -> bool:
-    try:
-        return (int(rflags_str, 16) & 0x200) == 0
-    except:
-        return False
-
 def detect_hard_lockup():
     """Detects hard lockups and classifies them as CONFIRMED / SUSPECT / NORMAL."""
     print("\n🔍 Checking for hard lockups in vmcore...\n")
@@ -368,4 +383,5 @@ if __name__ == "__main__":
 
     if args.hard_lockup:
         detect_hard_lockup()
+
 
