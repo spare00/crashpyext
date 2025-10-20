@@ -264,6 +264,26 @@ def is_hard_watchdog_enabled_default_true() -> bool:
     except Exception:
         return True
 
+# Hard lockup detector starts
+def get_hrtimer_values():
+    """Fetches hrtimer_interrupts and hrtimer_interrupts_saved for each CPU correctly."""
+    if not symbol_exists("hrtimer_interrupts") or not symbol_exists("hrtimer_interrupts_saved"):
+        print("⚠️ Warning: Required symbols 'hrtimer_interrupts' or 'hrtimer_interrupts_saved' are missing.")
+        return None, None
+
+    try:
+        hrtimer_interrupts_addrs = percpu.get_cpu_var("hrtimer_interrupts")
+        hrtimer_interrupts_saved_addrs = percpu.get_cpu_var("hrtimer_interrupts_saved")
+
+        hrtimer_interrupts = [readULong(addr) for addr in hrtimer_interrupts_addrs]
+        hrtimer_interrupts_saved = [readULong(addr) for addr in hrtimer_interrupts_saved_addrs]
+
+        return hrtimer_interrupts, hrtimer_interrupts_saved
+
+    except Exception as e:
+        print(f"❌ Error: Failed to read hrtimer values: {e}")
+        return None, None
+
 def get_cpu_rflags_cs_via_bt_robust():
     """
     Robustly parse 'bt -a': for each 'CPU: N' block, search lines until the next 'CPU:' for RFLAGS and CS.
@@ -304,12 +324,6 @@ def is_hard_watchdog_enabled():
         return (val & 0x01) != 0  # hard watchdog bit
     except:
         return True
-
-def if_bit_clear(rflags_str: str) -> bool:
-    try:
-        return (int(rflags_str, 16) & 0x200) == 0
-    except:
-        return False
 
 def is_hard_watchdog_enabled():
     try:
