@@ -21,6 +21,23 @@ def get_rhel_version():
     print(f"Detected RHEL Version: {RHEL_VERSION} (Kernel: {kernel_version})")
     return RHEL_VERSION
 
+def resolve_address(addr_or_symbol):
+    """Resolve a symbol or hexadecimal address string to an integer address."""
+    try:
+        # If it looks like a hex address
+        if addr_or_symbol.startswith("0x") or addr_or_symbol.startswith("ffff"):
+            return int(addr_or_symbol, 16)
+
+        # Otherwise, assume it’s a symbol name and resolve via crash
+        symbol_output = exec_crash_command(f"sym {addr_or_symbol}")
+        for line in symbol_output.splitlines():
+            if addr_or_symbol in line and " = " in line:
+                return int(line.split(" = ")[1], 16)
+        raise ValueError(f"Unable to resolve symbol: {addr_or_symbol}")
+
+    except Exception as e:
+        raise RuntimeError(f"Failed to resolve address for '{addr_or_symbol}': {e}")
+
 def to_binary(value, bits):
     """ Convert a value to a zero-padded binary string of given bit length. """
     return f"{value:0{bits}b}"

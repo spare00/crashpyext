@@ -6,7 +6,6 @@ import mutex
 import rwsem
 import semaphore as sem
 
-
 def main():
     parser = argparse.ArgumentParser(description="Unified Lock Analyzer for VMcore")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -55,7 +54,7 @@ def main():
 
     elif args.command == "spinlock":
         qspinlock.RHEL_VERSION = qspinlock.get_rhel_version()
-        qspinlock.analyze_spinlock(
+        qspinlock.analyze_qspinlock(
             qspinlock.resolve_address(args.addr), args.verbose, args.debug
         )
 
