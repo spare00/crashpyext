@@ -181,8 +181,14 @@ def detect_soft_lockup():
             continue
 
         if touch_ts[cpu] == 0:
-            status = "Ignored"
-            elapsed_str = "-"
+            # watchdog_touch_ts not valid – infer from scheduler lag
+            if delta > softlockup_thresh:
+                elapsed_str = f"\033[91m{delta:>16.2f}\033[0m"
+                status = "⚠️ Inferred Soft Lockup"
+                locked_cpus.append(cpu)
+            else:
+                elapsed_str = "-"
+                status = "Ignored (no touch_ts)"
         else:
             elapsed = rq_time[cpu] - touch_ts[cpu]
             if elapsed > softlockup_thresh:
