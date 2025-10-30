@@ -369,11 +369,14 @@ def detect_hard_lockup():
 
         if equal:
             if kernel_cs:
-                # In kernel: equality is meaningful. IF=0 strengthens but IF=1 does not clear it.
-                verdict = "⚠️ CONFIRMED hard lockup"
-                if not irqs_off:
-                    verdict += " (IF=1)"
-                confirmed.append(cpu)
+                if hard_wd_on:
+                    verdict = "⚠️ CONFIRMED hard lockup"
+                    if not irqs_off:
+                        verdict += " (IF=1)"
+                    confirmed.append(cpu)
+                else:
+                    verdict = "❓ INCONCLUSIVE (watchdog disabled)"
+                    suspects.append(cpu)
             else:
                 verdict = "❓ SUSPECT (user CS)"
                 suspects.append(cpu)
@@ -386,7 +389,7 @@ def detect_hard_lockup():
     if confirmed:
         print(f"⚠️ Hard lockup (CONFIRMED) on CPUs: {', '.join(map(str, confirmed))}")
     if suspects:
-        print(f"❓ Hard lockup (SUSPECT) on CPUs: {', '.join(map(str, suspects))}")
+        print(f"❓ Hard lockup (SUSPECT/INCONCLUSIVE) on CPUs: {', '.join(map(str, suspects))}")
     if not confirmed and not suspects:
         print("✅ No hard lockup indicated.")
 
@@ -403,5 +406,4 @@ if __name__ == "__main__":
 
     if args.hard_lockup:
         detect_hard_lockup()
-
 
