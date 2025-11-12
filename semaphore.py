@@ -69,31 +69,63 @@ _task_state_map = {
 
 
 def _task_state(task) -> str:
+    """Return human-readable task state, handling kernels with either 'state' or '__state'."""
     try:
-        val = task.state if RHEL_VERSION >= 8 else task.__state
+        val = None
+
+        # Some kernels have task.state, others task.__state
+        for candidate in ("state", "__state"):
+            try:
+                val = int(getattr(task, candidate))
+                logging(f"_task_state(): using field '{candidate}' with value {val}")
+                break
+            except Exception:
+                continue
+
+        # As a last resort, try via crash command
+        if val is None:
+            try:
+                raw = exec_crash_command(f"p ((struct task_struct *){int(task):#x})->__state")
+                val = int(raw.strip().split()[-1], 0)
+                logging(f"_task_state(): fallback via crash cmd returned {val}")
+            except Exception:
+                logging("_task_state(): no valid state field found")
+                return "Unknown"
+
         flags = [name for bit, name in _task_state_map.items() if val & bit]
         return " | ".join(flags) if flags else f"Unknown ({val})"
-    except Exception:
-        return "Unknown"
 
+    except Exception as e:
+        logging(f"_task_state() failed: {e}")
+        return "Unknown"
 
 # ---------- Waiters ----------
 def list_waiters(wait_list_addr) -> list:
     """Return list of (pid, comm, state, taddr) for tasks waiting on the semaphore."""
     result = []
     try:
-        cmd = f"list -s semaphore_waiter.task -l semaphore_waiter.list {wait_list_addr:#x}"
+        cmd = f"list -s semaphore_waiter.task -l semaphore_waiter.list -H {wait_list_addr:#x}"
         output = exec_crash_command(cmd)
-        for line in (l.strip() for l in output.splitlines() if l.strip()):
+
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        for i in range(0, len(lines), 2):  # Read 2 lines at a time
             try:
-                taddr = int(line, 16)
-                task = readSU("struct task_struct", taddr)
-                pid = task.pid
-                comm = task.comm
-                state = _task_state(task)
-                result.append((pid, comm, state, taddr))
+                node_addr = int(lines[i], 16)
+                task_line = lines[i + 1]
+
+                # Expecting: "task = 0xff377706b5ed0000,"
+                if "task =" in task_line:
+                    task_str = task_line.split("=", 1)[1].strip().strip(",")
+                    task_addr = int(task_str, 16)
+                    task = readSU("struct task_struct", task_addr)
+                    pid = task.pid
+                    comm = task.comm
+                    state = _task_state(task)
+                    result.append((pid, comm, state, task_addr))
+                else:
+                    result.append(("?", task_line, "?", 0))
             except Exception:
-                result.append(("?", line, "?", 0))
+                result.append(("?", lines[i], "?", 0))
     except Exception as e:
         print(f"Error listing waiters for semaphore at {wait_list_addr:#x}: {e}")
     return result
