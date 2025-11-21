@@ -454,12 +454,12 @@ def get_accounted_memory_kb(stats, hugepage_kb, percpu_kb):
         pages_to_kb(stats.get("NR_SLAB_UNRECLAIMABLE_B", 0)),
         pages_to_kb(stats.get("NR_FREE_PAGES", 0)),
         pages_to_kb(stats.get("NR_FILE_PAGES", 0)),
-        stats.get("NR_KERNEL_STACK_KB", 0),
+        pages_to_kb(stats.get("NR_KERNEL_STACK_KB", 0)),
         pages_to_kb(stats.get("NR_PAGETABLE", 0)),
         pages_to_kb(stats.get("NR_SWAPCACHE", 0)),
         hugepage_kb,
         percpu_kb,
-        stats.get("VMALLOC_KB", 0)
+        #stats.get("VMALLOC_KB", 0)
     ])
 
 def print_unaccounted_formula(stats, total_kb, hugepage_kb, percpu_kb, unit):
@@ -475,12 +475,12 @@ def print_unaccounted_formula(stats, total_kb, hugepage_kb, percpu_kb, unit):
         ("Slab Unreclaimable", kb(p("NR_SLAB_UNRECLAIMABLE_B"))),
         ("Free", kb(p("NR_FREE_PAGES"))),
         ("PageCache", kb(p("NR_FILE_PAGES"))),
-        ("KernelStack", kp("NR_KERNEL_STACK_KB")),
+        ("KernelStack", kb(p("NR_KERNEL_STACK_KB"))),
         ("PageTables", kb(p("NR_PAGETABLE"))),
         ("SwapCache", kb(p("NR_SWAPCACHE"))),
         ("HugePages", hugepage_kb),
         ("Percpu", percpu_kb),
-        ("Vmalloc/Vmap", stats.get("VMALLOC_KB", 0)),
+        #("Vmalloc/Vmap", stats.get("VMALLOC_KB", 0)),
     ]
 
     accounted = sum(val for _, val in fields)
@@ -510,7 +510,7 @@ def print_meminfo_style(stats, total_kb, hugepage_kb, percpu_kb, vmalloc_kb, uni
     anon_total = active_anon + inactive_anon
     file_pages = pages_to_kb(stats.get("NR_FILE_PAGES", 0))
     slab = pages_to_kb(stats.get("NR_SLAB_RECLAIMABLE_B", 0) + stats.get("NR_SLAB_UNRECLAIMABLE_B", 0))
-    kernel_stack = stats.get("NR_KERNEL_STACK_KB", 0)
+    kernel_stack = pages_to_kb(stats.get("NR_KERNEL_STACK_KB", 0))
     pagetables = pages_to_kb(stats.get("NR_PAGETABLE", 0))
     swapcache = pages_to_kb(stats.get("NR_SWAPCACHE", 0))
 
