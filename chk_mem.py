@@ -527,15 +527,16 @@ def print_meminfo_style(stats, total_kb, hugepage_kb, percpu_kb, vmalloc_kb, uni
         pages_to_kb(stats.get("NR_FILE_PAGES", 0) - stats.get("NR_SWAPCACHE", 0)) - buffers_kb,
         0
     )
-    pagecache_kb = pages_to_kb(
-        stats.get("NLE", 0))
+    pagecache_kb = pages_to_kb(stats.get("NLE", 0))
     swapcache = pages_to_kb(stats.get("NR_SWAPCACHE", 0))
 
-    # Shmem Estimation
-    shmem_kb_real = pages_to_kb(stats.get("NR_SHMEM", 0))
-    shmem_kb, tmpfs_kb, sysv_kb = estimate_unique_shmem_kb(debug)
-    _, visible_tmpfs_kb, internal_tmpfs_kb = get_tmpfs_memory_from_superblocks(debug)
-    extra_kb = max(shmem_kb - shmem_kb_rea<30}{scale(memfree):>20.2f}")
+    huge_total_kb, huge_used_kb = get_hugepage_info(debug=debug)
+    swap_total_kb, swap_used_kb = get_swap_info(debug=debug)
+
+    print(f"{'Field':<30}{'Size (' + unit_label + ')':>20}")
+    print("=" * 50)
+    print(f"{'MemTotal:':<30}{scale(total_kb):>20.2f}")
+    print(f"{'MemFree':<30}{scale(memfree):>20.2f}")
     print(f"{'Buffers':<30}{scale(buffers_kb):>20.2f}")  # Placeholder
     print(f"{'Cached':<30}{scale(cached_kb):>20.2f}")
     print(f"  {'pagecache':<28}{scale(file_pages):>20.2f}")
