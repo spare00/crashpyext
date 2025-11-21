@@ -15,6 +15,219 @@ RESET   = '\033[0m'
 
 PAGE_SIZE = 4096  # 4 KiB
 
+def get_tmpfs_superblocks(debug=False):
+    all_tmpfs_sbs = set()
+    visible_tmpfs_sbs = set()
+
+    # First collect all visible tmpfs from `mount`
+    try:
+        output = exec_crash_command("mount")
+        for line in output.splitlines():
+            if "tmpfs" not in line or line.startswith("MOUNT"):
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            sb_addr = parts[1]
+            if sb_addr.startswith("0x"):
+                sb = int(sb_addr, 16)
+            else:
+                sb = int("0x" + sb_addr, 16)
+            visible_tmpfs_sbs.add(sb)
+    except Exception as e:
+        if debug:
+            print(f"[debug] Failed to parse mount output: {e}")
+
+    # Now walk super_blocks to find all tmpfs
+    try:
+        head = readSymbol("super_blocks")
+        offset = crash.member_offset("struct super_block", "s_list")
+        node = readSU("struct list_head", head)
+        ptr = node.next
+
+        while ptr and int(ptr) != int(head):
+            try:
+                sb_addr = int(ptr) - offset
+                sb = readSU("struct super_block", sb_addr)
+                sid = str(sb.s_id).strip('"')
+                if sid == "tmpfs":
+                    all_tmpfs_sbs.add(sb_addr)
+                    if debug and sb_addr not in visible_tmpfs_sbs:
+                        print(f"[debug] Internal tmpfs superblock at {hex(sb_addr)}")
+            except Exception as e:
+                if debug:
+                    print(f"[debug] Failed to parse super_block at {hex(int(ptr))}: {e}")
+            ptr = ptr.next
+    except Exception as e:
+        if debug:
+            print(f"[debug] Failed to iterate super_blocks list: {e}")
+
+    return list(all_tmpfs_sbs), list(visible_tmpfs_sbs)
+
+def get_tmpfs_memory_from_superblocks(debug=False):
+    total_pages = 0
+    visible_pages = 0
+
+    all_sbs, visible_sbs = get_tmpfs_superblocks(debug)
+
+    inode_offset = crash.member_offset("struct inode", "i_sb_list")
+    nrpages_offset = crash.member_offset("struct address_space", "nrpages")
+    i_data_offset = crash.member_offset("struct inode", "i_data")
+
+    for sb_addr in all_sbs:
+        try:
+            sb = readSU("struct super_block", sb_addr)
+            head = sb.s_inodes
+            inode = head.next
+
+            max_inodes = 100000
+            count = 0
+            sb_pages = 0
+
+            while inode and int(inode) != int(head) and count < max_inodes:
+                try:
+                    inode_addr = int(inode) - inode_offset
+                    i_data_addr = inode_addr + i_data_offset
+                    nrpages_addr = i_data_addr + nrpages_offset
+
+                    nrpages = readU64(nrpages_addr)
+                    sb_pages += nrpages
+                    count += 1
+                except Exception as e:
+                    if debug:
+                        print(f"[debug] Failed inode @ {hex(int(inode))}: {e}")
+                inode = inode.next
+
+            total_pages += sb_pages
+            if sb_addr in visible_sbs:
+                visible_pages += sb_pages
+
+            if count == max_inodes and debug:
+                print(f"[debug] inode loop exceeded max_inodes for sb {hex(sb_addr)}")
+
+        except Exception as e:
+            if debug:
+                print(f"[debug] Failed to process sb {hex(sb_addr)}: {e}")
+
+    return (
+        pages_to_kb(total_pages),
+        pages_to_kb(visible_pages),
+        pages_to_kb(total_pages - visible_pages)  # internal
+    )
+
+def get_sysv_shm_kb(debug=False):
+    try:
+        output = exec_crash_command("ipcs -M")
+    except Exception as e:
+        if debug:
+            print(f"[debug] ipcs -M failed: {e}")
+        return 0
+
+    total_pages = 0
+    for line in output.splitlines():
+        if "PAGES ALLOCATED" in line:
+            try:
+                part = line.split(":")[1]
+                allocated = int(part.strip().split("/")[0])
+                total_pages += allocated
+            except Exception as e:
+                if debug:
+                    print(f"[debug] Failed to parse ipc line: {line} ({e})")
+                continue
+
+    sysv_kb = pages_to_kb(total_pages)
+
+    # Subtract HugePages_Used if it appears to overlap
+    try:
+        _, huge_used_kb = get_hugepage_info(debug)
+        if huge_used_kb > 0:
+            sysv_kb = max(sysv_kb - huge_used_kb, 0)
+            if debug:
+                print(f"[debug] Adjusted sysv_kb by subtracting HugePages_Used: -{huge_used_kb} KiB")
+    except Exception as e:
+        if debug:
+            print(f"[debug] Failed to get hugepage info for SysV adjustment: {e}")
+
+    return sysv_kb
+
+def estimate_unique_shmem_kb(debug=False):
+    tmpfs_total_kb, _, _ = get_tmpfs_memory_from_superblocks(debug)  # use only total for shared total
+    sysv_kb = get_sysv_shm_kb(debug)
+    total_shared_kb = tmpfs_total_kb + sysv_kb
+    return total_shared_kb, tmpfs_total_kb, sysv_kb
+
+def get_buffers_kb_from_blockdev(debug=False):
+    total_pages = 0
+    try:
+        sb = readSymbol("blockdev_superblock")
+        sb = readSU("struct super_block", int(sb))
+        head = sb.s_inodes
+        inode = head.next
+        while inode and int(inode) != int(head):
+            try:
+                container_addr = int(inode) - crash.member_offset("struct inode", "i_sb_list")
+                container = readSU("struct inode", container_addr)
+                nrpages = int(container.i_data.nrpages)
+                total_pages += nrpages
+            except Exception as e:
+                if debug:
+                    print(f"[debug] Failed to read inode from {hex(int(inode))}: {e}")
+            inode = inode.next
+    except Exception as e:
+        if debug:
+            print(f"[debug] Failed to read blockdev_superblock: {e}")
+    return pages_to_kb(total_pages)
+
+def get_hugepage_info(debug=False):
+    output = exec_crash_command("kmem -h")
+    total_kb = 0
+    used_kb = 0
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or line.startswith("HSTATE"):
+            continue
+        parts = line.split()
+        try:
+            size_str = parts[1]      # e.g., 2MB, 1GB
+            free_pages = int(parts[2])
+            total_pages = int(parts[3])
+            used_pages = total_pages - free_pages
+
+            if size_str.lower().endswith("kb"):
+                size_kb = int(size_str[:-2])
+            elif size_str.lower().endswith("mb"):
+                size_kb = int(size_str[:-2]) * 1024
+            elif size_str.lower().endswith("gb"):
+                size_kb = int(size_str[:-2]) * 1024 * 1024
+            else:
+                if debug:
+                    print(f"[debug] Unknown hugepage size unit: {size_str}")
+                continue
+
+            total_kb += size_kb * total_pages
+            used_kb  += size_kb * used_pages
+        except Exception as e:
+            if debug:
+                print(f"[debug] Failed to parse line: {line} ({e})")
+    return total_kb, used_kb
+
+def get_swap_info(debug=False):
+    try:
+        total_addr = readSymbol("total_swap_pages")
+        total_pages = int(total_addr)
+        nr_swap = readSU("atomic_long_t", readSymbol("nr_swap_pages"))
+        free_pages = int(nr_swap.counter)
+        used = total_pages - free_pages
+        return pages_to_kb(total_pages), pages_to_kb(used)
+    except Exception as e:
+        if debug:
+            print(f"[debug] Failed to read swap info: {e}")
+        return 0, 0
+    except Exception as e:
+        if debug:
+            print(f"[debug] Failed to read swap info: {e}")
+        return 0, 0
+
 def get_vmalloc_memory_kb(debug=False):
     """
     Parse `kmem -v` output and sum the SIZE column (vmalloc/vmap allocations).
@@ -94,34 +307,6 @@ def get_total_memory_from_kmem_i():
                 except ValueError:
                     continue
     return 0
-
-def get_hugepage_memory_kb(debug=False):
-    output = exec_crash_command("kmem -h")
-    total_kb = 0
-    for line in output.splitlines():
-        line = line.strip()
-        if not line or line.startswith("HSTATE"):
-            continue
-        parts = line.split()
-        try:
-            # Format may be: HSTATE SIZE NODE TOTAL ...
-            size_str = parts[1]
-            total_pages = int(parts[3])
-            if size_str.lower().endswith("kb"):
-                size_kb = int(size_str[:-2])
-            elif size_str.lower().endswith("mb"):
-                size_kb = int(size_str[:-2]) * 1024
-            elif size_str.lower().endswith("gb"):
-                size_kb = int(size_str[:-2]) * 1024 * 1024
-            else:
-                if debug:
-                    print(f"[debug] Unknown hugepage size unit: {size_str}")
-                continue
-            total_kb += size_kb * total_pages
-        except (IndexError, ValueError):
-            if debug:
-                print(f"[debug] Failed to parse hugepage line: {line}")
-    return total_kb
 
 def get_percpu_memory_kb():
     try:
@@ -250,22 +435,23 @@ def print_top_processes(n=10, unit="K", debug=False):
               f"{scale(p['rss']):>12.2f} {scale(p['vsz']):>12.2f} {scale(p.get('shm',0)):>12.2f}  {p['comm']}")
 
 def normalize_stats(stats):
-
+    # NR_SLAB_RECLAIMABLE_B implies to contain bytes value but it contains pages in RHEL7+
+    # Compare 'NR_SLAB_RECLAIMABLE_B from kmem -V' and 'vm_node_stat[NR_SLAB_RECLAIMABLE_B]'
     if "NR_SLAB_RECLAIMABLE_B" not in stats and "NR_SLAB_RECLAIMABLE" in stats:
-        stats["NR_SLAB_RECLAIMABLE_B"] = stats["NR_SLAB_RECLAIMABLE"] * PAGE_SIZE
+        stats["NR_SLAB_RECLAIMABLE_B"] = stats["NR_SLAB_RECLAIMABLE"] # * PAGE_SIZE
 
     if "NR_SLAB_UNRECLAIMABLE_B" not in stats and "NR_SLAB_UNRECLAIMABLE" in stats:
-        stats["NR_SLAB_UNRECLAIMABLE_B"] = stats["NR_SLAB_UNRECLAIMABLE"] * PAGE_SIZE
+        stats["NR_SLAB_UNRECLAIMABLE_B"] = stats["NR_SLAB_UNRECLAIMABLE"] # * PAGE_SIZE
 
     if "NR_KERNEL_STACK_KB" not in stats and "NR_KERNEL_STACK" in stats:
-        stats["NR_KERNEL_STACK_KB"] = stats["NR_KERNEL_STACK"] * PAGE_SIZE // 1024
+        stats["NR_KERNEL_STACK_KB"] = stats["NR_KERNEL_STACK"] # * PAGE_SIZE // 1024
 
 def get_accounted_memory_kb(stats, hugepage_kb, percpu_kb):
     return sum([
         pages_to_kb(stats.get("NR_ACTIVE_ANON", 0)),
         pages_to_kb(stats.get("NR_INACTIVE_ANON", 0)),
-        bytes_to_kb(stats.get("NR_SLAB_RECLAIMABLE_B", 0)),
-        bytes_to_kb(stats.get("NR_SLAB_UNRECLAIMABLE_B", 0)),
+        pages_to_kb(stats.get("NR_SLAB_RECLAIMABLE_B", 0)),
+        pages_to_kb(stats.get("NR_SLAB_UNRECLAIMABLE_B", 0)),
         pages_to_kb(stats.get("NR_FREE_PAGES", 0)),
         pages_to_kb(stats.get("NR_FILE_PAGES", 0)),
         stats.get("NR_KERNEL_STACK_KB", 0),
@@ -285,11 +471,11 @@ def print_unaccounted_formula(stats, total_kb, hugepage_kb, percpu_kb, unit):
     fields = [
         ("Active Anon", kb(p("NR_ACTIVE_ANON"))),
         ("Inactive Anon", kb(p("NR_INACTIVE_ANON"))),
-        ("Slab Reclaimable", b(p("NR_SLAB_RECLAIMABLE_B"))),
-        ("Slab Unreclaimable", b(p("NR_SLAB_UNRECLAIMABLE_B"))),
+        ("Slab Reclaimable", kb(p("NR_SLAB_RECLAIMABLE_B"))),
+        ("Slab Unreclaimable", kb(p("NR_SLAB_UNRECLAIMABLE_B"))),
         ("Free", kb(p("NR_FREE_PAGES"))),
         ("PageCache", kb(p("NR_FILE_PAGES"))),
-        ("KernelStack", p("NR_KERNEL_STACK_KB")),
+        ("KernelStack", kp("NR_KERNEL_STACK_KB")),
         ("PageTables", kb(p("NR_PAGETABLE"))),
         ("SwapCache", kb(p("NR_SWAPCACHE"))),
         ("HugePages", hugepage_kb),
@@ -313,6 +499,64 @@ def print_unaccounted_formula(stats, total_kb, hugepage_kb, percpu_kb, unit):
     print(f"{'Unaccounted':<15}= {'Total Memory':<15}- " + " - ".join(name for name, _ in fields))
     print(f"{scale(unaccounted):<15.2f}= {scale(total_kb):<15.2f}- " + " - ".join(f"{scale(val):.2f}" for _, val in fields))
     print("Note: This excludes reserved, memmap, directmap, early bootmem, and other special pools.\n")
+
+def print_meminfo_style(stats, total_kb, hugepage_kb, percpu_kb, vmalloc_kb, unit, debug=False):
+    unit_label = f"{unit}iB"
+    scale = lambda val: scale_value(val, unit)
+
+    memfree = pages_to_kb(stats.get("NR_FREE_PAGES", 0))
+    active_anon = pages_to_kb(stats.get("NR_ACTIVE_ANON", 0))
+    inactive_anon = pages_to_kb(stats.get("NR_INACTIVE_ANON", 0))
+    anon_total = active_anon + inactive_anon
+    file_pages = pages_to_kb(stats.get("NR_FILE_PAGES", 0))
+    slab = pages_to_kb(stats.get("NR_SLAB_RECLAIMABLE_B", 0) + stats.get("NR_SLAB_UNRECLAIMABLE_B", 0))
+    kernel_stack = stats.get("NR_KERNEL_STACK_KB", 0)
+    pagetables = pages_to_kb(stats.get("NR_PAGETABLE", 0))
+    swapcache = pages_to_kb(stats.get("NR_SWAPCACHE", 0))
+
+    # Shmem Estimation
+    shmem_kb_real = pages_to_kb(stats.get("NR_SHMEM", 0))
+    shmem_kb, tmpfs_kb, sysv_kb = estimate_unique_shmem_kb(debug)
+    _, visible_tmpfs_kb, internal_tmpfs_kb = get_tmpfs_memory_from_superblocks(debug)
+    extra_kb = max(shmem_kb - shmem_kb_real, 0)
+
+    unaccounted = total_kb - get_accounted_memory_kb(stats, hugepage_kb, percpu_kb)
+
+    buffers_kb = get_buffers_kb_from_blockdev(debug=debug)
+    cached_kb = max(
+        pages_to_kb(stats.get("NR_FILE_PAGES", 0) - stats.get("NR_SWAPCACHE", 0)) - buffers_kb,
+        0
+    )
+    pagecache_kb = pages_to_kb(
+        stats.get("NLE", 0))
+    swapcache = pages_to_kb(stats.get("NR_SWAPCACHE", 0))
+
+    # Shmem Estimation
+    shmem_kb_real = pages_to_kb(stats.get("NR_SHMEM", 0))
+    shmem_kb, tmpfs_kb, sysv_kb = estimate_unique_shmem_kb(debug)
+    _, visible_tmpfs_kb, internal_tmpfs_kb = get_tmpfs_memory_from_superblocks(debug)
+    extra_kb = max(shmem_kb - shmem_kb_rea<30}{scale(memfree):>20.2f}")
+    print(f"{'Buffers':<30}{scale(buffers_kb):>20.2f}")  # Placeholder
+    print(f"{'Cached':<30}{scale(cached_kb):>20.2f}")
+    print(f"  {'pagecache':<28}{scale(file_pages):>20.2f}")
+    print(f"  {'Shmem':28}{scale(shmem_kb_real):>20.2f}  (extra={scale(extra_kb):.2f} GiB)")
+    print(f"    {'SysV (non-Hugetlb)':<26}{scale(sysv_kb):>20.2f}")
+    print(f"    {'tmpfs':<26}{scale(tmpfs_kb):>20.2f}  (internal: {scale(internal_tmpfs_kb):.2f} {unit_label})")
+    print(f"{'SwapCached':<30}{scale(swapcache):>20.2f}")
+    print(f"{'AnonPages':<30}{scale(anon_total):>20.2f}")
+    print(f"  {'Active(anon)':<28}{scale(active_anon):>20.2f}")
+    print(f"  {'Inactive(anon)':<28}{scale(inactive_anon):>20.2f}")
+    print(f"{'Slab':<30}{scale(slab):>20.2f}")
+    print(f"{'KernelStack':<30}{scale(kernel_stack):>20.2f}")
+    print(f"{'PageTables':<30}{scale(pagetables):>20.2f}")
+    print(f"{'Percpu':<30}{scale(percpu_kb):>20.2f}")
+    print(f"{'Vmalloc/Vmap':<30}{scale(vmalloc_kb):>20.2f}")
+    print(f"{'HugePages_Total':<30}{scale(huge_total_kb):>20.2f}")
+    print(f"{'HugePages_Used':<30}{scale(huge_used_kb):>20.2f}")  # Approx; you could refine this
+    print(f"{'SwapTotal':<30}{scale(swap_total_kb):>20.2f}")  # Placeholder for SwapTotal
+    print(f"{'SwapUsed':<30}{scale(swap_used_kb):>20.2f}")  # Placeholder
+    print("=" * 50)
+    print(f"{'Unaccounted:':<30}{scale(unaccounted):>20.2f}")
 
 def main():
     parser = argparse.ArgumentParser(description="Estimate unaccounted memory from VMcore.")
@@ -338,7 +582,7 @@ def main():
     unit = args.unit
 
     total_kb = get_total_memory_from_kmem_i()
-    hugepage_kb = get_hugepage_memory_kb(debug=args.debug)
+    hugepage_kb,_ = get_hugepage_info(debug=args.debug)
     percpu_kb = get_percpu_memory_kb()
     vmalloc_kb = get_vmalloc_memory_kb(debug=args.debug)
     stats["VMALLOC_KB"] = vmalloc_kb
@@ -349,30 +593,7 @@ def main():
     unit_label = f"{unit}iB"
 
     if args.info:
-        print(f"{'Category':<30}{f'Memory ({unit_label})':>20}")
-        print("-" * 50)
-        print(f"{'Total Memory':<30}{scale(total_kb):>20.2f}")
-        print(f"{'Active Anon':<30}{scale(pages_to_kb(stats.get('NR_ACTIVE_ANON', 0))):>20.2f}")
-        print(f"{'Inactive Anon':<30}{scale(pages_to_kb(stats.get('NR_INACTIVE_ANON', 0))):>20.2f}")
-        print(f"{'Slab Reclaimable':<30}{scale(bytes_to_kb(stats.get('NR_SLAB_RECLAIMABLE_B', 0))):>20.2f}")
-        print(f"{'Slab Unreclaimable':<30}{scale(bytes_to_kb(stats.get('NR_SLAB_UNRECLAIMABLE_B', 0))):>20.2f}")
-        print(f"{'Free Pages':<30}{scale(pages_to_kb(stats.get('NR_FREE_PAGES', 0))):>20.2f}")
-        print(f"{'Kernel Stacks':<30}{scale(stats.get('NR_KERNEL_STACK_KB', 0)):>20.2f}")
-        print(f"{'Page Tables':<30}{scale(pages_to_kb(stats.get('NR_PAGETABLE', 0))):>20.2f}")
-        print(f"{'Pagecache':<30}{scale(pages_to_kb(stats.get('NR_FILE_PAGES', 0))):>20.2f}")
-        print(f"{'Swap Cache':<30}{scale(pages_to_kb(stats.get('NR_SWAPCACHE', 0))):>20.2f}")
-        print(f"{'Hugepages':<30}{scale(hugepage_kb):>20.2f}")
-        print(f"{'Per-CPU Allocations':<30}{scale(percpu_kb):>20.2f}")
-        print(f"{'Vmalloc/Vmap':<30}{scale(vmalloc_kb):>20.2f}")
-        print("-" * 50)
-        print(f"{'Accounted Memory':<30}{scale(accounted_kb):>20.2f}")
-        unaccounted_pct = (unaccounted_kb / total_kb) * 100 if total_kb else 0
-        if unaccounted_pct > 10:
-            color_start = RED  # red
-            color_end = RESET
-        else:
-            color_start = color_end = ''
-        print(f"{'Unaccounted Memory':<30}{scale(unaccounted_kb):>20.2f} {color_start}(%{unaccounted_pct:.2f}){color_end}")
+        print_meminfo_style(stats, total_kb, hugepage_kb, percpu_kb, vmalloc_kb, unit, debug=args.debug)
 
     if args.debug:
         print("\n[debug] Parsed stats from 'kmem -V':")
