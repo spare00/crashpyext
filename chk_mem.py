@@ -533,13 +533,15 @@ def print_meminfo_style(stats, total_kb, hugepage_kb, percpu_kb, vmalloc_kb, uni
     huge_total_kb, huge_used_kb = get_hugepage_info(debug=debug)
     swap_total_kb, swap_used_kb = get_swap_info(debug=debug)
 
+    cached_pages = file_pages - sysv_kb
+
     print(f"{'Field':<30}{'Size (' + unit_label + ')':>20}")
     print("=" * 50)
     print(f"{'MemTotal:':<30}{scale(total_kb):>20.2f}")
     print(f"{'MemFree':<30}{scale(memfree):>20.2f}")
     print(f"{'Buffers':<30}{scale(buffers_kb):>20.2f}")  # Placeholder
     print(f"{'Cached':<30}{scale(cached_kb):>20.2f}")
-    print(f"  {'pagecache':<28}{scale(file_pages):>20.2f}")
+    print(f"  {'pagecache':<28}{scale(cached_pages):>20.2f}")
     print(f"  {'Shmem':28}{scale(shmem_kb_real):>20.2f}  (extra={scale(extra_kb):.2f} GiB)")
     print(f"    {'SysV (non-Hugetlb)':<26}{scale(sysv_kb):>20.2f}")
     print(f"    {'tmpfs':<26}{scale(tmpfs_kb):>20.2f}  (internal: {scale(internal_tmpfs_kb):.2f} {unit_label})")
