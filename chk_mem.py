@@ -9,6 +9,8 @@ Includes hugepages, percpu memory, and meminfo-style output.
 import argparse
 from pykdump.API import *
 
+from collections import defaultdict
+
 # ANSI color codes
 RED     = '\033[91m'
 RESET   = '\033[0m'
@@ -412,10 +414,10 @@ def get_top_processes(n=10, debug=False):
     for p in top:
         p["shm"] = get_process_shmem_kb(p["task"], debug)
 
-    return top
+    return top, procs
 
 def print_top_processes(n=10, unit="K", debug=False):
-    top = get_top_processes(n, debug)
+    top, all_procs = get_top_processes(n, debug)
     if not top:
         print("No process data available.")
         return
@@ -433,6 +435,15 @@ def print_top_processes(n=10, unit="K", debug=False):
     for p in top:
         print(f"{p['pid']:>8} {p['ppid']:>8} {p['cpu']:>4} "
               f"{scale(p['rss']):>12.2f} {scale(p['vsz']):>12.2f} {scale(p.get('shm',0)):>12.2f}  {p['comm']}")
+
+    # Global totals (ALL processes)
+    total_rss = sum(p["rss"] for p in all_procs)      # instead of top
+    total_vsz = sum(p["vsz"] for p in all_procs)
+    total_shm = sum(p.get("shm", 0) for p in all_procs)
+
+    print("-" * 80)
+    print(f"{'TOTAL (all processes)':>22} "
+          f"{scale(total_rss):>12.2f} {scale(total_vsz):>12.2f} {scale(total_shm):>12.2f}")
 
 def normalize_stats(stats):
     # NR_SLAB_RECLAIMABLE_B implies to contain bytes value but it contains pages in RHEL7+
@@ -561,6 +572,66 @@ def print_meminfo_style(stats, total_kb, hugepage_kb, percpu_kb, vmalloc_kb, uni
     print("=" * 50)
     print(f"{'Unaccounted:':<30}{scale(unaccounted):>20.2f}")
 
+def print_command_memory_usage(unit="G", debug=False, top_n=10):
+    try:
+        output = exec_crash_command("ps -G")
+    except Exception as e:
+        if debug:
+            print(f"[debug] Failed to run ps -G: {e}")
+        return
+
+    command_map = defaultdict(lambda: {"rss": 0, "vsz": 0, "shm": 0, "count": 0})
+
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or line.startswith("PID"):
+            continue
+
+        if line.startswith(">"):
+            line = line[1:].strip()
+
+        parts = line.split()
+        if len(parts) < 9:
+            continue
+
+        try:
+            task_addr = parts[3]
+            rss = int(parts[7])
+            vsz = int(parts[6])
+            comm = " ".join(parts[8:])
+            shm = get_process_shmem_kb(task_addr, debug=debug)
+
+            entry = command_map[comm]
+            entry["rss"] += rss
+            entry["vsz"] += vsz
+            entry["shm"] += shm
+            entry["count"] += 1
+        except Exception as e:
+            if debug:
+                print(f"[debug] Failed to parse line: {line} ({e})")
+            continue
+
+    def scale(val): return scale_value(val, unit)
+    unit_label = f"{unit}iB"
+
+    print(f"\nTop {top_n} commands by total RSS (unit: {unit_label}):")
+    print(f"{'Count':>8}{'RSS':>15}{'VSZ':>15}{'SHM':>15}  {'COMMAND'}")
+    print("-" * 83)
+
+    sorted_cmds = sorted(command_map.items(), key=lambda x: x[1]["rss"], reverse=True)[:top_n]
+    for comm, data in sorted_cmds:
+        print(f"{data['count']:>8}{scale(data['rss']):>15.2f}"
+              f"{scale(data['vsz']):>15.2f}{scale(data['shm']):>15.2f}  {comm}")
+
+    # TOTAL of ALL commands, not only top 10 shown
+    total_rss = sum(data["rss"] for data in command_map.values())
+    total_vsz = sum(data["vsz"] for data in command_map.values())
+    total_shm = sum(data["shm"] for data in command_map.values())
+    total_count = sum(data["count"] for data in command_map.values())
+
+    print("-" * 83)
+    print(f"{total_count:>8}{scale(total_rss):>15.2f}{scale(total_vsz):>15.2f}{scale(total_shm):>15.2f}  TOTAL (all processes)")
+
 def main():
     parser = argparse.ArgumentParser(description="Estimate unaccounted memory from VMcore.")
     parser = argparse.ArgumentParser(description="Estimate unaccounted memory from VMcore.")
@@ -568,6 +639,8 @@ def main():
                         help="Show summarized usage breakdown (default view if no option is given)")
     parser.add_argument("-p", "--processes", action="store_true",
                         help="Show top 10 processes by RSS (like ps | sort -nrk8 | head)")
+    parser.add_argument("-c", "--commands", action="store_true",
+                        help="Show aggregated memory usage per command (like ps | awk '{arr[$11]+=$6} END {for (c in arr) print c, arr[c]}')")
     parser.add_argument("-v", "--verbose", action="store_true", help="Show all parsed entries and meminfo-like summary")
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
     parser.add_argument("-K", action="store_const", dest="unit", const="K", help="Show memory in KiB")
@@ -577,7 +650,7 @@ def main():
     args = parser.parse_args()
 
     # If no primary view option was chosen, default to -i
-    if not any([args.info, args.processes]):
+    if not any([args.info, args.processes, args.commands]):
         args.info = True
 
     stats = parse_kmem_V(debug=args.debug)
@@ -608,6 +681,9 @@ def main():
 
     if args.processes:
         print_top_processes(10, unit=args.unit, debug=args.debug)
+
+    if args.commands:
+        print_command_memory_usage(unit=args.unit, debug=args.debug, top_n=10)
 
 if __name__ == "__main__":
     main()
