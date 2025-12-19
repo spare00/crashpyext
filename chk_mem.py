@@ -544,7 +544,7 @@ def print_meminfo_style(stats, total_kb, hugepage_kb, percpu_kb, vmalloc_kb, uni
     huge_total_kb, huge_used_kb = get_hugepage_info(debug=debug)
     swap_total_kb, swap_used_kb = get_swap_info(debug=debug)
 
-    cached_pages = file_pages - sysv_kb
+    cached_pages = cached_kb - sysv_kb - tmpfs_kb
 
     print(f"{'Field':<30}{'Size (' + unit_label + ')':>20}")
     print("=" * 50)
