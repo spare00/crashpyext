@@ -47,7 +47,6 @@ def get_rhel_version():
                     pass
             break
 
-    print(f"Detected RHEL Version: {RHEL_VERSION} (Kernel: {kernel_version})")
     return RHEL_VERSION
 
 def _build_sched_classes():
