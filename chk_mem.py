@@ -17,6 +17,89 @@ RESET   = '\033[0m'
 
 PAGE_SIZE = 4096  # 4 KiB
 
+def get_slab_usage(debug=False, top_n=10):
+    try:
+        output = exec_crash_command("kmem -s")
+    except Exception as e:
+        if debug:
+            print(f"[debug] kmem -s failed: {e}")
+        return [], 0
+
+    slabs = []
+    total_kb = 0
+
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or line.startswith("CACHE"):
+            continue
+
+        parts = line.split()
+        if len(parts) < 7:
+            continue
+
+        try:
+            # 오른쪽 기준 파싱 (안정)
+            name      = parts[-1]
+            ssize_str = parts[-2]   # 4k / 8k / 16k / 32k
+            slabs_cnt = int(parts[-3])
+            total_obj = int(parts[-4])
+            allocated = int(parts[-5])
+            objsize   = int(parts[-6])
+
+            if not ssize_str.lower().endswith("k"):
+                continue
+
+            slab_kb = int(ssize_str[:-1])
+            mem_kb = slabs_cnt * slab_kb
+            total_kb += mem_kb
+
+            slabs.append({
+                "cache": name,
+                "objsize": objsize,
+                "allocated": allocated,
+                "total": total_obj,
+                "slabs": slabs_cnt,
+                "slab_kb": slab_kb,
+                "mem_kb": mem_kb,
+            })
+
+        except Exception as e:
+            if debug:
+                print(f"[debug] slab parse failed: {line} ({e})")
+
+    slabs.sort(key=lambda x: x["mem_kb"], reverse=True)
+    return slabs[:top_n], total_kb
+
+def print_slab_usage(unit="G", debug=False, top_n=10):
+    slabs, total_kb = get_slab_usage(debug=debug, top_n=top_n)
+    if not slabs:
+        print("No slab data available.")
+        return
+
+    scale = lambda v: scale_value(v, unit)
+    unit_label = f"{unit}iB"
+
+    print(f"\nTop {top_n} slab caches by memory usage (unit: {unit_label}):")
+    print(f"{'SLABS':>10}"
+          f"{'OBJSIZE':>12}"
+          f"{'ALLOC':>12}"
+          f"{'TOTAL':>12}"
+          f"{'SSIZE':>10}"
+          f"{'MEM':>12}  CACHE")
+
+    print("-" * 90)
+
+    for s in slabs:
+        print(f"{s['slabs']:>10}"
+              f"{s['objsize']:>12}"
+              f"{s['allocated']:>12}"
+              f"{s['total']:>12}"
+              f"{s['slab_kb']:>10}"
+              f"{scale(s['mem_kb']):>12.2f}  {s['cache']}")
+
+    print("-" * 90)
+    print(f"{'TOTAL SLAB MEMORY':>42}{scale(total_kb):>12.2f} {unit_label}")
+
 def get_tmpfs_superblocks(debug=False):
     all_tmpfs_sbs = set()
     visible_tmpfs_sbs = set()
@@ -633,57 +716,85 @@ def print_command_memory_usage(unit="G", debug=False, top_n=10):
     print(f"{total_count:>8}{scale(total_rss):>15.2f}{scale(total_vsz):>15.2f}{scale(total_shm):>15.2f}  TOTAL (all processes)")
 
 def main():
-    parser = argparse.ArgumentParser(description="Estimate unaccounted memory from VMcore.")
-    parser = argparse.ArgumentParser(description="Estimate unaccounted memory from VMcore.")
-    parser.add_argument("-i", "--info", action="store_true",
-                        help="Show summarized usage breakdown (default view if no option is given)")
-    parser.add_argument("-p", "--processes", action="store_true",
-                        help="Show top 10 processes by RSS (like ps | sort -nrk8 | head)")
-    parser.add_argument("-c", "--commands", action="store_true",
-                        help="Show aggregated memory usage per command (like ps | awk '{arr[$11]+=$6} END {for (c in arr) print c, arr[c]}')")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Show all parsed entries and meminfo-like summary")
-    parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
+
+    parser = argparse.ArgumentParser(
+        description="Estimate unaccounted memory from VMcore."
+    )
+
+    group = parser.add_mutually_exclusive_group()
+
+    group.add_argument("-i", "--info", action="store_true",
+                       help="Show summarized usage breakdown (default)")
+    group.add_argument("-p", "--processes", action="store_true",
+                       help="Show top 10 processes by RSS (like ps | sort -nrk8 | head)")
+    group.add_argument("-c", "--commands", action="store_true",
+                       help="Show aggregated memory usage per command")
+    group.add_argument("-s", "--slab", action="store_true",
+                       help="Show slab cache memory usage (from kmem -s)")
+
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("-d", "--debug", action="store_true")
     parser.add_argument("-K", action="store_const", dest="unit", const="K", help="Show memory in KiB")
     parser.add_argument("-M", action="store_const", dest="unit", const="M", help="Show memory in MiB")
     parser.add_argument("-G", action="store_const", dest="unit", const="G", help="Show memory in GiB")
     parser.set_defaults(unit="G")
+
     args = parser.parse_args()
-
-    # If no primary view option was chosen, default to -i
-    if not any([args.info, args.processes, args.commands]):
-        args.info = True
-
-    stats = parse_kmem_V(debug=args.debug)
-    normalize_stats(stats)
     unit = args.unit
 
+    # default = -i
+    if not any([args.info, args.processes, args.commands, args.slab]):
+        args.info = True
+
+    # ----------------------
+    # -p : processes only
+    # ----------------------
+    if args.processes:
+        print_top_processes(10, unit=unit, debug=args.debug)
+        return
+
+    # ----------------------
+    # -c : commands only
+    # ----------------------
+    if args.commands:
+        print_command_memory_usage(unit=unit, debug=args.debug, top_n=10)
+        return
+
+    # ----------------------
+    # -s : slab only
+    # ----------------------
+    if args.slab:
+        print_slab_usage(unit=unit, debug=args.debug, top_n=10)
+        return
+
+    # ----------------------
+    # -i / -v : full memory accounting
+    # ----------------------
+    stats = parse_kmem_V(debug=args.debug)
+    normalize_stats(stats)
+
     total_kb = get_total_memory_from_kmem_i()
-    hugepage_kb,_ = get_hugepage_info(debug=args.debug)
+    hugepage_kb, _ = get_hugepage_info(debug=args.debug)
     percpu_kb = get_percpu_memory_kb()
     vmalloc_kb = get_vmalloc_memory_kb(debug=args.debug)
     stats["VMALLOC_KB"] = vmalloc_kb
 
-    accounted_kb = get_accounted_memory_kb(stats, hugepage_kb, percpu_kb)
-    unaccounted_kb = total_kb - accounted_kb
-    scale = lambda val: scale_value(val, unit)
-    unit_label = f"{unit}iB"
-
     if args.info:
-        print_meminfo_style(stats, total_kb, hugepage_kb, percpu_kb, vmalloc_kb, unit, debug=args.debug)
+        print_meminfo_style(
+            stats, total_kb, hugepage_kb,
+            percpu_kb, vmalloc_kb,
+            unit, debug=args.debug
+        )
+
+    if args.verbose:
+        print_unaccounted_formula(
+            stats, total_kb, hugepage_kb, percpu_kb, unit
+        )
 
     if args.debug:
         print("\n[debug] Parsed stats from 'kmem -V':")
         for k in sorted(stats):
             print(f"{k:<35}{stats[k]}")
-
-    if args.verbose and args.info:
-        print_unaccounted_formula(stats, total_kb, hugepage_kb, percpu_kb, unit)
-
-    if args.processes:
-        print_top_processes(10, unit=args.unit, debug=args.debug)
-
-    if args.commands:
-        print_command_memory_usage(unit=args.unit, debug=args.debug, top_n=10)
 
 if __name__ == "__main__":
     main()
