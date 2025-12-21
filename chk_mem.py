@@ -82,23 +82,19 @@ def print_slab_usage(unit="G", debug=False, top_n=10):
     print(f"\nTop {top_n} slab caches by memory usage (unit: {unit_label}):")
     print(f"{'SLABS':>10}"
           f"{'OBJSIZE':>12}"
-          f"{'ALLOC':>12}"
-          f"{'TOTAL':>12}"
           f"{'SSIZE':>10}"
           f"{'MEM':>12}  CACHE")
 
-    print("-" * 90)
+    print("-" * 70)
 
     for s in slabs:
         print(f"{s['slabs']:>10}"
               f"{s['objsize']:>12}"
-              f"{s['allocated']:>12}"
-              f"{s['total']:>12}"
               f"{s['slab_kb']:>10}"
               f"{scale(s['mem_kb']):>12.2f}  {s['cache']}")
 
-    print("-" * 90)
-    print(f"{'TOTAL SLAB MEMORY':>42}{scale(total_kb):>12.2f} {unit_label}")
+    print("-" * 70)
+    print(f"{'TOTAL SLAB MEMORY':>32}{scale(total_kb):>12.2f} {unit_label}")
 
 def get_tmpfs_superblocks(debug=False):
     all_tmpfs_sbs = set()
