@@ -331,7 +331,7 @@ def show_info():
     - RCU defers freeing or modifying data until the grace period ends to ensure all pre-existing readers are done.
 
 🛑 Quiescent State (QS):
-    - A state in which a CPU is guaranteed not to be accessing any RCU-protected data.
+    - A state in which a CPU is guaranteed to have exited any RCU read-side critical sections that began before this point
     - Typical quiescent states include:
         - Returning to user space
         - Going idle
