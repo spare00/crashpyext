@@ -189,7 +189,7 @@ def get_per_cpu_rcu_data(rcu_ctx, rhel_version, hz, verbose=False, debug=False, 
         print(f"⏱️ Now jiffies: {jiffies_now}   Stall deadline: {jiffies_stall}   Δ(now→stall): {until_stall} j")
 
     print("\n=== Per-CPU RCU Status ===")
-    print(f"{'CPU':<5} {'GP-Seq':<18} {'Awaiting-QS':<12} {'GP-State':<10} {'Since-GP-Start':<20}")
+    print(f"{'CPU':<5} {'GP-Seq':<18} {'QS-Reported':<12} {'GP-State':<10} {'Since-GP-Start':<20}")
 
     any_qs_pending = False
     qs_pending_cpus = set()
@@ -435,7 +435,7 @@ def main():
             pending = sorted(per_cpu.get("qs_pending_cpus", []))
             overlap = sorted(set(pending).intersection(stall["cpus"]))
             print("\n=== Correlation ===")
-            print(f"Currently Awaiting-QS CPUs: {_format_cpu_list(pending)}")
+            print(f"Currently QS-Reported CPUs: {_format_cpu_list(pending)}")
             print(f"Overlap with last-stall CPUs: {_format_cpu_list(overlap)}")
 
     if args.verbose:
