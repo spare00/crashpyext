@@ -375,7 +375,6 @@ def show_info():
                               v
                  [Deferred callbacks executed 🧹]
 
-Tip: Use '-v' to see raw structure contents for advanced debugging.
 """)
 
 def main():
