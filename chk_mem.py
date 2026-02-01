@@ -209,8 +209,8 @@ def get_sysv_shm_kb(debug=False):
         if "PAGES ALLOCATED" in line:
             try:
                 part = line.split(":")[1]
-                allocated = int(part.strip().split("/")[0])
-                total_pages += allocated
+                resident = int(part.strip().split("/")[1])
+                total_pages += resident
             except Exception as e:
                 if debug:
                     print(f"[debug] Failed to parse ipc line: {line} ({e})")
@@ -536,20 +536,31 @@ def normalize_stats(stats):
     if "NR_KERNEL_STACK_KB" not in stats and "NR_KERNEL_STACK" in stats:
         stats["NR_KERNEL_STACK_KB"] = stats["NR_KERNEL_STACK"] # * PAGE_SIZE // 1024
 
-def get_accounted_memory_kb(stats, hugepage_kb, percpu_kb):
+def get_accounted_memory_kb(stats, hugepage_kb, percpu_kb, vmalloc_kb):
+    anon_kb = pages_to_kb(
+        stats.get("NR_ACTIVE_ANON", 0) +
+        stats.get("NR_INACTIVE_ANON", 0) -
+        stats.get("NR_SHMEM", 0)
+    )
+
+    file_kb = pages_to_kb(stats.get("NR_FILE_PAGES", 0))
+
+    slab_kb = pages_to_kb(
+        stats.get("NR_SLAB_RECLAIMABLE_B", 0) +
+        stats.get("NR_SLAB_UNRECLAIMABLE_B", 0)
+    )
+
     return sum([
-        pages_to_kb(stats.get("NR_ACTIVE_ANON", 0)),
-        pages_to_kb(stats.get("NR_INACTIVE_ANON", 0)),
-        pages_to_kb(stats.get("NR_SLAB_RECLAIMABLE_B", 0)),
-        pages_to_kb(stats.get("NR_SLAB_UNRECLAIMABLE_B", 0)),
+        anon_kb,
+        file_kb,
         pages_to_kb(stats.get("NR_FREE_PAGES", 0)),
-        pages_to_kb(stats.get("NR_FILE_PAGES", 0)),
+        slab_kb,
         pages_to_kb(stats.get("NR_KERNEL_STACK_KB", 0)),
         pages_to_kb(stats.get("NR_PAGETABLE", 0)),
-        pages_to_kb(stats.get("NR_SWAPCACHE", 0)),
+        pages_to_kb(stats.get("NR_SWAPCACHE", 0)),  # swapcache는 file/anon과 중복 안 됨
         hugepage_kb,
         percpu_kb,
-        #stats.get("VMALLOC_KB", 0)
+        # vmalloc_kb,
     ])
 
 def print_unaccounted_formula(stats, total_kb, hugepage_kb, percpu_kb, unit):
@@ -610,8 +621,6 @@ def print_meminfo_style(stats, total_kb, hugepage_kb, percpu_kb, vmalloc_kb, uni
     _, visible_tmpfs_kb, internal_tmpfs_kb = get_tmpfs_memory_from_superblocks(debug)
     extra_kb = max(shmem_kb - shmem_kb_real, 0)
 
-    unaccounted = total_kb - get_accounted_memory_kb(stats, hugepage_kb, percpu_kb)
-
     buffers_kb = get_buffers_kb_from_blockdev(debug=debug)
     cached_kb = max(
         pages_to_kb(stats.get("NR_FILE_PAGES", 0) - stats.get("NR_SWAPCACHE", 0)) - buffers_kb,
@@ -623,7 +632,11 @@ def print_meminfo_style(stats, total_kb, hugepage_kb, percpu_kb, vmalloc_kb, uni
     huge_total_kb, huge_used_kb = get_hugepage_info(debug=debug)
     swap_total_kb, swap_used_kb = get_swap_info(debug=debug)
 
-    cached_pages = cached_kb - sysv_kb - tmpfs_kb
+    cached_pages = cached_kb - shmem_kb_real
+
+    unaccounted = total_kb - get_accounted_memory_kb(
+        stats, hugepage_kb, percpu_kb, vmalloc_kb
+    )
 
     print(f"{'Field':<30}{'Size (' + unit_label + ')':>20}")
     print("=" * 50)
@@ -631,10 +644,12 @@ def print_meminfo_style(stats, total_kb, hugepage_kb, percpu_kb, vmalloc_kb, uni
     print(f"{'MemFree':<30}{scale(memfree):>20.2f}")
     print(f"{'Buffers':<30}{scale(buffers_kb):>20.2f}")  # Placeholder
     print(f"{'Cached':<30}{scale(cached_kb):>20.2f}")
-    print(f"  {'pagecache':<28}{scale(cached_pages):>20.2f}")
+    print(f"  {'pagecache(estimated)':<28}{scale(cached_pages):>20.2f}")
     print(f"  {'Shmem':28}{scale(shmem_kb_real):>20.2f}  (extra={scale(extra_kb):.2f} GiB)")
     print(f"    {'SysV (non-Hugetlb)':<26}{scale(sysv_kb):>20.2f}")
-    print(f"    {'tmpfs':<26}{scale(tmpfs_kb):>20.2f}  (internal: {scale(internal_tmpfs_kb):.2f} {unit_label})")
+    print(f"    {'tmpfs':<26}{scale(tmpfs_kb):>20.2f}")
+    print(f"      {'visible tmpfs':<24}{scale(visible_tmpfs_kb):>20.2f}")
+    print(f"      {'internal tmpfs':<24}{scale(internal_tmpfs_kb):>20.2f}  {'(including SysV:':<18}{scale(sysv_kb):>0.2f})")
     print(f"{'SwapCached':<30}{scale(swapcache):>20.2f}")
     print(f"{'AnonPages':<30}{scale(anon_total):>20.2f}")
     print(f"  {'Active(anon)':<28}{scale(active_anon):>20.2f}")
@@ -794,4 +809,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
