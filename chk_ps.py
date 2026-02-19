@@ -90,13 +90,18 @@ def get_sched_class(task):
 
 def get_state(task):
     try:
-        if HAS_TASK_STATE:
-            return int(task.state)
         if HAS_TASK___STATE:
             return int(task.__state)
+        if HAS_TASK_STATE:
+            return int(task.state)
+
+        # fallback brute-force
+        try:
+            return int(getattr(task, "__state"))
+        except:
+            return int(getattr(task, "state"))
     except Exception:
-        pass
-    return 0
+        return 0
 
 HAS_TASK_STATE = False
 HAS_TASK___STATE = False
@@ -218,70 +223,24 @@ def get_state_name(state):
         return "UNKNOWN"
 
 def get_ps_code(task, debug=False):
-    """
-    ps-like state code. On this RHEL7 build, crash treats TASK_DEAD (0x40)
-    with any non-zero exit_state as ZO. Keep that behavior here.
-    """
-    try:
-        es = None
-        try:
-            exit_state = int(getattr(task, 'exit_state', 0))
-        except Exception:
-            try:
-                es = getattr(task, 'exit_state', 0)
-                exit_state = int(getattr(es, 'value', 0))
-            except Exception:
-                try:
-                    # only attempt if es was set successfully
-                    if es is not None:
-                        exit_state = int(str(es), 0)
-                    else:
-                        exit_state = 0
-                except Exception:
-                    exit_state = 0
+    state = get_state(task)
+    exit_state = int(getattr(task, "exit_state", 0))
 
-        state = int(get_state(task))
+    if exit_state & 0x20:
+        return "ZO"
+    if exit_state & 0x10:
+        return "DE"
 
-        # Match crash behavior seen in your dump:
-        # TASK_DEAD + any exit_state => ZO
-        if (state & 0x40):  # TASK_DEAD
-            if exit_state != 0:
-                if debug: print(f"[DEBUG] classify ZO: state=0x{state:x} exit_state=0x{exit_state:x}")
-                return "ZO"
-            else:
-                # Rare, but keep DE fallback if TASK_DEAD with no exit_state
-                if debug: print(f"[DEBUG] classify DE: state=0x{state:x} exit_state=0x{exit_state:x}")
-                return "DE"
+    if state == 0:
+        return "RU"
 
-        # Remaining mappings (same as before)
-        if exit_state & 0x20:   # EXIT_ZOMBIE (classic)
-            return "ZO"
-        if exit_state & 0x10:   # EXIT_DEAD
-            return "DE"
-        if state == 0x0000:
-            return "RU"
-        if state == 0x0402:
-            return "ID"
-        if state & 0x0001:
-            return "IN"
-        if state & 0x0002:
-            return "UN"
-        if state & 0x0004:
-            return "ST"
-        if state & 0x0008:
-            return "TR"
-        if state & 0x0200:
-            return "WA"
-        if state & 0x0040:
-            # If we ever get here (no exit_state), treat as DE
-            return "DE"
+    if state & 0x2:
+        return "UN"
 
-        if not getattr(task, 'mm', None):
-            return "ID"
+    if state & 0x1:
+        return "IN"
 
-        return "NE"
-    except Exception:
-        return "NE"
+    return "NE"
 
 def parse_bt_output(bt_output, max_depth=5):
     """
