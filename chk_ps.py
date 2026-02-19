@@ -90,11 +90,30 @@ def get_sched_class(task):
 
 def get_state(task):
     try:
-        if RHEL_VERSION == 7:
-            return task.state
-        return task.__state
+        if HAS_TASK_STATE:
+            return int(task.state)
+        if HAS_TASK___STATE:
+            return int(task.__state)
     except Exception:
-        return -1
+        pass
+    return 0
+
+HAS_TASK_STATE = False
+HAS_TASK___STATE = False
+
+def _detect_state_member():
+    global HAS_TASK_STATE, HAS_TASK___STATE
+    try:
+        crash.member_offset("struct task_struct", "state")
+        HAS_TASK_STATE = True
+    except:
+        pass
+
+    try:
+        crash.member_offset("struct task_struct", "__state")
+        HAS_TASK___STATE = True
+    except:
+        pass
 
 # Detect available members only once
 HAS_TASK_CPU   = False
@@ -584,6 +603,7 @@ def main():
     # Initialize kernel/RHEL detection first
     get_rhel_version()
     _detect_cpu_members()
+    _detect_state_member()
     # make list guard configurable
     global LIST_MAXEL
     LIST_MAXEL = max(10000, int(args.maxel))
