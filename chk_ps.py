@@ -226,18 +226,27 @@ def get_ps_code(task, debug=False):
     state = get_state(task)
     exit_state = int(getattr(task, "exit_state", 0))
 
+    TASK_IDLE = 0x0400
+    TASK_UNINTERRUPTIBLE = 0x0002
+    TASK_INTERRUPTIBLE = 0x0001
+
     if exit_state & 0x20:
         return "ZO"
+
     if exit_state & 0x10:
         return "DE"
 
     if state == 0:
         return "RU"
 
-    if state & 0x2:
+    # MUST check ID before UN
+    if state & TASK_IDLE:
+        return "ID"
+
+    if state & TASK_UNINTERRUPTIBLE:
         return "UN"
 
-    if state & 0x1:
+    if state & TASK_INTERRUPTIBLE:
         return "IN"
 
     return "NE"
