@@ -108,15 +108,18 @@ HAS_TASK___STATE = False
 
 def _detect_state_member():
     global HAS_TASK_STATE, HAS_TASK___STATE
+
     try:
-        crash.member_offset("struct task_struct", "state")
-        HAS_TASK_STATE = True
+        off = crash.member_offset("struct task_struct", "state")
+        if off >= 0:
+            HAS_TASK_STATE = True
     except:
         pass
 
     try:
-        crash.member_offset("struct task_struct", "__state")
-        HAS_TASK___STATE = True
+        off = crash.member_offset("struct task_struct", "__state")
+        if off >= 0:
+            HAS_TASK___STATE = True
     except:
         pass
 
@@ -226,26 +229,58 @@ def get_ps_code(task, debug=False):
     state = get_state(task)
     exit_state = int(getattr(task, "exit_state", 0))
 
-    TASK_IDLE = 0x0400
-    TASK_UNINTERRUPTIBLE = 0x0002
     TASK_INTERRUPTIBLE = 0x0001
+    TASK_UNINTERRUPTIBLE = 0x0002
+    __TASK_STOPPED = 0x0004
+    __TASK_TRACED = 0x0008
 
-    if exit_state & 0x20:
+    EXIT_DEAD = 0x0010
+    EXIT_ZOMBIE = 0x0020
+
+    TASK_PARKED = 0x0040
+    TASK_WAKING = 0x0200
+    TASK_NOLOAD = 0x0400
+
+    TASK_IDLE = TASK_UNINTERRUPTIBLE | TASK_NOLOAD
+
+    if debug:
+        print(f"[DEBUG] pid={task.pid} comm={task.comm} state=0x{state:x} exit_state=0x{exit_state:x}")
+
+    # exit states
+    if exit_state & EXIT_ZOMBIE:
         return "ZO"
 
-    if exit_state & 0x10:
+    if exit_state & EXIT_DEAD:
         return "DE"
 
+    # stopped / traced
+    if state & __TASK_STOPPED:
+        return "ST"
+
+    if state & __TASK_TRACED:
+        return "TR"
+
+    # parked
+    if state & TASK_PARKED:
+        return "PA"
+
+    # running
     if state == 0:
         return "RU"
 
-    # MUST check ID before UN
-    if state & TASK_IDLE:
+    # idle (TASK_UNINTERRUPTIBLE | TASK_NOLOAD)
+    if (state & TASK_IDLE) == TASK_IDLE:
         return "ID"
 
+    # waking
+    if state & TASK_WAKING:
+        return "WA"
+
+    # uninterruptible sleep
     if state & TASK_UNINTERRUPTIBLE:
         return "UN"
 
+    # interruptible sleep
     if state & TASK_INTERRUPTIBLE:
         return "IN"
 
@@ -414,8 +449,19 @@ def walk_task_list(filter_code=None, only_active=False, debug=False, collect_bt=
             return
 
         if filter_code and ps_code != filter_code:
+            if debug:
+                print(
+                    f"[DEBUG] Skipping task {comm} (pid={pid}, state={state_val}, task.state={task.state}) "
+                    f"ps_code={ps_code} does not match filter_code={filter_code}"
+                )
             return
+
         if only_active and (ps_code != "RU" or on_cpu != 1):
+            if debug:
+                print(
+                    f"[DEBUG] Skipping task {comm} (pid={pid}) "
+                    f"only_active filter failed: ps_code={ps_code}, on_cpu={on_cpu}"
+                )
             return
 
         if debug:
