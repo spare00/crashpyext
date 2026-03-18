@@ -179,13 +179,36 @@ def get_owner_info(owner_flag_masked):
         return hex(owner_flag_masked)
 
 def get_reader_count(count_raw, is_readfail_reliable):
-    reader_count = 0
-    if is_readfail_reliable:
-        reader_count = (count_raw - (count_raw & 0xFF)) >> 8
-    else:
-        reader_count = (-count_raw + (count_raw & 0xFF)) >> 8
+    """
+    Correctly extract reader count from rwsem.count using bitfields.
+    This fixes negative reader count issues.
+    """
+    bitwise_count = count_raw & 0xFFFFFFFFFFFFFFFF
 
-    logging(f"get_reader_count(): count: {count_raw}, is_readfail_reliable: {is_readfail_reliable}, readers: {reader_count}")
+    # Extract bits 8–62 (reader count)
+    reader_count = (bitwise_count >> 8) & ((1 << (63 - 8)) - 1)
+
+    logging(f"get_reader_count(): count: {count_raw}, readers: {reader_count}")
+    return reader_count
+
+def get_reader_count(count_raw, is_readfail_reliable):
+    """
+    Extract reader count correctly while respecting READFAIL semantics.
+    """
+
+    bitwise_count = count_raw & 0xFFFFFFFFFFFFFFFF
+
+    # Extract raw reader bits (always correct encoding)
+    reader_count = (bitwise_count >> 8) & ((1 << (63 - 8)) - 1)
+
+    # Handle READFAIL interpretation
+    if is_readfail_reliable:
+        # READFAIL means reader acquisition failed → not active readers
+        if bitwise_count & RWSEM_FLAG_READFAIL:
+            logging("READFAIL set: treating reader count as 0 (no active readers)")
+            return 0
+
+    logging(f"get_reader_count(): count: {count_raw}, readers: {reader_count}")
     return reader_count
 
 def list_waiting_tasks(wait_list_addr):
@@ -329,93 +352,95 @@ def classify_rwsem_state(count_raw, is_readfail_reliable, reader_count, verbose=
     flags = []
     state = ""
 
-    # Interpret count bitwise (64-bit) to extract flags regardless of sign
+    # Interpret count bitwise (64-bit)
     bitwise_count, writer, waiters, handoff, readfail = chk_count_bits(count_raw)
 
     count_hex = hex(bitwise_count)
 
     reserved_bits = (bitwise_count >> 3) & 0x1F
-    raw_reader_bits = (bitwise_count >> 8) & ((1 << (63 - 8)) - 1)
-    reader_count = raw_reader_bits
-    reader_note = ""
+
+    # ✅ Always use fixed reader extraction (ignore passed reader_count)
+    reader_count = get_reader_count(count_raw, is_readfail_reliable)
+
+    reader_note = f"{reader_count} reader(s)"
     reader_count_valid = True
 
+    # Flags
     if writer: flags.append("WRITER_LOCKED")
     if waiters: flags.append("WAITERS")
     if handoff: flags.append("HANDOFF")
     if readfail: flags.append("READFAIL")
 
-    # Find a reliable reader count
-    reader_count = get_reader_count(count_raw, is_readfail_reliable)
+    # --- Explicit edge case handling (from known combinations) ---
 
-    # 🧠 Special case: treat large negative counts with flags as likely race (e.g., -256, -1018)
-    logging(f"count: {count_raw}, {(count_raw & 0xFF)}, {readfail}")
-    if (waiters or handoff) and not is_readfail_reliable:
-        reader_note = f"🌀 Transitional: derived {reader_count} reader(s) released during flag state."
-        reader_count_valid = False
+    # READFAIL + writer (invalid)
+    if readfail and writer:
+        state_type = "❗ Invalid"
+        description = "READFAIL + WRITER combination — invalid state."
+        return build_result(...)
 
-    # Reader count validity analysis
-    elif not is_readfail_reliable:
-        reader_note = "⚠️ Suspicious: extremely high reader count, likely due to corruption or race."
+    # Negative values (transient states)
+    if count_raw < 0 and not readfail:
+        state_type = "🌀 Transitional"
+        description = "Negative count — transient state during reader release or race."
+        return build_result(...)
+
+    # READFAIL = real transitional condition
+    if readfail:
+        reader_note = "🌀 Reader acquisition failed (READFAIL)"
         reader_count_valid = False
-    elif reader_count == 0 and (count < 0) and not is_readfail_reliable:
-        reader_note = "⚠️ Reader count is zero, but count is negative — possibly transitional or corrupted."
-        reader_count_valid = False
-    else:
-        reader_note = f"{reader_count} reader(s)"
-        reader_count_valid = True
 
     # Classify known edge case first
     if count_raw == -1:
         state_type = "🌀 Transitional / Invalid"
-        description = "-1 observed due to race condition between reader release and writer unlock — likely transient and invalid in steady state."
+        description = "Race condition or corrupted state."
 
     elif count_raw == 0:
         state_type = "✅ Stable"
         description = "Lock is free."
 
-    elif reader_count > 0 and not writer and reader_count_valid:
+    # ✅ Readers hold lock (VALID even with waiters)
+    elif reader_count > 0 and not writer:
         state_type = "✅ Stable"
-        description = f"{reader_note} hold the lock."
+        if waiters:
+            description = f"{reader_count} reader(s) hold the lock with waiters queued."
+        else:
+            description = f"{reader_count} reader(s) hold the lock."
 
-    elif reader_count > 0 and not writer and not reader_count_valid:
-        state_type = "❗ Invalid or Corrupted"
-        description = f"{reader_note} — unlikely valid state."
-
-    elif writer and reader_count == 0:
-        state_type = "✅ Stable"
-        description = "Writer holds the lock."
-
+    # ❌ Invalid: writer + readers
     elif writer and reader_count > 0:
         state_type = "❗ Invalid"
-        description = f"Writer and {reader_note} both appear to hold the lock — should not happen."
+        description = f"Writer and {reader_note} both hold the lock — impossible state."
 
-    elif is_readfail_reliable:
+    # ✅ Writer holds lock
+    elif writer and reader_count == 0:
+        state_type = "✅ Stable"
+        if waiters:
+            description = "Writer holds the lock with waiters queued."
+        else:
+            description = "Writer holds the lock."
+
+    # 🌀 Transitional states (real ones only)
+    elif readfail:
         state_type = "🌀 Transitional"
-        description = "Reader failed to acquire the lock — likely fallback to queue."
+        description = "Reader failed to acquire lock (READFAIL)."
 
     elif reader_count == 0 and (waiters or handoff):
         state_type = "🌀 Transitional"
-        description = "No current holders, but waiters or handoff is pending."
-
-    elif reader_count == 0 and writer and (waiters or handoff):
-        state_type = "🌀 Transitional"
-        description = "Writer holds the lock with queued waiters and handoff pending."
-
-    elif reader_count == 0 and not (writer or waiters or handoff or readfail):
-        state_type = "✅ Stable"
-        description = "Zero state with no active flags — likely unlocked."
+        description = "No active holders, but waiters or handoff pending."
 
     else:
         state_type = "🌀 Unknown or Rare"
         description = "Unclassified state. Possibly due to race, partial update, or corruption."
 
+    # Reserved bits warning
     if reserved_bits:
         description += " Reserved bits (3–7) are set — unexpected."
 
+    # Known pattern match
     matched_known = next((entry['desc'] for entry in KNOWN_RWSEM_STATES if count_raw == entry['value']), None)
 
-    # 🔍 Append breakdown from flag analyzer
+    # Bit combination explanation (keep your existing function)
     combined_bits_desc = explain_bits_combination(count_raw, reader_count, is_readfail_reliable)
     description += f"\n  🧩  Possible Bits Combination: {combined_bits_desc}"
 
