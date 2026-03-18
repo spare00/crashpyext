@@ -213,6 +213,13 @@ def check_integrity(count, owner, reader_owned, owner_task_addr, is_readfail_rel
 
     issues = []
 
+    writer_task_struct = None
+    if owner_task_addr:
+        try:
+            writer_task_struct = readSU("struct task_struct", owner_task_addr)
+        except Exception:
+            writer_task_struct = None
+
     # Check if reliable RWSEM_FLAG_READFAIL is set
     if is_readfail_reliable and (count & RWSEM_FLAG_READFAIL) == RWSEM_FLAG_READFAIL:
         flags = []
@@ -237,7 +244,7 @@ def check_integrity(count, owner, reader_owned, owner_task_addr, is_readfail_rel
         if RHEL_VERSION == 8:
             if not reader_owned:
                 issues.append("ℹ️ Reader bias is present in `.count`, but RWSEM_READER_OWNED bit is not set — may be valid (fastpath), or worth reviewing.")
-            if writer_task_struct != 0 and not reader_owned:
+            if writer_task_struct is not None and not reader_owned:
                 issues.append("⚠️ Owner field is nonzero but RWSEM_READER_OWNED not set — possible stale writer, or early reader acquisition.")
 
         elif RHEL_VERSION == 7:
