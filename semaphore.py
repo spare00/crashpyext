@@ -1,139 +1,85 @@
 #!/usr/bin/env python3
+"""
+semaphore.py — Classic counting semaphore (struct semaphore) analyzer.
 
+Shared infrastructure (RHEL version, task state, address resolution) is
+provided by chk_lock.py and injected before any analysis function is called.
+This module only contains semaphore-specific logic.
+"""
 import sys
-from pykdump.API import *  # exec_crash_command, readSU, symbol_exists, crash, percpu, etc.
+from pykdump.API import *
 from typing import Optional, Tuple, List
 
+# Shared globals — injected by chk_lock._push_globals() at startup.
 RHEL_VERSION = 8
-kernel_version = "Unknown"
-DEBUG = False
+DEBUG        = False
 
-# ---------- Utilities ----------
-def logging(msg):
+
+def dbg(msg):
     if DEBUG:
-        print(f"[sem][DEBUG] {msg}")
+        print(f"[sem][dbg] {msg}")
 
 
-def get_rhel_version():
-    """Determines the major RHEL version from the kernel release."""
-    global RHEL_VERSION, kernel_version
-    sys_output = exec_crash_command("sys")
-    for line in sys_output.splitlines():
-        if "RELEASE" in line:
-            kernel_version = line.split()[-1]
-            if "el" in kernel_version:
-                try:
-                    RHEL_VERSION = int(kernel_version.split(".el")[1][0])
-                except (IndexError, ValueError):
-                    pass
-    print(f"Detected RHEL Version: {RHEL_VERSION} (Kernel: {kernel_version})")
-    return RHEL_VERSION
+# Injected by chk_lock._push_globals() — stubs keep the module importable
+# standalone (e.g. during testing) even if chk_lock hasn't run yet.
+def get_task_state(task):  # pragma: no cover
+    raise RuntimeError("get_task_state not injected by chk_lock")
 
 
-def resolve_address(input_value):
-    try:
-        if isinstance(input_value, int):
-            return input_value
-        if input_value.startswith("0x"):
-            return int(input_value, 16)
-        elif all(c in "0123456789abcdefABCDEF" for c in input_value):
-            return int(input_value, 16)
-        elif symbol_exists(input_value):
-            return readSymbol(input_value)
-        else:
-            print(f"Error: '{input_value}' is neither a valid address nor a known symbol.")
-            sys.exit(1)
-    except Exception as e:
-        print(f"Error resolving address for {input_value}: {e}")
-        sys.exit(1)
-
-
-# ---------- Task state helpers ----------
-_task_state_map = {
-    0x00: "TASK_RUNNING",
-    0x01: "TASK_INTERRUPTIBLE",
-    0x02: "TASK_UNINTERRUPTIBLE",
-    0x04: "__TASK_STOPPED",
-    0x08: "__TASK_TRACED",
-    0x10: "EXIT_DEAD",
-    0x20: "EXIT_ZOMBIE",
-    0x40: "TASK_PARKED" if RHEL_VERSION >= 8 else "TASK_DEAD",
-    0x80: "TASK_DEAD" if RHEL_VERSION >= 8 else "TASK_WAKEKILL",
-    0x100: "TASK_WAKEKILL" if RHEL_VERSION >= 8 else "TASK_WAKING",
-    0x200: "TASK_WAKING" if RHEL_VERSION >= 8 else "TASK_PARKED",
-    0x400: "TASK_NOLOAD" if RHEL_VERSION >= 8 else "TASK_STATE_MAX",
-    0x800: "TASK_NEW" if RHEL_VERSION >= 8 else "TASK_STATE_MAX",
-    0x1000: "TASK_RTLOCK_WAIT" if RHEL_VERSION >= 8 else "TASK_STATE_MAX",
-    0x2000: "TASK_STATE_MAX" if RHEL_VERSION >= 9 else "TASK_STATE_MAX",
-}
-
-
-def _task_state(task) -> str:
-    """Return human-readable task state, handling kernels with either 'state' or '__state'."""
-    try:
-        val = None
-
-        # Some kernels have task.state, others task.__state
-        for candidate in ("state", "__state"):
-            try:
-                val = int(getattr(task, candidate))
-                logging(f"_task_state(): using field '{candidate}' with value {val}")
-                break
-            except Exception:
-                continue
-
-        # As a last resort, try via crash command
-        if val is None:
-            try:
-                raw = exec_crash_command(f"p ((struct task_struct *){int(task):#x})->__state")
-                val = int(raw.strip().split()[-1], 0)
-                logging(f"_task_state(): fallback via crash cmd returned {val}")
-            except Exception:
-                logging("_task_state(): no valid state field found")
-                return "Unknown"
-
-        flags = [name for bit, name in _task_state_map.items() if val & bit]
-        return " | ".join(flags) if flags else f"Unknown ({val})"
-
-    except Exception as e:
-        logging(f"_task_state() failed: {e}")
-        return "Unknown"
-
-# ---------- Waiters ----------
+# ---------------------------------------------------------------------------
+# Waiter list
+# ---------------------------------------------------------------------------
 def list_waiters(wait_list_addr) -> list:
-    """Return list of (pid, comm, state, taddr) for tasks waiting on the semaphore."""
+    """
+    Return list of (pid, comm, state, task_addr) for tasks waiting on the
+    semaphore.
+
+    Uses 'list -s semaphore_waiter.task -l semaphore_waiter.list -H <addr>'
+    which emits alternating lines: a node address, then 'task = <addr>,'.
+    """
     result = []
     try:
         cmd = f"list -s semaphore_waiter.task -l semaphore_waiter.list -H {wait_list_addr:#x}"
         output = exec_crash_command(cmd)
+        lines = [l.strip() for l in output.splitlines() if l.strip()]
 
-        lines = [line.strip() for line in output.splitlines() if line.strip()]
-        for i in range(0, len(lines), 2):  # Read 2 lines at a time
+        # Lines come in pairs: node_addr, then "task = 0x...,".
+        # FIX #11: The original used range(0, len, 2) with lines[i+1] which
+        # raises IndexError on an odd-length list (truncated crash output).
+        # Now handled explicitly with a bounds check and a warning.
+        i = 0
+        while i < len(lines):
+            if i + 1 >= len(lines):
+                print(f"Warning: incomplete semaphore_waiter entry at line {i}: {lines[i]!r}")
+                break
             try:
-                node_addr = int(lines[i], 16)
                 task_line = lines[i + 1]
-
-                # Expecting: "task = 0xff377706b5ed0000,"
                 if "task =" in task_line:
-                    task_str = task_line.split("=", 1)[1].strip().strip(",")
+                    task_str  = task_line.split("=", 1)[1].strip().rstrip(",")
                     task_addr = int(task_str, 16)
-                    task = readSU("struct task_struct", task_addr)
-                    pid = task.pid
-                    comm = task.comm
-                    state = _task_state(task)
-                    result.append((pid, comm, state, task_addr))
+                    task      = readSU("struct task_struct", task_addr)
+                    state     = get_task_state(task)
+                    result.append((task.pid, task.comm, state, task_addr))
                 else:
                     result.append(("?", task_line, "?", 0))
-            except Exception:
+            except Exception as e:
+                dbg(f"list_waiters(): error at line {i}: {e}")
                 result.append(("?", lines[i], "?", 0))
+            i += 2
+
     except Exception as e:
         print(f"Error listing waiters for semaphore at {wait_list_addr:#x}: {e}")
     return result
 
 
-# ---------- Core ----------
+# ---------------------------------------------------------------------------
+# Core
+# ---------------------------------------------------------------------------
 def _read_count(sem):
-    """Handle kernels where semaphore.count is unsigned int vs atomic_t."""
+    """
+    Read semaphore.count, handling kernels where it is atomic_t (has .counter)
+    vs kernels where it is a plain unsigned int.
+    """
     try:
         return int(sem.count.counter)
     except Exception:
@@ -146,6 +92,7 @@ def _read_count(sem):
 
 
 def get_semaphore_info(sem_addr: int, list_waiters_flag: bool = False):
+    """Read and decode a struct semaphore from the vmcore."""
     try:
         sem = readSU("struct semaphore", sem_addr)
     except Exception as e:
@@ -159,58 +106,63 @@ def get_semaphore_info(sem_addr: int, list_waiters_flag: bool = False):
         return None
 
     info = {
-        "address": f"{sem_addr:#x}",
-        "count": count_val,
+        "address":        f"{sem_addr:#x}",
+        "count":          count_val,
         "wait_list_next": f"{int(sem.wait_list.next):#x}",
         "wait_list_prev": f"{int(sem.wait_list.prev):#x}",
     }
 
     if list_waiters_flag:
-        info["waiters"] = list_waiters(int(sem.wait_list)) if hasattr(sem, 'wait_list') else []
+        info["waiters"] = (
+            list_waiters(int(sem.wait_list)) if hasattr(sem, "wait_list") else []
+        )
 
     return info
 
+
 def _classify(count: int, waiter_len: Optional[int]) -> Tuple[str, str, List[str]]:
-    """Return (state_type, description, issues[])"""
+    """Return (state_label, description, issues[]) for the given count value."""
     issues = []
     if count > 0:
         state = "✅ Stable"
-        desc = f"{count} slot(s) available."
+        desc  = f"{count} slot(s) available."
         if waiter_len and waiter_len > 0:
             issues.append("⚠️ Waiters present while count > 0 — possible missed wakeup or transient race.")
     elif count == 0:
         state = "ℹ️ Contended / Fully held"
-        desc = "No available slots."
-    else:  # count < 0
+        desc  = "No available slots."
+    else:
         implied = -count
-        state = "🌀 Contended"
-        desc = f"Negative count implies ~{implied} waiter(s) (implementation detail)."
+        state   = "🌀 Contended"
+        desc    = f"Negative count implies ~{implied} waiter(s) (implementation detail)."
         if waiter_len is not None and waiter_len != implied:
-            issues.append(f"ℹ️ Waiter list length ({waiter_len}) != implied ({implied}) — can be normal across kernels.")
+            issues.append(
+                f"ℹ️ Waiter list length ({waiter_len}) != implied ({implied})"
+                " — can be normal across kernels."
+            )
     return state, desc, issues
 
 
 def analyze_semaphore(info: dict, verbose: bool = False):
+    """Print a human-readable analysis of a decoded semaphore."""
     if not info:
         print("No valid semaphore information.")
         return
 
     count = info["count"]
     print("\n=== Semaphore Status ===")
-    print(f"Address: {info['address']}")
-    print(f"Count:   0x{count:08X} ({count})")
+    print(f"Address:        {info['address']}")
+    print(f"Count:          0x{count:08X} ({count})")
     print(f"Wait List Next: {info['wait_list_next']}")
     print(f"Wait List Prev: {info['wait_list_prev']}")
 
-    waiter_len = len(info.get("waiters", [])) if "waiters" in info else None
+    waiter_len            = len(info["waiters"]) if "waiters" in info else None
     state_type, desc, issues = _classify(count, waiter_len)
 
     print(f"\n  🧠 Inferred State:")
     print(f"  {state_type}: {desc}")
-
-    if issues:
-        for m in issues:
-            print(m)
+    for msg in issues:
+        print(f"  {msg}")
 
     if "waiters" in info:
         waiters = info["waiters"]
@@ -223,3 +175,4 @@ def analyze_semaphore(info: dict, verbose: bool = False):
             print(f"\nNumber of waiters: {len(waiters)}")
         else:
             print("\nWaiting Tasks: none")
+

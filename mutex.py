@@ -1,133 +1,133 @@
-import sys
-import argparse
+#!/usr/bin/env python3
+"""
+mutex.py — Linux kernel mutex (struct mutex) analyzer.
+
+Shared infrastructure (RHEL version, task state, address resolution) is
+provided by chk_lock.py and injected before any analysis function is called.
+This module only contains mutex-specific logic.
+"""
 from pykdump.API import *
 
-# Global variable
-kernel_version = "Unknown"
+# Kernel constants — confirmed against kernel/locking/mutex.c
+# Bit 0: non-empty waiter list; unlock must issue a wakeup.
+# Bit 1: unlock needs to hand the lock to the top-waiter.
+# Bit 2: handoff done, waiting for pickup.
+MUTEX_FLAG_WAITERS = 0x01
+MUTEX_FLAG_HANDOFF = 0x02
+MUTEX_FLAG_PICKUP  = 0x04
+MUTEX_FLAGS        = 0x07
+
+# Shared globals — injected by chk_lock._push_globals() at startup.
 rhel_version = 8
-
-def get_rhel_version():
-    """Determines the major RHEL version from the kernel release."""
-    sys_output = exec_crash_command("sys")
-    kernel_version = "Unknown"
-    rhel_version = 8  # Default to RHEL 8+
-
-    for line in sys_output.splitlines():
-        if "RELEASE" in line:
-            kernel_version = line.split()[-1]
-            if "el" in kernel_version:
-                try:
-                    rhel_version = int(kernel_version.split(".el")[1][0])
-                except (IndexError, ValueError):
-                    pass
-
-    print(f"Detected RHEL Version: {rhel_version} (Kernel: {kernel_version})")
-    return rhel_version
+DEBUG        = False
 
 
-task_state_array = {
-    0x00: "TASK_RUNNING",
-    0x01: "TASK_INTERRUPTIBLE",
-    0x02: "TASK_UNINTERRUPTIBLE",
-    0x04: "__TASK_STOPPED",
-    0x08: "__TASK_TRACED",
-    0x10: "EXIT_DEAD",
-    0x20: "EXIT_ZOMBIE",
-    0x40: "TASK_PARKED" if rhel_version >= 8 else "TASK_DEAD",
-    0x80: "TASK_DEAD" if rhel_version >= 8 else "TASK_WAKEKILL",
-    0x100: "TASK_WAKEKILL" if rhel_version >= 8 else "TASK_WAKING",
-    0x200: "TASK_WAKING" if rhel_version >= 8 else "TASK_PARKED",
-    0x400: "TASK_NOLOAD" if rhel_version >= 8 else "TASK_STATE_MAX",
-    0x800: "TASK_NEW" if rhel_version >= 8 else "TASK_STATE_MAX",
-    0x1000: "TASK_RTLOCK_WAIT" if rhel_version >= 8 else "TASK_STATE_MAX",
-    0x2000: "TASK_STATE_MAX" if rhel_version >= 9 else "TASK_STATE_MAX",
-}
+def dbg(msg):
+    if DEBUG:
+        print(f"[mutex][dbg] {msg}")
 
-def resolve_address(input_value):
-    try:
-        if input_value.startswith("0x"):
-            return int(input_value, 16)
-        elif all(c in "0123456789abcdefABCDEF" for c in input_value):
-            return int(input_value, 16)
-        elif symbol_exists(input_value):
-            return readSymbol(input_value)
-        else:
-            print(f"Error: '{input_value}' is neither a valid address nor a known symbol.")
-            sys.exit(1)
-    except Exception as e:
-        print(f"Error resolving address for {input_value}: {e}")
-        sys.exit(1)
 
-def get_task_state(task):
-    try:
-        state_val = task.__state   # RHEL8+
-    except KeyError:
-        state_val = task.state     # RHEL7 fallback
+# Injected by chk_lock._push_globals() — stub keeps module importable standalone.
+def get_task_state(task):  # pragma: no cover
+    raise RuntimeError("get_task_state not injected by chk_lock")
 
-    # Map numeric state to human-readable flags
-    states = []
-    for bit, name in task_state_array.items():
-        if state_val & bit:
-            states.append(name)
-
-    if not states:
-        return f"UNKNOWN({state_val})"
-
-    return "|".join(states)
 
 def get_waiters(mutex):
+    """Return list of (pid, comm, state) tuples for tasks waiting on the mutex."""
     waiters = []
-    wait_list = ListHead(int(mutex.wait_list), "struct mutex_waiter")
-    for waiter in wait_list.list:
-        task = waiter.task
-        if task:
-            state = get_task_state(task)
-            waiters.append((task.pid, task.comm, state))
+    try:
+        wait_list = ListHead(int(mutex.wait_list), "struct mutex_waiter")
+        for waiter in wait_list.list:
+            task = waiter.task
+            if task:
+                state = get_task_state(task)
+                waiters.append((task.pid, task.comm, state))
+    except Exception as e:
+        print(f"Warning: could not enumerate mutex waiters: {e}")
     return waiters
 
+
 def get_owner_info(owner_address):
+    """
+    Given a task_struct pointer (flag bits already stripped), return a
+    human-readable string describing the owning task.
+    """
+    # FIX: Removed the isinstance-str branch — owner_address is always an int
+    # by the time it arrives here.  Also returns "None" cleanly for null owner
+    # instead of calling hex(0) and then trying to readSU from address 0.
+    if not owner_address:
+        return "None"
     try:
-        owner_address = int(owner_address, 16) if isinstance(owner_address, str) else owner_address
         owner_task = readSU("struct task_struct", owner_address)
-        pid = owner_task.pid
-        comm = owner_task.comm
+        pid   = owner_task.pid
+        comm  = owner_task.comm
         state = get_task_state(owner_task)
-        return f"{hex(owner_address)} (PID: {pid}, COMM: {comm}, {state})"
-    except Exception:
-        return hex(owner_address)
+        return f"{owner_address:#x} (PID: {pid}, COMM: {comm}, {state})"
+    except Exception as e:
+        dbg(f"get_owner_info(): could not read task_struct at {owner_address:#x}: {e}")
+        return f"{owner_address:#x}"
+
 
 def get_mutex_info(mutex_addr, list_waiters):
+    """Read and decode a struct mutex from the vmcore."""
     try:
         mutex = readSU("struct mutex", mutex_addr)
     except Exception as e:
-        print(f"Error accessing mutex at {hex(mutex_addr)}: {e}")
+        print(f"Error accessing mutex at {mutex_addr:#x}: {e}")
         return None
 
-    owner_raw = mutex.owner.counter if rhel_version >= 8 else mutex.owner
-    owner_address = owner_raw & ~0x07
-    owner_address = owner_address & (2**64 - 1)
-    flags = owner_raw & 0x07
+    # owner field is atomic_long_t on RHEL8+ (access via .counter),
+    # and a plain task_struct * on RHEL7.
+    # FIX: The original code used the module-level rhel_version which was never
+    # updated from its default of 8 because get_rhel_version() only wrote to a
+    # local variable.  Now that get_rhel_version() correctly updates the global,
+    # this conditional works as intended.
+    try:
+        owner_raw = mutex.owner.counter if rhel_version >= 8 else int(mutex.owner)
+    except Exception as e:
+        print(f"Warning: could not read mutex.owner at {mutex_addr:#x}: {e}")
+        owner_raw = 0
+
+    # Strip the 3 flag bits to get the actual task_struct pointer.
+    owner_address = (owner_raw & ~MUTEX_FLAGS) & 0xFFFFFFFFFFFFFFFF
+    flags_raw     = owner_raw & MUTEX_FLAGS
 
     flag_status = []
-    if flags & 0x01:
+    if flags_raw & MUTEX_FLAG_WAITERS:
         flag_status.append("WAITERS - Unlock must issue a wakeup")
-    if flags & 0x02:
+    if flags_raw & MUTEX_FLAG_HANDOFF:
         flag_status.append("HANDOFF - Unlock needs to hand the lock to the top-waiter")
-    if flags & 0x04:
+    if flags_raw & MUTEX_FLAG_PICKUP:
         flag_status.append("PICKUP - Handoff has been done, waiting for pickup")
 
-    wait_lock_val = (mutex.wait_lock.raw_lock.val.counter if rhel_version >= 8
-                     else mutex.wait_lock.rlock.raw_lock.val.counter)
-    lock_state = "Locked" if wait_lock_val != 1 else "Unlocked"
+    # FIX: wait_lock field path differs by RHEL version.  The original code
+    # had both paths gated on rhel_version >= 8, but the else branch used
+    # rlock.raw_lock.val.counter which matches RHEL7's spinlock layout.
+    # Also wrapped in try/except so a layout mismatch doesn't crash the tool.
+    try:
+        if rhel_version >= 8:
+            wait_lock_val = mutex.wait_lock.raw_lock.val.counter
+        else:
+            wait_lock_val = mutex.wait_lock.rlock.raw_lock.val.counter
+    except Exception as e:
+        print(f"Warning: could not read mutex.wait_lock at {mutex_addr:#x}: {e}")
+        wait_lock_val = -1
+
+    # A qspinlock val of 0 means unlocked; anything else means locked.
+    # FIX: The original used `!= 1` as the locked test, but qspinlock encodes
+    # "unlocked" as 0, not 1.  A val of 1 actually means the lock IS held
+    # (locked byte = 0x01).  Corrected to `!= 0`.
+    lock_state = "Locked" if wait_lock_val != 0 else "Unlocked"
 
     mutex_info = {
-        "address": hex(mutex_addr),
-        "owner": get_owner_info(owner_address) if owner_address else "None",
-        "flags": flag_status if flag_status else ["NONE"],
-        "wait_lock_val": wait_lock_val,
-        "wait_list_next": hex(mutex.wait_list.next),
-        "wait_list_prev": hex(mutex.wait_list.prev),
-        "locked": lock_state,
+        "address":        f"{mutex_addr:#x}",
+        "owner":          get_owner_info(owner_address),
+        "flags":          flag_status if flag_status else ["NONE"],
+        "flags_raw":      flags_raw,
+        "wait_lock_val":  wait_lock_val,
+        "wait_list_next": f"{int(mutex.wait_list.next):#x}",
+        "wait_list_prev": f"{int(mutex.wait_list.prev):#x}",
+        "locked":         lock_state,
     }
 
     if list_waiters:
@@ -135,27 +135,54 @@ def get_mutex_info(mutex_addr, list_waiters):
 
     return mutex_info
 
-def analyze_mutex(mutex_info):
+
+def analyze_mutex(mutex_info, verbose=False):
+    """Print a human-readable analysis of a decoded mutex."""
     if not mutex_info:
         print("No valid mutex information found.")
         return
 
-    print("\nMutex Analysis:")
-    print("Address: ", mutex_info["address"])
-    print("Owner Address: ", mutex_info["owner"])
-    print("Flags: ", ", ".join(mutex_info["flags"]))
-    print("Status: ", mutex_info["locked"])
-    print("Wait Lock Value: ", mutex_info["wait_lock_val"])
-    print("Wait List Next: ", mutex_info["wait_list_next"])
-    print("Wait List Prev: ", mutex_info["wait_list_prev"])
+    print("\n=== Mutex Analysis ===")
+    print(f"Address:        {mutex_info['address']}")
+    print(f"Owner:          {mutex_info['owner']}")
+    print(f"Flags:          {', '.join(mutex_info['flags'])}")
+    print(f"Status:         {mutex_info['locked']}")
+    print(f"Wait Lock Val:  {mutex_info['wait_lock_val']}")
+    print(f"Wait List Next: {mutex_info['wait_list_next']}")
+    print(f"Wait List Prev: {mutex_info['wait_list_prev']}")
 
-    if "waiters" in mutex_info and mutex_info["waiters"]:
-        print("\nWaiting Tasks:")
-        print("{:<10} {:<20} {:<15}".format("PID", "Command", "State"))
-        print("-" * 50)
-        for pid, comm, state in mutex_info["waiters"]:
-            print("{:<10} {:<20} {:<15}".format(pid, comm, state))
+    if verbose:
+        print("\nVerbose Explanation:")
+        print("  wait_lock is a qspinlock protecting the wait_list.")
+        print("  val == 0 : unlocked (no one holds wait_lock)")
+        print("  val != 0 : locked   (a thread is modifying the wait_list)")
+        print(f"\n  Flag bits (raw: {mutex_info['flags_raw']:#x}):")
+        print(f"    bit 0 (WAITERS) = {int(bool(mutex_info['flags_raw'] & MUTEX_FLAG_WAITERS))}"
+              "  unlock must issue a wakeup")
+        print(f"    bit 1 (HANDOFF) = {int(bool(mutex_info['flags_raw'] & MUTEX_FLAG_HANDOFF))}"
+              "  unlock must hand lock directly to top waiter")
+        print(f"    bit 2 (PICKUP)  = {int(bool(mutex_info['flags_raw'] & MUTEX_FLAG_PICKUP))}"
+              "  handoff done, top waiter must pick up the lock")
 
-        # Add number of waiters at the end
-        print("\nNumber of waiters: ", len(mutex_info["waiters"]))
+    # Integrity hint: WAITERS flag set but wait_list appears empty
+    next_addr = int(mutex_info['wait_list_next'], 16)
+    prev_addr = int(mutex_info['wait_list_prev'], 16)
+    list_empty = (next_addr == prev_addr)  # circular list points to itself when empty
+
+    if mutex_info['flags_raw'] & MUTEX_FLAG_WAITERS and list_empty:
+        print("⚠️  WAITERS flag is set but wait_list appears empty — possible transient state.")
+    if mutex_info['flags_raw'] & MUTEX_FLAG_HANDOFF and mutex_info['flags_raw'] & MUTEX_FLAG_PICKUP:
+        print("⚠️  Both HANDOFF and PICKUP flags set simultaneously — unexpected state.")
+
+    if "waiters" in mutex_info:
+        waiters = mutex_info["waiters"]
+        if waiters:
+            print("\nWaiting Tasks:")
+            print(f"{'PID':<10} {'Command':<20} {'State'}")
+            print("-" * 60)
+            for pid, comm, state in waiters:
+                print(f"{pid!s:<10} {comm:<20} {state}")
+            print(f"\nNumber of waiters: {len(waiters)}")
+        else:
+            print("\nWaiting Tasks: none")
 
