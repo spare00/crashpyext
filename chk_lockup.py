@@ -62,9 +62,22 @@ def get_cpu_rflags_cs_and_comm_via_bt():
     """
     Robustly parse 'bt -a' by CPU block.
 
-    Returns a list of (cpu, rflags_hex|'N/A', cs_hex|'N/A', comm|'Unknown').
-    Matches either COMM or COMMAND for the task name.
+    Returns a list of (cpu, rflags_hex|'N/A', cs_hex|'N/A', comm|'Unknown', is_idle).
+
+    comm is extracted from the CPU header line (e.g. COMMAND: "swapper/0") first;
+    body lines are also scanned as a fallback.
+
+    is_idle is True when the task is a swapper/idle thread OR the call stack
+    contains idle-path symbols (do_idle, cpu_startup_entry, intel_idle, etc.).
+    This correctly handles NMI-interrupted idle CPUs where the watchdog timestamp
+    is stale by design, not because of a real lockup.
     """
+    # Symbols that unambiguously indicate a CPU is in the idle path.
+    IDLE_STACK_SYMS = re.compile(
+        r"\b(do_idle|cpu_startup_entry|cpuidle_enter|cpuidle_idle_call|intel_idle|"
+        r"acpi_idle_enter|hlt_play_dead|mwait_play_dead|native_safe_halt)\b"
+    )
+
     out = exec_crash_command("bt -a")
     lines = out.splitlines()
     cpu_info = []
@@ -74,26 +87,39 @@ def get_cpu_rflags_cs_and_comm_via_bt():
         if not m:
             i += 1
             continue
+
         cpu = int(m.group(1))
         rflags = "N/A"
         cs = "N/A"
-        comm = "Unknown"
+
+        # The COMMAND field lives on the same CPU header line.
+        mco = re.search(r'\bCOM(?:M|MAND):\s*"([^"]+)"', lines[i])
+        comm = mco.group(1) if mco else "Unknown"
+
+        idle_in_stack = False
         i += 1
+
         while i < len(lines) and "CPU:" not in lines[i]:
+            line = lines[i]
             if rflags == "N/A":
-                mrf = re.search(r"\bRFLAGS:\s*([0-9a-fA-F]+)\b", lines[i])
+                mrf = re.search(r"\bRFLAGS:\s*([0-9a-fA-F]+)\b", line)
                 if mrf:
                     rflags = mrf.group(1)
             if cs == "N/A":
-                mcs = re.search(r"\bCS:\s*([0-9a-fA-F]{4})\b", lines[i])
+                mcs = re.search(r"\bCS:\s*([0-9a-fA-F]{4})\b", line)
                 if mcs:
                     cs = mcs.group(1)
+            # Fallback: body may also carry COMM/COMMAND in some crash versions.
             if comm == "Unknown":
-                mco = re.search(r'\bCOM(?:M|MAND):\s*"([^"]+)"', lines[i])
-                if mco:
-                    comm = mco.group(1)
+                mco2 = re.search(r'\bCOM(?:M|MAND):\s*"([^"]+)"', line)
+                if mco2:
+                    comm = mco2.group(1)
+            if not idle_in_stack and IDLE_STACK_SYMS.search(line):
+                idle_in_stack = True
             i += 1
-        cpu_info.append((cpu, rflags, cs, comm))
+
+        is_idle = comm.startswith("swapper") or idle_in_stack
+        cpu_info.append((cpu, rflags, cs, comm, is_idle))
     return cpu_info
 
 
@@ -205,16 +231,21 @@ def detect_soft_lockup():
         behind_by_str = f"{delta:>12.2f}"
 
         rflags = cs = task_comm = "N/A"
+        is_idle = False
         for entry in cpu_info:
             if entry[0] == cpu:
-                rflags, cs, task_comm = entry[1], entry[2], entry[3]
+                rflags, cs, task_comm, is_idle = entry[1], entry[2], entry[3], entry[4]
                 break
 
-        # Skip idle CPUs
-        if task_comm.startswith("swapper"):
-            status = "Idle - Ignored"
+        # Skip idle CPUs — the watchdog is intentionally not touched during
+        # intel_idle / cpuidle, so a stale touch_ts is expected and normal.
+        # We detect idle both by task name (swapper) and by call-stack symbols
+        # so that NMI-interrupted idle CPUs are not falsely flagged.
+        if is_idle:
+            idle_reason = "swapper" if task_comm.startswith("swapper") else "idle stack"
+            status = f"Idle ({idle_reason}) - Skip"
             elapsed_str = "-"
-            line = f"{cpu:<5} {rq_time[cpu]:>10.2f} {'-':>12} {elapsed_str:>16} {rflags:>18} {cs:>8} {status:>16}"
+            line = f"{cpu:<5} {rq_time[cpu]:>10.2f} {'-':>12} {elapsed_str:>16} {rflags:>18} {cs:>8} {status:>20}"
             print(line)
             continue
 
