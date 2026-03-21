@@ -75,6 +75,25 @@ def _safe_read_symbol(name):
 
 
 # ---------------------------------------------------------------------------
+# Inline ANSI helpers
+# ---------------------------------------------------------------------------
+# crash/pykdump interprets ANSI codes when they are embedded inside string
+# *values* passed to print() -- wrapping the print() call itself does not
+# work because the pager strips codes at the call boundary.  The original
+# script used this same technique (e.g. f"\033[91m{elapsed:.2f}\033[0m").
+# We expose two helpers for the two levels of severity used:
+#
+#   _red(s)    bold red   -- confirmed lockup values
+#   _yellow(s) yellow     -- suspect / warn values
+
+def _red(s: str) -> str:
+    return f"\033[1;31m{s}\033[0m"
+
+def _yellow(s: str) -> str:
+    return f"\033[1;33m{s}\033[0m"
+
+
+# ---------------------------------------------------------------------------
 # RHEL version detection
 # ---------------------------------------------------------------------------
 
@@ -311,7 +330,8 @@ def detect_soft_lockup(rhel_version, bt_map, verbose=False):
         delta = max_now - rq_time[cpu]
 
         if cpu not in bt_map:
-            print(f"{cpu:<5} {'N/A':>10} {'N/A':>10} {'N/A':>11} {'N/A':>18} {'N/A':>6}  {'N/A':<20} ⚠️  WARN: not in bt -a")
+            _status = _yellow("WARN: not in bt -a")
+            print(f"{cpu:<5} {'N/A':>10} {'N/A':>10} {'N/A':>11} {'N/A':>18} {'N/A':>6}  {'N/A':<20} {_status}")
             continue
 
         info    = bt_map[cpu]
@@ -356,7 +376,9 @@ def detect_soft_lockup(rhel_version, bt_map, verbose=False):
             if tts == 0:
                 if delta > thresh:
                     elapsed = delta
-                    print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {elapsed:>11.2f} {rflags:>18} {cs:>6}  {comm:<20} ⚠️  INFERRED SOFT LOCKUP (touch_ts=0)")
+                    _estatus = _red("INFERRED SOFT LOCKUP (touch_ts=0)")
+                    _elapsed_str = _red(f"{elapsed:>11.2f}")
+                    print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {_elapsed_str} {rflags:>18} {cs:>6}  {comm:<20} {_estatus}")
                     locked_cpus.append(cpu)
                 else:
                     print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {'--':>11} {rflags:>18} {cs:>6}  {comm:<20} OK (touch_ts=0, watchdog not yet run or touch pending)")
@@ -368,7 +390,8 @@ def detect_soft_lockup(rhel_version, bt_map, verbose=False):
             # running, but guard against 0 in case the watchdog never started
             # on this CPU (e.g. hotplugged CPU, or watchdog enabled mid-run).
             if tts == 0:
-                print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {'--':>11} {rflags:>18} {cs:>6}  {comm:<20} ⚠️  WARN (touch_ts=0, watchdog never ran on this CPU)")
+                _status = _yellow("WARN (touch_ts=0, watchdog never ran on this CPU)")
+                print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {'--':>11} {rflags:>18} {cs:>6}  {comm:<20} {_status}")
                 continue
             elapsed = rq_time[cpu] - tts
             # Check whether reporting was suppressed by a recent reschedule.
@@ -382,10 +405,12 @@ def detect_soft_lockup(rhel_version, bt_map, verbose=False):
                 # Elapsed exceeds threshold but a reschedule suppressed the
                 # kernel's own report.  Still flag it -- the CPU was stuck
                 # even if the kernel hadn't printed a warning yet.
-                status = f"⚠️  SOFT LOCKUP (report suppressed by reschedule){irq_note}"
+                status = f"SOFT LOCKUP (report suppressed by reschedule){irq_note}"
             else:
-                status = f"⚠️  SOFT LOCKUP{irq_note}"
-            print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {elapsed:>11.2f} {rflags:>18} {cs:>6}  {comm:<20} {status}")
+                status = f"SOFT LOCKUP{irq_note}"
+            _elapsed_str = _red(f"{elapsed:>11.2f}")
+            _status_str  = _red(status)
+            print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {_elapsed_str} {rflags:>18} {cs:>6}  {comm:<20} {_status_str}")
             locked_cpus.append(cpu)
         else:
             if has_report_ts and report_suppressed:
@@ -397,7 +422,8 @@ def detect_soft_lockup(rhel_version, bt_map, verbose=False):
     # Summary
     print()
     if locked_cpus:
-        print(f"⚠️  Soft lockup detected on CPU(s): {', '.join(map(str, locked_cpus))}")
+        _summary = _red(f"Soft lockup detected on CPU(s): {', '.join(map(str, locked_cpus))}")
+        print(_summary)
         if verbose:
             for cpu in locked_cpus:
                 print(f"\n--- bt -c {cpu} " + "-" * 60)
@@ -405,7 +431,7 @@ def detect_soft_lockup(rhel_version, bt_map, verbose=False):
         else:
             print("    (run with -v to show backtraces for affected CPUs)")
     else:
-        print("✅ No soft lockup detected.")
+        print("No soft lockup detected.")
 
 
 # ---------------------------------------------------------------------------
@@ -494,16 +520,16 @@ def _hard_lockup_verdict(interrupts, saved, rflags, cs, hard_wd_on):
 
     # Counters are equal -- potential hard lockup.
     if not hard_wd_on:
-        return "❓ INCONCLUSIVE (hard watchdog disabled)", "suspect"
+        return _yellow("INCONCLUSIVE (hard watchdog disabled)"), "suspect"
 
     if not kernel_cs:
-        return "❓ SUSPECT (equal counters, user-space CS)", "suspect"
+        return _yellow("SUSPECT (equal counters, user-space CS)"), "suspect"
 
     # Kernel CS + equal counters = hard lockup.
     if irqs_off:
-        return "⚠️  CONFIRMED (IRQs off, kernel)", "confirmed"
+        return _red("CONFIRMED (IRQs off, kernel)"), "confirmed"
     else:
-        return "⚠️  CONFIRMED (IRQs ON in kernel -- spinloop or IRQ-handler hang)", "confirmed"
+        return _red("CONFIRMED (IRQs ON in kernel -- spinloop or IRQ-handler hang)"), "confirmed"
 
 
 def detect_hard_lockup(rhel_version, bt_map, verbose=False):
@@ -551,11 +577,12 @@ def detect_hard_lockup(rhel_version, bt_map, verbose=False):
     # Summary
     print()
     if confirmed:
-        print(f"⚠️  Hard lockup CONFIRMED on CPU(s) : {', '.join(map(str, confirmed))}")
+        _summary = _red(f"Hard lockup CONFIRMED on CPU(s): {', '.join(map(str, confirmed))}")
+        print(_summary)
     if suspects:
-        print(f"❓ Hard lockup SUSPECT on CPU(s)   : {', '.join(map(str, suspects))}")
+        print(_yellow(f"Hard lockup SUSPECT on CPU(s)  : {', '.join(map(str, suspects))}"))
     if not confirmed and not suspects:
-        print("✅ No hard lockup indicated.")
+        print("No hard lockup indicated.")
 
     if verbose:
         for cpu in confirmed + suspects:
