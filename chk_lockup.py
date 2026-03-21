@@ -71,6 +71,10 @@ def _safe_read_symbol(name):
 
 
 # ---------------------------------------------------------------------------
+# ANSI colour helpers
+
+
+# ---------------------------------------------------------------------------
 # RHEL version detection
 # ---------------------------------------------------------------------------
 
@@ -307,7 +311,7 @@ def detect_soft_lockup(rhel_version, bt_map, verbose=False):
         delta = max_now - rq_time[cpu]
 
         if cpu not in bt_map:
-            print(f"{cpu:<5} {'N/A':>10} {'N/A':>10} {'N/A':>11} {'N/A':>18} {'N/A':>6}  {'N/A':<20} WARN: not in bt -a")
+            print(f"{cpu:<5} {'N/A':>10} {'N/A':>10} {'N/A':>11} {'N/A':>18} {'N/A':>6}  {'N/A':<20} ⚠️  WARN: not in bt -a")
             continue
 
         info    = bt_map[cpu]
@@ -352,7 +356,7 @@ def detect_soft_lockup(rhel_version, bt_map, verbose=False):
             if tts == 0:
                 if delta > thresh:
                     elapsed = delta
-                    print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {elapsed:>11.2f} {rflags:>18} {cs:>6}  {comm:<20} [!] INFERRED SOFT LOCKUP (touch_ts=0)")
+                    print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {elapsed:>11.2f} {rflags:>18} {cs:>6}  {comm:<20} ⚠️  INFERRED SOFT LOCKUP (touch_ts=0)")
                     locked_cpus.append(cpu)
                 else:
                     print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {'--':>11} {rflags:>18} {cs:>6}  {comm:<20} OK (touch_ts=0, watchdog not yet run or touch pending)")
@@ -364,7 +368,7 @@ def detect_soft_lockup(rhel_version, bt_map, verbose=False):
             # running, but guard against 0 in case the watchdog never started
             # on this CPU (e.g. hotplugged CPU, or watchdog enabled mid-run).
             if tts == 0:
-                print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {'--':>11} {rflags:>18} {cs:>6}  {comm:<20} WARN (touch_ts=0, watchdog never ran on this CPU)")
+                print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {'--':>11} {rflags:>18} {cs:>6}  {comm:<20} ⚠️  WARN (touch_ts=0, watchdog never ran on this CPU)")
                 continue
             elapsed = rq_time[cpu] - tts
             # Check whether reporting was suppressed by a recent reschedule.
@@ -378,9 +382,9 @@ def detect_soft_lockup(rhel_version, bt_map, verbose=False):
                 # Elapsed exceeds threshold but a reschedule suppressed the
                 # kernel's own report.  Still flag it -- the CPU was stuck
                 # even if the kernel hadn't printed a warning yet.
-                status = f"[!] SOFT LOCKUP (report suppressed by reschedule){irq_note}"
+                status = f"⚠️  SOFT LOCKUP (report suppressed by reschedule){irq_note}"
             else:
-                status = f"[!] SOFT LOCKUP{irq_note}"
+                status = f"⚠️  SOFT LOCKUP{irq_note}"
             print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {elapsed:>11.2f} {rflags:>18} {cs:>6}  {comm:<20} {status}")
             locked_cpus.append(cpu)
         else:
@@ -393,7 +397,7 @@ def detect_soft_lockup(rhel_version, bt_map, verbose=False):
     # Summary
     print()
     if locked_cpus:
-        print(f"[!] Soft lockup detected on CPU(s): {', '.join(map(str, locked_cpus))}")
+        print(f"⚠️  Soft lockup detected on CPU(s): {', '.join(map(str, locked_cpus))}")
         if verbose:
             for cpu in locked_cpus:
                 print(f"\n--- bt -c {cpu} " + "-" * 60)
@@ -401,7 +405,7 @@ def detect_soft_lockup(rhel_version, bt_map, verbose=False):
         else:
             print("    (run with -v to show backtraces for affected CPUs)")
     else:
-        print("[OK] No soft lockup detected.")
+        print("✅ No soft lockup detected.")
 
 
 # ---------------------------------------------------------------------------
@@ -490,16 +494,16 @@ def _hard_lockup_verdict(interrupts, saved, rflags, cs, hard_wd_on):
 
     # Counters are equal -- potential hard lockup.
     if not hard_wd_on:
-        return "[?] INCONCLUSIVE (hard watchdog disabled)", "suspect"
+        return "❓ INCONCLUSIVE (hard watchdog disabled)", "suspect"
 
     if not kernel_cs:
-        return "[?] SUSPECT (equal counters, user-space CS)", "suspect"
+        return "❓ SUSPECT (equal counters, user-space CS)", "suspect"
 
     # Kernel CS + equal counters = hard lockup.
     if irqs_off:
-        return "[!] CONFIRMED (IRQs off, kernel)", "confirmed"
+        return "⚠️  CONFIRMED (IRQs off, kernel)", "confirmed"
     else:
-        return "[!] CONFIRMED (IRQs ON in kernel -- spinloop or IRQ-handler hang)", "confirmed"
+        return "⚠️  CONFIRMED (IRQs ON in kernel -- spinloop or IRQ-handler hang)", "confirmed"
 
 
 def detect_hard_lockup(rhel_version, bt_map, verbose=False):
@@ -536,16 +540,22 @@ def detect_hard_lockup(rhel_version, bt_map, verbose=False):
         elif category == "suspect":
             suspects.append(cpu)
 
-        print(f"{cpu:<5} {interrupts[cpu]:<16} {saved[cpu]:<16} {rflags:<18} {cs:<6}  {comm:<20} {verdict}")
+        row = f"{cpu:<5} {interrupts[cpu]:<16} {saved[cpu]:<16} {rflags:<18} {cs:<6}  {comm:<20} {verdict}"
+        if category == "confirmed":
+            print(row)
+        elif category in ("suspect", "warn"):
+            print(row)
+        else:
+            print(row)
 
     # Summary
     print()
     if confirmed:
-        print(f"[!] Hard lockup CONFIRMED on CPU(s) : {', '.join(map(str, confirmed))}")
+        print(f"⚠️  Hard lockup CONFIRMED on CPU(s) : {', '.join(map(str, confirmed))}")
     if suspects:
-        print(f"[?] Hard lockup SUSPECT on CPU(s)   : {', '.join(map(str, suspects))}")
+        print(f"❓ Hard lockup SUSPECT on CPU(s)   : {', '.join(map(str, suspects))}")
     if not confirmed and not suspects:
-        print("[OK] No hard lockup indicated.")
+        print("✅ No hard lockup indicated.")
 
     if verbose:
         for cpu in confirmed + suspects:
@@ -583,4 +593,3 @@ if __name__ == "__main__":
 
         if args.hard_lockup:
             detect_hard_lockup(rhel_version, bt_map, verbose=args.verbose)
-
