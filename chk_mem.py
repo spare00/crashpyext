@@ -196,6 +196,7 @@ def get_tmpfs_memory_from_superblocks(debug=False):
         pages_to_kb(total_pages - visible_pages)  # internal
     )
 
+
 def get_sysv_shm_kb(debug=False):
     try:
         output = exec_crash_command("ipcs -M")
@@ -304,10 +305,6 @@ def get_swap_info(debug=False):
         if debug:
             print(f"[debug] Failed to read swap info: {e}")
         return 0, 0
-    except Exception as e:
-        if debug:
-            print(f"[debug] Failed to read swap info: {e}")
-        return 0, 0
 
 def get_vmalloc_memory_kb(debug=False):
     """
@@ -326,6 +323,7 @@ def get_vmalloc_memory_kb(debug=False):
         line = line.strip()
         if not line or line.startswith("VMAP_AREA") or line.startswith("crash>"):
             continue
+
         parts = line.split()
         if len(parts) < 5:
             if debug:
@@ -397,18 +395,6 @@ def get_percpu_memory_kb():
     except Exception:
         return 0
 
-def _fs_name_from_vma(vma):
-    try:
-        f = vma.vm_file
-        if not f:
-            return None
-        dentry = f.f_path.dentry
-        if not dentry or not dentry.d_sb or not dentry.d_sb.s_type:
-            return None
-        name = dentry.d_sb.s_type.name
-        return str(name) if name is not None else None
-    except Exception:
-        return None
 
 def get_process_shmem_kb(task_addr, debug=False):
     try:
@@ -473,6 +459,7 @@ def get_top_processes(n=10, debug=False):
             vsz    = int(parts[6])
             rss    = int(parts[7])
             comm   = " ".join(parts[8:])
+
 
             procs.append({
                 "pid": pid, "ppid": ppid, "cpu": cpu,
@@ -555,7 +542,7 @@ def get_accounted_memory_kb(stats, hugepage_kb, percpu_kb, vmalloc_kb):
         file_kb,
         pages_to_kb(stats.get("NR_FREE_PAGES", 0)),
         slab_kb,
-        pages_to_kb(stats.get("NR_KERNEL_STACK_KB", 0)),
+        stats.get("NR_KERNEL_STACK_KB", 0),  # already in KiB; do not pass through pages_to_kb()
         pages_to_kb(stats.get("NR_PAGETABLE", 0)),
         pages_to_kb(stats.get("NR_SWAPCACHE", 0)),  # swapcache는 file/anon과 중복 안 됨
         hugepage_kb,
@@ -576,7 +563,7 @@ def print_unaccounted_formula(stats, total_kb, hugepage_kb, percpu_kb, unit):
         ("Slab Unreclaimable", kb(p("NR_SLAB_UNRECLAIMABLE_B"))),
         ("Free", kb(p("NR_FREE_PAGES"))),
         ("PageCache", kb(p("NR_FILE_PAGES"))),
-        ("KernelStack", kb(p("NR_KERNEL_STACK_KB"))),
+        ("KernelStack", p("NR_KERNEL_STACK_KB")),  # already in KiB; do not pass through kb()
         ("PageTables", kb(p("NR_PAGETABLE"))),
         ("SwapCache", kb(p("NR_SWAPCACHE"))),
         ("HugePages", hugepage_kb),
@@ -611,7 +598,7 @@ def print_meminfo_style(stats, total_kb, hugepage_kb, percpu_kb, vmalloc_kb, uni
     anon_total = active_anon + inactive_anon
     file_pages = pages_to_kb(stats.get("NR_FILE_PAGES", 0))
     slab = pages_to_kb(stats.get("NR_SLAB_RECLAIMABLE_B", 0) + stats.get("NR_SLAB_UNRECLAIMABLE_B", 0))
-    kernel_stack = pages_to_kb(stats.get("NR_KERNEL_STACK_KB", 0))
+    kernel_stack = stats.get("NR_KERNEL_STACK_KB", 0)  # already in KiB; do not pass through pages_to_kb()
     pagetables = pages_to_kb(stats.get("NR_PAGETABLE", 0))
     swapcache = pages_to_kb(stats.get("NR_SWAPCACHE", 0))
 
@@ -626,7 +613,6 @@ def print_meminfo_style(stats, total_kb, hugepage_kb, percpu_kb, vmalloc_kb, uni
         pages_to_kb(stats.get("NR_FILE_PAGES", 0) - stats.get("NR_SWAPCACHE", 0)) - buffers_kb,
         0
     )
-    pagecache_kb = pages_to_kb(stats.get("NLE", 0))
     swapcache = pages_to_kb(stats.get("NR_SWAPCACHE", 0))
 
     huge_total_kb, huge_used_kb = get_hugepage_info(debug=debug)
@@ -690,6 +676,7 @@ def print_command_memory_usage(unit="G", debug=False, top_n=10):
 
         try:
             task_addr = parts[3]
+
             rss = int(parts[7])
             vsz = int(parts[6])
             comm = " ".join(parts[8:])
@@ -707,6 +694,7 @@ def print_command_memory_usage(unit="G", debug=False, top_n=10):
 
     def scale(val): return scale_value(val, unit)
     unit_label = f"{unit}iB"
+
 
     print(f"\nTop {top_n} commands by total RSS (unit: {unit_label}):")
     print(f"{'Count':>8}{'RSS':>15}{'VSZ':>15}{'SHM':>15}  {'COMMAND'}")
@@ -809,3 +797,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
