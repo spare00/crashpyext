@@ -52,9 +52,6 @@ def get_owner_info(owner_address):
     Given a task_struct pointer (flag bits already stripped), return a
     human-readable string describing the owning task.
     """
-    # FIX: Removed the isinstance-str branch — owner_address is always an int
-    # by the time it arrives here.  Also returns "None" cleanly for null owner
-    # instead of calling hex(0) and then trying to readSU from address 0.
     if not owner_address:
         return "None"
     try:
@@ -78,10 +75,6 @@ def get_mutex_info(mutex_addr, list_waiters):
 
     # owner field is atomic_long_t on RHEL8+ (access via .counter),
     # and a plain task_struct * on RHEL7.
-    # FIX: The original code used the module-level rhel_version which was never
-    # updated from its default of 8 because get_rhel_version() only wrote to a
-    # local variable.  Now that get_rhel_version() correctly updates the global,
-    # this conditional works as intended.
     try:
         owner_raw = mutex.owner.counter if rhel_version >= 8 else int(mutex.owner)
     except Exception as e:
@@ -100,10 +93,6 @@ def get_mutex_info(mutex_addr, list_waiters):
     if flags_raw & MUTEX_FLAG_PICKUP:
         flag_status.append("PICKUP - Handoff has been done, waiting for pickup")
 
-    # FIX: wait_lock field path differs by RHEL version.  The original code
-    # had both paths gated on rhel_version >= 8, but the else branch used
-    # rlock.raw_lock.val.counter which matches RHEL7's spinlock layout.
-    # Also wrapped in try/except so a layout mismatch doesn't crash the tool.
     try:
         if rhel_version >= 8:
             wait_lock_val = mutex.wait_lock.raw_lock.val.counter
@@ -113,21 +102,47 @@ def get_mutex_info(mutex_addr, list_waiters):
         print(f"Warning: could not read mutex.wait_lock at {mutex_addr:#x}: {e}")
         wait_lock_val = -1
 
-    # A qspinlock val of 0 means unlocked; anything else means locked.
-    # FIX: The original used `!= 1` as the locked test, but qspinlock encodes
-    # "unlocked" as 0, not 1.  A val of 1 actually means the lock IS held
-    # (locked byte = 0x01).  Corrected to `!= 0`.
-    lock_state = "Locked" if wait_lock_val != 0 else "Unlocked"
+    # Determine lock status.
+    #
+    # RHEL7 uses a count-based mutex:
+    #   count.counter ==  1  -> unlocked
+    #   count.counter ==  0  -> locked, no waiters
+    #   count.counter <= -1  -> locked, with waiters (decremented once per waiter)
+    #
+    # RHEL8+ uses an owner-based mutex: non-zero owner means locked.
+    #
+    # FIX: The original derived lock_state from wait_lock_val, which is the
+    # spinlock protecting the wait_list — not the mutex state itself.  It is
+    # almost always 0 in a crash dump, so status was always "Unlocked".
+    if rhel_version >= 8:
+        locked = "Locked" if owner_address != 0 else "Unlocked"
+        count_val = None
+    else:
+        try:
+            count_val = mutex.count.counter
+            if count_val == 1:
+                locked = "Unlocked"
+            elif count_val == 0:
+                locked = "Locked (no waiters)"
+            elif count_val <= -1:
+                locked = f"Locked (with ~{abs(count_val)} waiter(s))"
+            else:
+                locked = f"Unknown (count={count_val})"
+        except Exception as e:
+            print(f"Warning: could not read mutex.count at {mutex_addr:#x}: {e}")
+            count_val = None
+            locked    = "Unknown"
 
     mutex_info = {
         "address":        f"{mutex_addr:#x}",
         "owner":          get_owner_info(owner_address),
         "flags":          flag_status if flag_status else ["NONE"],
         "flags_raw":      flags_raw,
+        "count_val":      count_val,
         "wait_lock_val":  wait_lock_val,
         "wait_list_next": f"{int(mutex.wait_list.next):#x}",
         "wait_list_prev": f"{int(mutex.wait_list.prev):#x}",
-        "locked":         lock_state,
+        "locked":         locked,
     }
 
     if list_waiters:
@@ -147,6 +162,8 @@ def analyze_mutex(mutex_info, verbose=False):
     print(f"Owner:          {mutex_info['owner']}")
     print(f"Flags:          {', '.join(mutex_info['flags'])}")
     print(f"Status:         {mutex_info['locked']}")
+    if mutex_info['count_val'] is not None:
+        print(f"Count Val:      {mutex_info['count_val']} (RHEL7 atomic count)")
     print(f"Wait Lock Val:  {mutex_info['wait_lock_val']}")
     print(f"Wait List Next: {mutex_info['wait_list_next']}")
     print(f"Wait List Prev: {mutex_info['wait_list_prev']}")
@@ -185,4 +202,3 @@ def analyze_mutex(mutex_info, verbose=False):
             print(f"\nNumber of waiters: {len(waiters)}")
         else:
             print("\nWaiting Tasks: none")
-
