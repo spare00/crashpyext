@@ -125,7 +125,7 @@ def get_mutex_info(mutex_addr, list_waiters):
             elif count_val == 0:
                 locked = "Locked (no waiters)"
             elif count_val <= -1:
-                locked = f"Locked (with ~{abs(count_val)} waiter(s))"
+                locked = "Locked (with waiters)"  # refined below once waiters are counted
             else:
                 locked = f"Unknown (count={count_val})"
         except Exception as e:
@@ -146,7 +146,11 @@ def get_mutex_info(mutex_addr, list_waiters):
     }
 
     if list_waiters:
-        mutex_info["waiters"] = get_waiters(mutex)
+        waiters = get_waiters(mutex)
+        mutex_info["waiters"] = waiters
+        # Refine the locked status with the actual waiter count from the list.
+        if count_val is not None and count_val <= -1:
+            mutex_info["locked"] = f"Locked (with ~{len(waiters)} waiter(s))"
 
     return mutex_info
 
