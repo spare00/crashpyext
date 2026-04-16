@@ -25,6 +25,9 @@ DEFAULT_PAGE_SIZE = 4096
 PTR_SIZE = 8
 _STRUCT_FIELD_CACHE = {}
 _SYS_CACHE = None
+_SECTIONS = None
+DEFAULT_PAGES_PER_SECTION = 0x8000
+SECTION_MAP_MASK_FALLBACK = ~0xFF
 
 
 class CacheSummary:
@@ -59,6 +62,13 @@ class EstimateResult:
         self.tops = tops
         self.complete = complete
         self.note = note
+
+
+class SectionRow:
+    def __init__(self, nr, addr, pfn_base):
+        self.nr = nr
+        self.addr = addr
+        self.pfn_base = pfn_base
 
 
 def _read_sys_output():
@@ -126,6 +136,15 @@ def first_existing_member(typename, candidates):
     return None
 
 
+def parse_int_auto(tok):
+    s = tok.strip().lower().strip(",")
+    if s.startswith("0x"):
+        return int(s, 16)
+    if re.fullmatch(r"[0-9a-f]+", s):
+        return int(s, 16)
+    return int(s, 10)
+
+
 def detect_ptr_size():
     out = _read_sys_output()
     for line in out.splitlines():
@@ -191,6 +210,66 @@ def get_percpu_struct_addr(cache_addr, field, cpu):
         return None
     addr = cpu_base + percpu_off
     return addr if addr else None
+
+
+def get_struct_size(typename, default=0):
+    try:
+        out = exec_crash_command(f"p/x sizeof({typename})")
+        m = re.search(r'=\s*(0x[0-9a-fA-F]+|\d+)', out)
+        if m:
+            return int(m.group(1), 0)
+    except Exception:
+        pass
+    return default
+
+
+def get_pages_per_section():
+    rows = parse_kmem_n_sections_once()
+    if len(rows) >= 2:
+        diffs = []
+        for i in range(1, min(len(rows), 8)):
+            diff = rows[i].pfn_base - rows[i - 1].pfn_base
+            if diff > 0:
+                diffs.append(diff)
+        if diffs:
+            return diffs[0]
+    return DEFAULT_PAGES_PER_SECTION
+
+
+def parse_kmem_n_sections_once():
+    global _SECTIONS
+    if _SECTIONS is not None:
+        return _SECTIONS
+
+    out = exec_crash_command("kmem -n")
+    rows = []
+    in_table = False
+    for line in out.splitlines():
+        s = line.strip()
+        if s.startswith("NR") and "SECTION" in s and "PFN" in s:
+            in_table = True
+            continue
+        if not in_table or not s or not s[0].isdigit():
+            continue
+        toks = re.split(r"\s+", s)
+        try:
+            nr = int(toks[0], 10)
+            sec_addr = parse_int_auto(toks[1])
+            pfn_base = parse_int_auto(toks[-1])
+        except Exception:
+            m = re.match(r"^(\d+)\s+([0-9A-Fa-fx]+)\s+.*?([0-9A-Fa-fx]+)\s*$", s)
+            if not m:
+                continue
+            nr = int(m.group(1), 10)
+            sec_addr = parse_int_auto(m.group(2))
+            pfn_base = parse_int_auto(m.group(3))
+        rows.append(SectionRow(nr, sec_addr, pfn_base))
+
+    if not rows:
+        raise RuntimeError("Could not parse sections from `kmem -n`.")
+    rows.sort(key=lambda r: r.pfn_base)
+    _SECTIONS = rows
+    return rows
 
 
 def get_page_size(debug=False):
@@ -380,6 +459,67 @@ def parse_kmem_page_objects(page_addr, debug=False):
     return objs
 
 
+def get_section_mem_map_base(sec_addr):
+    sec = readSU("struct mem_section", sec_addr)
+    raw = int(sec.section_mem_map)
+    if raw == 0:
+        return 0
+    if (raw & 0x2) == 0:
+        return 0
+    return raw & SECTION_MAP_MASK_FALLBACK
+
+
+def iter_cache_backed_slab_pages(summary, debug=False):
+    """
+    Globally scan struct page arrays and find pages whose mapping points to the
+    target kmem_cache. This does not require kmem_cache_node/full lists.
+    """
+    rows = parse_kmem_n_sections_once()
+    pages_per_section = get_pages_per_section()
+    page_struct_sz = get_struct_size("struct page")
+    mapping_off = member_offset("struct page", "mapping")
+    if page_struct_sz <= 0 or mapping_off is None:
+        if debug:
+            print("[debug] global scan unavailable: sizeof(struct page) or mapping offset missing")
+        return set()
+
+    cache_addr_masked = int(summary.cache_addr) & SECTION_MAP_MASK_FALLBACK
+    candidate_pages = set()
+    chunk_pages = 2048
+
+    for row in rows:
+        base = get_section_mem_map_base(row.addr)
+        if not base:
+            continue
+        for idx in range(0, pages_per_section, chunk_pages):
+            count = min(chunk_pages, pages_per_section - idx)
+            start = base + ((row.pfn_base + idx) * page_struct_sz)
+            size = count * page_struct_sz
+            try:
+                blob = readmem(start, size)
+            except Exception as e:
+                if debug:
+                    print(f"[debug] readmem section {row.nr} offset {idx} failed: {e}")
+                continue
+            for i in range(count):
+                off = i * page_struct_sz + mapping_off
+                try:
+                    mapping = int.from_bytes(blob[off:off + PTR_SIZE], "little")
+                except Exception:
+                    continue
+                if not mapping:
+                    continue
+                if (mapping & SECTION_MAP_MASK_FALLBACK) != cache_addr_masked:
+                    continue
+                pfn = row.pfn_base + idx + i
+                page_addr = base + (pfn * page_struct_sz)
+                candidate_pages.add(page_addr)
+
+    if debug:
+        print(f"[debug] global candidate pages  : {len(candidate_pages)}")
+    return candidate_pages
+
+
 def get_slab_struct_type():
     if has_member("struct slab", "slab_list"):
         return "struct slab"
@@ -496,10 +636,14 @@ def get_full_mode_object_addrs(summary, debug=False):
         return []
 
     pages = set()
-    cpu_pages = get_cpu_slab_pages(summary.cache_addr, debug=debug)
-    node_pages = get_node_slab_pages(summary.cache_addr, debug=debug)
-    pages.update(cpu_pages)
-    pages.update(node_pages)
+    global_pages = iter_cache_backed_slab_pages(summary, debug=debug)
+    if global_pages:
+        pages.update(global_pages)
+    else:
+        cpu_pages = get_cpu_slab_pages(summary.cache_addr, debug=debug)
+        node_pages = get_node_slab_pages(summary.cache_addr, debug=debug)
+        pages.update(cpu_pages)
+        pages.update(node_pages)
 
     objs = []
     for page_addr in sorted(pages):
