@@ -41,9 +41,12 @@ def _extract_ascii_dump(text):
         if ":" not in line:
             continue
         _, payload = line.split(":", 1)
-        payload = payload.rstrip()
+        # `rd -a` prefixes each ASCII chunk with formatting spaces after the colon.
+        # Remove only that prefix and preserve the chunk's original whitespace.
+        if payload.startswith("  "):
+            payload = payload[2:]
         if payload:
-            chunks.append(payload.strip())
+            chunks.append(payload)
     if not chunks:
         raise RuntimeError("Failed to extract command line text from crash output:\n%s" % text)
     return "".join(chunks)
