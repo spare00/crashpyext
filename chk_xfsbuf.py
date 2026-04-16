@@ -11,8 +11,9 @@ Approach:
     3) Enumerate visible allocated objects with `kmem -S <cache>`.
     4) Read each xfs_buf and sum b_page_count * PAGE_SIZE.
 
-  Full mode (planned):
-    Walk slab internals directly so FULL slabs are included too.
+  Full mode:
+    Walk kmem_cache CPU/node slab pages and parse each slab page.
+    This is slower, but can include FULL slabs when the kernel exposes them.
 """
 
 import argparse
@@ -21,6 +22,9 @@ from pykdump.API import *
 from LinuxDump import crash
 
 DEFAULT_PAGE_SIZE = 4096
+PTR_SIZE = 8
+_STRUCT_FIELD_CACHE = {}
+_SYS_CACHE = None
 
 
 class CacheSummary:
@@ -56,6 +60,13 @@ class EstimateResult:
         self.complete = complete
         self.note = note
 
+
+def _read_sys_output():
+    global _SYS_CACHE
+    if _SYS_CACHE is None:
+        _SYS_CACHE = exec_crash_command("sys")
+    return _SYS_CACHE
+
 def _is_tty():
     import sys
     try:
@@ -72,10 +83,120 @@ def cyan(s):   return _color(s, "36")
 def fmt_mib_gib(kb):
     return f"{kb/1024:.2f} MiB / {kb/1024/1024:.2f} GiB"
 
+
+def member_offset(typename, member):
+    key = (typename, member)
+    if key in _STRUCT_FIELD_CACHE:
+        return _STRUCT_FIELD_CACHE[key]
+    off = None
+    try:
+        import crash as _cr
+        if hasattr(_cr, "member_offset"):
+            off = _cr.member_offset(typename, member)
+            if off is not None and off != -1:
+                off = int(off)
+            else:
+                off = None
+    except Exception:
+        off = None
+    if off is None:
+        try:
+            out = exec_crash_command(f"struct {typename} -o")
+            m = re.search(
+                rf'^\s*\[(0x[0-9a-fA-F]+|\d+)\]\s+.*\b{re.escape(member)}\b(?:\[.*\])?;',
+                out,
+                re.MULTILINE,
+            )
+            if m:
+                off = int(m.group(1), 0)
+        except Exception:
+            off = None
+    _STRUCT_FIELD_CACHE[key] = off
+    return off
+
+
+def has_member(typename, member):
+    return member_offset(typename, member) is not None
+
+
+def first_existing_member(typename, candidates):
+    for member in candidates:
+        if has_member(typename, member):
+            return member
+    return None
+
+
+def detect_ptr_size():
+    out = _read_sys_output()
+    for line in out.splitlines():
+        if line.startswith("MACHINE:"):
+            lower = line.lower()
+            if "x86_64" in lower or "aarch64" in lower or "ppc64" in lower or "64" in lower:
+                return 8
+            break
+    return PTR_SIZE
+
+
+def get_cpu_count():
+    out = _read_sys_output()
+    for line in out.splitlines():
+        m = re.search(r'CPUS:\s*(\d+)', line)
+        if m:
+            return int(m.group(1))
+    for sym in ("nr_cpu_ids", "nr_cpumask_bits"):
+        try:
+            return int(readSymbol(sym))
+        except Exception:
+            pass
+    return 1
+
+
+def get_node_count():
+    for sym in ("nr_node_ids",):
+        try:
+            val = int(readSymbol(sym))
+            if val > 0:
+                return val
+        except Exception:
+            pass
+    out = _read_sys_output()
+    for line in out.splitlines():
+        m = re.search(r'available:\s*(\d+)\s+nodes', line)
+        if m:
+            return int(m.group(1))
+    return 1
+
+
+def parse_this_cpu_off(cpu):
+    try:
+        out = exec_crash_command(f"p this_cpu_off:{cpu}")
+    except Exception:
+        return None
+    m = re.search(r'=\s*(0x[0-9a-fA-F]+|\d+)', out)
+    if not m:
+        return None
+    return int(m.group(1), 0)
+
+
+def get_percpu_struct_addr(cache_addr, field, cpu):
+    off = member_offset("struct kmem_cache", field)
+    if off is None:
+        return None
+    try:
+        percpu_off = int(readULong(cache_addr + off))
+    except Exception:
+        return None
+    cpu_base = parse_this_cpu_off(cpu)
+    if cpu_base is None:
+        return None
+    addr = cpu_base + percpu_off
+    return addr if addr else None
+
+
 def get_page_size(debug=False):
     """Derive PAGE_SIZE from `sys` output, falling back to 4 KiB."""
     try:
-        out = exec_crash_command("sys")
+        out = _read_sys_output()
         for line in out.splitlines():
             if "PAGE SIZE" not in line:
                 continue
@@ -227,6 +348,170 @@ def parse_kmem_S_objects(cache_name, debug=False):
         print(f"[debug] kmem -S {cache_name}: found {len(objs)} objects")
     return objs
 
+
+def parse_kmem_page_objects(page_addr, debug=False):
+    """
+    Return allocated object addresses from `kmem <page_addr>`.
+    """
+    try:
+        out = exec_crash_command(f"kmem 0x{page_addr:x}")
+    except Exception as e:
+        if debug:
+            print(f"[debug] kmem 0x{page_addr:x} failed: {e}")
+        return []
+
+    objs = []
+    in_object_list = False
+    for line in out.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("PAGE"):
+            in_object_list = False
+            continue
+        if s.startswith("FREE /"):
+            in_object_list = True
+            continue
+        if not in_object_list:
+            continue
+        match = re.fullmatch(r"\[\s*(0x)?([0-9a-fA-F]+)\s*\]", s)
+        if match:
+            objs.append(int(match.group(2), 16))
+    return objs
+
+
+def get_slab_struct_type():
+    if has_member("struct slab", "slab_list"):
+        return "struct slab"
+    return "struct page"
+
+
+def get_slab_list_field(struct_type):
+    return first_existing_member(struct_type, ("slab_list", "lru", "list"))
+
+
+def get_cpu_slab_pages(cache_addr, debug=False):
+    pages = set()
+    cpu_struct_field = "cpu_slab"
+    cpu_count = get_cpu_count()
+    active_field = None
+    partial_field = None
+
+    for candidate in ("slab", "page"):
+        if has_member("struct kmem_cache_cpu", candidate):
+            active_field = candidate
+            break
+    for candidate in ("partial",):
+        if has_member("struct kmem_cache_cpu", candidate):
+            partial_field = candidate
+            break
+
+    if active_field is None:
+        if debug:
+            print("[debug] struct kmem_cache_cpu has no slab/page field")
+        return pages
+
+    for cpu in range(cpu_count):
+        percpu_addr = get_percpu_struct_addr(cache_addr, cpu_struct_field, cpu)
+        if not percpu_addr:
+            continue
+        try:
+            cpu_slab = readSU("struct kmem_cache_cpu", percpu_addr)
+        except Exception as e:
+            if debug:
+                print(f"[debug] readSU(struct kmem_cache_cpu, 0x{percpu_addr:x}) failed: {e}")
+            continue
+        for field in (active_field, partial_field):
+            if not field:
+                continue
+            try:
+                page_addr = int(getattr(cpu_slab, field))
+            except Exception:
+                page_addr = 0
+            if page_addr:
+                pages.add(page_addr)
+    if debug:
+        print(f"[debug] cpu slab pages         : {len(pages)}")
+    return pages
+
+
+def get_node_slab_pages(cache_addr, debug=False):
+    pages = set()
+    list_counts = {}
+    node_member_off = member_offset("struct kmem_cache", "node")
+    if node_member_off is None:
+        return pages
+
+    node_count = get_node_count()
+    ptr_size = detect_ptr_size()
+    slab_struct = get_slab_struct_type()
+    list_field = get_slab_list_field(slab_struct)
+    if list_field is None:
+        if debug:
+            print(f"[debug] Could not find list field for {slab_struct}")
+        return pages
+
+    for nodeid in range(node_count):
+        try:
+            node_addr = readPtr(cache_addr + node_member_off + (nodeid * ptr_size))
+        except Exception:
+            continue
+        if not node_addr:
+            continue
+        for list_name in ("partial", "full"):
+            list_off = member_offset("struct kmem_cache_node", list_name)
+            if list_off is None:
+                continue
+            head_addr = node_addr + list_off
+            try:
+                slabs = readSUListFromHead(head_addr, list_field, slab_struct, maxel=100000)
+            except Exception as e:
+                if debug:
+                    print(f"[debug] readSUListFromHead({list_name}) failed for node {nodeid}: {e}")
+                continue
+            list_counts[list_name] = list_counts.get(list_name, 0) + len(slabs)
+            for slab in slabs:
+                try:
+                    pages.add(int(slab))
+                except Exception:
+                    try:
+                        pages.add(int(Addr(slab)))
+                    except Exception:
+                        pass
+    if debug:
+        partials = list_counts.get("partial", 0)
+        fulls = list_counts.get("full", 0)
+        print(f"[debug] node partial slabs     : {partials}")
+        print(f"[debug] node full slabs        : {fulls}")
+        print(f"[debug] node slab pages        : {len(pages)}")
+    return pages
+
+
+def get_full_mode_object_addrs(summary, debug=False):
+    """
+    Enumerate slab pages from kmem_cache internals, then parse `kmem <page>`
+    to recover allocated objects from partial/full slabs.
+    """
+    if summary is None or not summary.cache_addr:
+        return []
+
+    pages = set()
+    cpu_pages = get_cpu_slab_pages(summary.cache_addr, debug=debug)
+    node_pages = get_node_slab_pages(summary.cache_addr, debug=debug)
+    pages.update(cpu_pages)
+    pages.update(node_pages)
+
+    objs = []
+    for page_addr in sorted(pages):
+        objs.extend(parse_kmem_page_objects(page_addr, debug=debug))
+
+    objs = list(dict.fromkeys(objs))
+    if debug:
+        print(f"[debug] merged slab pages       : {len(pages)}")
+        print(f"[debug] full mode slab pages     : {len(pages)}")
+        print(f"[debug] full mode objects found : {len(objs)}")
+    return objs
+
 def buf_pages_kb(buf, page_size):
     try:
         pages = int(buf.b_page_count)
@@ -286,10 +571,32 @@ def estimate_xfsbuf_fast(cache_name, page_size, top_n=0, debug=False):
 
 def estimate_xfsbuf_full(cache_name, page_size, top_n=0, debug=False):
     """
-    Placeholder for a future slab-internal walk that includes FULL slabs.
+    Walk kmem_cache CPU/node slab pages and parse each slab page with `kmem`.
+    This is slower than `kmem -S`, but can include FULL slabs when the kernel
+    exposes them via kmem_cache_node lists.
     """
-    raise NotImplementedError(
-        "Full mode is not implemented yet; use the default fast mode for now."
+    summary = get_cache_summary(cache_name, debug=debug)
+    addrs = get_full_mode_object_addrs(summary, debug=debug)
+    total_kb, counted, tops = estimate_attached_pages(
+        addrs, page_size, top_n=top_n, debug=debug
+    )
+
+    complete = bool(summary and counted == summary.allocated)
+    note = None
+    if summary and counted < summary.allocated:
+        note = ("Full mode still did not recover every allocated object; "
+                "some slabs may not be reachable from the exposed cache lists.")
+
+    return EstimateResult(
+        mode="full",
+        summary=summary,
+        page_size=page_size,
+        addrs=addrs,
+        counted=counted,
+        total_kb=total_kb,
+        tops=tops,
+        complete=complete,
+        note=note,
     )
 
 
@@ -331,7 +638,7 @@ def main():
         "--mode",
         choices=("fast", "full"),
         default="fast",
-        help="fast=kmem -S lower-bound estimate, full=slab walk (planned)",
+        help="fast=kmem -S lower-bound estimate, full=slab page walk",
     )
     args = ap.parse_args()
     page_size = get_page_size(debug=args.debug)
@@ -358,6 +665,10 @@ def main():
     if not result.addrs and args.mode == "fast":
         print(f"Slab cache '{cache}' has no enumerated objects via `kmem -S`. "
               "Cannot estimate attached XFS buffer pages in fast mode.")
+        return
+    if not result.addrs and args.mode == "full":
+        print(f"Full mode could not recover slab pages for '{cache}'. "
+              "This kernel may not expose enough kmem_cache internals.")
         return
 
     print_summary(result, debug=args.debug)
