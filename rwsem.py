@@ -168,37 +168,56 @@ def get_reader_count(count_raw, is_readfail_reliable):
 
 
 def list_waiting_tasks(wait_list_addr):
-    """Print tasks queued in the rw_semaphore's wait_list."""
-    # FIX #4: Function previously fell off the end (returned None) on the
-    # success path and only returned [] in the except branch.  Now always
-    # returns a list of the printed rows.
-    print("\n**List of waiters in rw_semaphore wait_list**\n")
-    results = []
+    """
+    Return list of (pid, comm, state, task_addr, waiter_type) for tasks waiting on the
+    rw_semaphore.
+
+    Uses the same parsed waiter format as semaphore analysis so both lock
+    analyzers print a consistent waiter table, with rwsem-specific waiter type.
+    """
+    result = []
     try:
-        command = f"list -s rwsem_waiter.task,type -l rwsem_waiter.list {wait_list_addr:#x}"
-        print(f"Executing: {command}\n")
-        output = exec_crash_command(command)
+        cmd = f"list -s rwsem_waiter.task,type -l rwsem_waiter.list -H {wait_list_addr:#x}"
+        output = exec_crash_command(cmd)
         lines = [line.strip() for line in output.splitlines() if line.strip()]
 
-        # FIX #10: Original used `i + 2 < len(lines)` which silently dropped
-        # the last group whenever len(lines) % 3 != 0.  Now we handle partial
-        # groups explicitly with a warning so nothing is lost.
+        # Lines come in triplets: node_addr, "task = 0x...,", "type = ...,".
         i = 0
         while i < len(lines):
-            remaining = len(lines) - i
-            if remaining >= 3:
-                row = f"{lines[i]}  {lines[i+1]}  {lines[i+2]}"
-                print(row)
-                results.append(row)
-                i += 3
-            else:
-                partial = "  ".join(lines[i:])
-                print(f"Warning: incomplete waiter entry (expected 3 fields, got {remaining}): {partial}")
-                results.append(partial)
+            if i + 2 >= len(lines):
+                print(f"Warning: incomplete rwsem_waiter entry at line {i}: {lines[i]!r}")
                 break
+            try:
+                task_line = lines[i + 1]
+                type_line = lines[i + 2]
+                if "task =" in task_line:
+                    task_str = task_line.split("=", 1)[1].strip().rstrip(",")
+                    task_addr = int(task_str, 16)
+                    task = readSU("struct task_struct", task_addr)
+                    state = get_task_state(task)
+                    waiter_type = "Unknown"
+                    if "type =" in type_line:
+                        type_str = type_line.split("=", 1)[1].strip().rstrip(",")
+                        try:
+                            waiter_type = "Write" if int(type_str, 0) else "Read"
+                        except Exception:
+                            lowered = type_str.lower()
+                            if "write" in lowered:
+                                waiter_type = "Write"
+                            elif "read" in lowered:
+                                waiter_type = "Read"
+                            else:
+                                waiter_type = type_str
+                    result.append((task.pid, task.comm, state, task_addr, waiter_type))
+                else:
+                    result.append(("?", task_line, "?", 0, "?"))
+            except Exception as e:
+                dbg(f"list_waiting_tasks(): error at line {i}: {e}")
+                result.append(("?", lines[i], "?", 0, "?"))
+            i += 3
     except Exception as e:
         print(f"Error listing waiters for rw_semaphore at {wait_list_addr:#x}: {e}")
-    return results
+    return result
 
 
 def check_integrity(count, owner, reader_owned, owner_task_addr, is_readfail_reliable, reader_count, verbose=False):
@@ -550,5 +569,13 @@ def analyze_rw_semaphore_from_vmcore(rw_semaphore_addr, list_waiters=False, verb
     analyze_rw_semaphore(count_raw, is_readfail_reliable, owner_raw, arch, verbose)
 
     if list_waiters:
-        list_waiting_tasks(rwsem.wait_list)
-
+        waiters = list_waiting_tasks(int(rwsem.wait_list))
+        if waiters:
+            print("\nWaiting Tasks:")
+            print(f"{'PID':<10} {'State':<25} {'Type':<8} {'Address':<18} Command")
+            print("-" * 81)
+            for pid, comm, state, task_addr, waiter_type in waiters:
+                print(f"{pid!s:<10} {state:<25} {waiter_type:<8} {task_addr:#018x} {comm}")
+            print(f"\nNumber of waiters: {len(waiters)}")
+        else:
+            print("\nWaiting Tasks: none")

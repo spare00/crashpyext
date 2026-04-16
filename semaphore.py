@@ -143,6 +143,44 @@ def _classify(count: int, waiter_len: Optional[int]) -> Tuple[str, str, List[str
     return state, desc, issues
 
 
+def _lock_status_details(count: int, waiter_len: Optional[int]) -> Tuple[str, List[str]]:
+    """Return a lock-status label and detailed explanatory lines."""
+    details = []
+
+    if count > 0:
+        status = "Unlocked / Available"
+        details.append(f"Semaphore has {count} available slot(s); a down() can succeed immediately.")
+        if waiter_len is None:
+            details.append("Waiter count was not requested.")
+        elif waiter_len == 0:
+            details.append("No waiters are queued.")
+        else:
+            details.append(f"{waiter_len} waiter(s) are queued despite available slots.")
+    elif count == 0:
+        status = "Fully Held / No Free Slots"
+        details.append("Semaphore has no available slots; new acquirers must wait unless a holder releases it.")
+        if waiter_len is None:
+            details.append("Waiter count was not requested.")
+        elif waiter_len == 0:
+            details.append("No queued waiters were found at this snapshot.")
+        else:
+            details.append(f"{waiter_len} waiter(s) are queued for the next wakeup.")
+    else:
+        implied = -count
+        status = "Contended / Waiters Present"
+        details.append(
+            f"Negative count indicates contention; kernel bookkeeping suggests about {implied} waiter(s)."
+        )
+        if waiter_len is None:
+            details.append("Waiter count was not requested.")
+        elif waiter_len == 0:
+            details.append("The wait list was empty in this snapshot, which can happen during races or wakeups.")
+        else:
+            details.append(f"Observed wait list contains {waiter_len} waiter(s).")
+
+    return status, details
+
+
 def analyze_semaphore(info: dict, verbose: bool = False):
     """Print a human-readable analysis of a decoded semaphore."""
     if not info:
@@ -158,6 +196,12 @@ def analyze_semaphore(info: dict, verbose: bool = False):
 
     waiter_len            = len(info["waiters"]) if "waiters" in info else None
     state_type, desc, issues = _classify(count, waiter_len)
+    lock_status, lock_details = _lock_status_details(count, waiter_len)
+
+    print(f"\n  🔒 Lock Status:")
+    print(f"  {lock_status}")
+    for line in lock_details:
+        print(f"  - {line}")
 
     print(f"\n  🧠 Inferred State:")
     print(f"  {state_type}: {desc}")
@@ -168,11 +212,10 @@ def analyze_semaphore(info: dict, verbose: bool = False):
         waiters = info["waiters"]
         if waiters:
             print("\nWaiting Tasks:")
-            print(f"{'PID':<10} {'Command':<20} {'State':<25} Address")
+            print(f"{'PID':<10} {'State':<25} {'Address':<18} Command")
             print("-" * 72)
             for pid, comm, state, taddr in waiters:
-                print(f"{pid!s:<10} {comm:<20} {state:<25} {taddr:#x}")
+                print(f"{pid!s:<10} {state:<25} {taddr:#018x} {comm}")
             print(f"\nNumber of waiters: {len(waiters)}")
         else:
             print("\nWaiting Tasks: none")
-
