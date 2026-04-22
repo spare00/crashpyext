@@ -3,13 +3,26 @@
 # RHEL-focused, works inside crash via pykdump.API / pykdump.
 #
 # Usage inside crash:
-#   epython chk_cg.py <PID|TASK_POINTER>
+#   epython chk_cg.py -p <PID|TASK_POINTER>
+#   epython chk_cg.py -l [--controller cpu|memory|both]
 #
 # Example:
-#   epython chk_cg.py 22774
-#   epython chk_cg.py 0xffffa0b8412e4000
+#   epython chk_cg.py -p 22774
+#   epython chk_cg.py -p 0xffffa0b8412e4000
+#   epython chk_cg.py -l
 
 import sys, re, argparse
+
+VERBOSE = False
+DEBUG = False
+
+def vmsg(msg):
+    if VERBOSE or DEBUG:
+        print(f"[INFO] {msg}", file=sys.stderr)
+
+def dmsg(msg):
+    if DEBUG:
+        print(f"[DEBUG] {msg}", file=sys.stderr)
 
 # ---------------- colors ----------------
 class C:
@@ -187,11 +200,8 @@ def normalize_target(arg: str) -> str:
     matches = []
     for ln in ps_out.splitlines():
         if arg in ln:
-            toks = ln.split()
-            if not toks: continue
-            try:
-                pid = int(toks[0])
-            except ValueError:
+            pid = pid_from_ps_line(ln)
+            if pid is None:
                 continue
             tp = task_ptr_from_pid(pid)
             if tp:
@@ -223,6 +233,33 @@ def task_ptr_from_pid(pid: int) -> str:
             raw = m2.group(1).strip()
             ptr = raw if raw.startswith("0x") else "0x" + raw
     return ptr
+
+def pid_from_ps_line(line: str):
+    toks = line.split()
+    if not toks:
+        return None
+    idx = 1 if toks[0] == ">" else 0
+    if idx >= len(toks):
+        return None
+    try:
+        return int(toks[idx])
+    except ValueError:
+        return None
+
+def iter_ps_tasks():
+    """Yield (pid, task_ptr, comm) from crash `ps` output."""
+    out = x("ps")
+    for ln in out.splitlines():
+        toks = ln.split()
+        pid = pid_from_ps_line(ln)
+        if pid is None:
+            continue
+        m = ADDR_RE.search(ln)
+        if not m:
+            continue
+        task_ptr = "0x" + m.group(2).lower()
+        comm = toks[-1] if len(toks) > 1 else ""
+        yield pid, task_ptr, comm
 
 def fmt_ns(v) -> str:
     try:
@@ -872,16 +909,219 @@ def print_mem(mem):
                 line += f"  (pages: {wmp})"
             print(line)
 
+# ---------------- cgroup listing ----------------
+_CGROUP_ID_CACHE = {}
+_TG_BUDGET_CACHE = {}
+
+def _budget_desc(quota, period):
+    if quota is None:
+        return "quota=?"
+    if quota == -1 or (isinstance(quota, int) and quota >= 10**15):
+        return "unlimited"
+    if quota == 0:
+        return "disabled"
+    if period and period > 0:
+        return f"{100.0 * (quota / float(period)):.2f}% CPU"
+    return f"quota={quota} period={period}"
+
+def _limit_desc(limit):
+    if limit is None:
+        return "limit=?"
+    if limit == -1 or limit >= (1 << 60):
+        return "unlimited"
+    return fmt_bytes(limit)
+
+def _cg_key(controller, info):
+    path = info.get("path") or (info.get("name") if info.get("name") not in (None, "") else None) or "/"
+    return (controller, path, info.get("cgroup") or "", info.get("kn") or "")
+
+def _remember_task(row, pid, comm):
+    row["tasks"] += 1
+    if len(row["samples"]) < 5:
+        row["samples"].append(f"{pid}:{comm}")
+
+def cgroup_identity_from_css_cached(css):
+    css_addr = addr_only(css) or str(css)
+    if css_addr in _CGROUP_ID_CACHE:
+        return _CGROUP_ID_CACHE[css_addr]
+    name, cg, kn = cgroup_name_from_css(css)
+    path = cgroup_path_for(cg, kn) if (cg or kn) else None
+    ident = (name, path, cg, kn)
+    _CGROUP_ID_CACHE[css_addr] = ident
+    return ident
+
+def cpu_budget_from_tg_cached(tg_addr):
+    if not tg_addr:
+        return (None, None)
+    if tg_addr in _TG_BUDGET_CACHE:
+        return _TG_BUDGET_CACHE[tg_addr]
+    period = quota = None
+    try:
+        period = to_int(p_eval(f"((struct task_group *){tg_addr})->cfs_bandwidth.period"))
+        quota = to_int(p_eval(f"((struct task_group *){tg_addr})->cfs_bandwidth.quota"))
+    except Exception as e:
+        dmsg(f"task_group {tg_addr} cpu budget read failed: {e}")
+    _TG_BUDGET_CACHE[tg_addr] = (quota, period)
+    return quota, period
+
+def collect_cpu_list_entry(task_ptr):
+    """Cheap CPU cgroup snapshot for list mode.
+
+    Avoid per-runqueue scheduler fields here. On some vmcores those reads are
+    slow or fail noisily when repeated across every task.
+    """
+    out = {}
+    cpu_css = p_eval(f"((struct task_struct *){task_ptr})->cgroups->subsys[1]")
+    out["cpu_css"] = cpu_css
+
+    name, path, cg, kn = cgroup_identity_from_css_cached(cpu_css)
+    out["name"] = name
+    out["path"] = path
+    out["cgroup"] = cg
+    out["kn"] = kn
+
+    tg = p_eval(f"((struct task_struct *){task_ptr})->sched_task_group")
+    tg_addr = addr_only(tg) or tg
+    out["tg"] = tg_addr
+    if tg_addr:
+        quota, period = cpu_budget_from_tg_cached(tg_addr)
+        out["period_ns"] = period
+        out["quota_ns"] = quota
+    return out
+
+def collect_mem_list_entry(task_ptr):
+    """Cheap memory cgroup identity snapshot for list mode."""
+    out = {}
+    mem_css = p_eval(f"((struct task_struct *){task_ptr})->cgroups->subsys[4]")
+    out["mem_css"] = mem_css
+
+    name, path, cg, kn = cgroup_identity_from_css_cached(mem_css)
+    out["name"] = name
+    out["path"] = path
+    out["cgroup"] = cg
+    out["kn"] = kn
+    return out
+
+def collect_cgroup_list(controller="both"):
+    groups = {}
+    total_tasks = 0
+    errors = []
+
+    vmsg(f"scanning tasks from crash ps for {controller} cgroups")
+    for pid, task_ptr, comm in iter_ps_tasks():
+        total_tasks += 1
+        if DEBUG and (total_tasks == 1 or total_tasks % 100 == 0):
+            dmsg(f"visited {total_tasks} tasks; current PID={pid} TASK={task_ptr} COMM={comm}")
+        if controller in ("cpu", "both"):
+            try:
+                cpu = collect_cpu_list_entry(task_ptr)
+                key = _cg_key("cpu", cpu)
+                row = groups.setdefault(key, {
+                    "controller": "cpu",
+                    "path": key[1],
+                    "cgroup": key[2],
+                    "kn": key[3],
+                    "tasks": 0,
+                    "samples": [],
+                    "quota": cpu.get("quota_ns"),
+                    "period": cpu.get("period_ns"),
+                })
+                _remember_task(row, pid, comm)
+            except Exception as e:
+                err = f"PID {pid} cpu: {e}"
+                errors.append(err)
+                dmsg(err)
+
+        if controller in ("memory", "both"):
+            try:
+                mem = collect_mem_list_entry(task_ptr)
+                key = _cg_key("memory", mem)
+                row = groups.setdefault(key, {
+                    "controller": "memory",
+                    "path": key[1],
+                    "cgroup": key[2],
+                    "kn": key[3],
+                    "tasks": 0,
+                    "samples": [],
+                })
+                _remember_task(row, pid, comm)
+            except Exception as e:
+                err = f"PID {pid} memory: {e}"
+                errors.append(err)
+                dmsg(err)
+
+    vmsg(f"discovered {len(groups)} {controller} cgroup entries from {total_tasks} tasks")
+    return groups, total_tasks, errors
+
+def print_cgroup_list(controller="both", debug=False):
+    groups, total_tasks, errors = collect_cgroup_list(controller)
+    print(f"{C.BOLD}== Cgroups =={C.RESET}")
+    print(f" source : tasks from crash ps")
+    print(f" tasks  : {total_tasks}")
+    print(f" groups : {len(groups)}")
+    if errors:
+        print(f" errors : {len(errors)} task/controller reads failed")
+        if debug:
+            for err in errors[:20]:
+                print(f"   {err}")
+            if len(errors) > 20:
+                print(f"   ... {len(errors) - 20} more")
+
+    by_ctl = {"cpu": [], "memory": []}
+    for row in groups.values():
+        by_ctl.setdefault(row["controller"], []).append(row)
+
+    for ctl in ("cpu", "memory"):
+        rows = by_ctl.get(ctl) or []
+        if controller != "both" and ctl != controller:
+            continue
+        print(f"\n{C.BOLD}== {ctl.upper()} cgroups =={C.RESET}")
+        if not rows:
+            print(" (none discovered)")
+            continue
+        rows.sort(key=lambda r: (r["path"], r["cgroup"]))
+        for row in rows:
+            print(f" {C.CYAN}{row['path']}{C.RESET}")
+            print(f"   tasks : {row['tasks']}  samples: {', '.join(row['samples'])}")
+            if row.get("cgroup"):
+                print(f"   cgrp  : {row['cgroup']}")
+            if row.get("kn"):
+                print(f"   kn    : {row['kn']}")
+            if ctl == "cpu":
+                print(f"   budget: {_budget_desc(row.get('quota'), row.get('period'))}")
+            else:
+                print(f"   memcg : {row['cgroup'] or 'unknown'}")
+
 # ---------------- main ----------------
 def main():
+    global VERBOSE, DEBUG
+
     ap = argparse.ArgumentParser(
         description="Show CPU/memory cgroup limits for a task (vmcore via crash epython)."
     )
-    ap.add_argument("target", nargs=1, help="PID or task_struct pointer (e.g., 22774 or 0xffff...)")
+    ap.add_argument("-p", "--pid", dest="target", metavar="PID|TASK",
+                    help="PID, COMM substring, or task_struct pointer to inspect")
+    ap.add_argument("-l", "--list-cgroups", action="store_true",
+                    help="List cgroups discovered from all tasks in crash ps")
+    ap.add_argument("-c", "--controller", choices=("cpu", "memory", "both"), default="both",
+                    help="Controller to show with --list-cgroups (default: both)")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="Print progress messages to stderr")
+    ap.add_argument("-d", "--debug", action="store_true",
+                    help="Print debug messages and detailed read failures to stderr")
     args = ap.parse_args()
 
-    target = normalize_target(args.target[0])
-    comm = p_eval(f"((struct task_struct *){target})->comm") or ""
+    VERBOSE = args.verbose
+    DEBUG = args.debug
+
+    if args.list_cgroups:
+        print_cgroup_list(args.controller, debug=args.debug)
+        return
+
+    if not args.target:
+        ap.error("-p/--pid is required unless --list-cgroups is used")
+
+    target = normalize_target(args.target)
     pid  = to_int(p_eval(f"((struct task_struct *){target})->pid"))
     # strip quotes and any trailing NULs crash prints
     raw_comm = p_eval(f"((struct task_struct *){target})->comm") or ""
@@ -907,4 +1147,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
