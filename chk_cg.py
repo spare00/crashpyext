@@ -5,11 +5,15 @@
 # Usage inside crash:
 #   epython chk_cg.py -p <PID|TASK_POINTER>
 #   epython chk_cg.py -l [--controller cpu|memory|both]
+#   epython chk_cg.py -l --all
+#   epython chk_cg.py -l --summary
 #
 # Example:
 #   epython chk_cg.py -p 22774
 #   epython chk_cg.py -p 0xffffa0b8412e4000
 #   epython chk_cg.py -l
+#   epython chk_cg.py -l --all
+#   epython chk_cg.py -l --summary
 
 import sys, re, argparse
 
@@ -181,6 +185,13 @@ def to_int(s: str):
         return int(tok, 10)
     except Exception:
         return None
+
+def addr_int(s: str):
+    a = addr_only(s)
+    return int(a, 16) if a else None
+
+def addr_hex(v: int) -> str:
+    return f"0x{int(v):016x}"
 
 def normalize_target(arg: str) -> str:
     # Pure PID
@@ -912,6 +923,7 @@ def print_mem(mem):
 # ---------------- cgroup listing ----------------
 _CGROUP_ID_CACHE = {}
 _TG_BUDGET_CACHE = {}
+_CGROUP_CHILD_LIST_MEMBERS = None
 
 def _budget_desc(quota, period):
     if quota is None:
@@ -1001,6 +1013,285 @@ def collect_mem_list_entry(task_ptr):
     out["cgroup"] = cg
     out["kn"] = kn
     return out
+
+def list_head_next(head_addr):
+    nxt = p_eval(f"((struct list_head *){head_addr})->next")
+    return addr_only(nxt)
+
+def struct_member_addr(typename, obj_addr, member):
+    return addr_only(p_eval(f"&((struct {typename} *){obj_addr})->{member}"))
+
+def member_addr_offset(typename, member):
+    off = member_offset(typename, member)
+    if off is not None:
+        return off
+    if "." not in member:
+        return None
+    try:
+        return to_int(p_eval(f"(unsigned long)&(((struct {typename} *)0)->{member})"))
+    except Exception:
+        return None
+
+def symbol_addr(name):
+    try:
+        return addr_only(p_eval(f"&{name}"))
+    except Exception:
+        try:
+            out = x(f"sym {name}")
+            return addr_only(out)
+        except Exception as e:
+            dmsg(f"symbol lookup failed for {name}: {e}")
+            return None
+
+def cgroup_identity_from_cgrp_cached(cg_addr):
+    key = "cg:" + str(cg_addr)
+    if key in _CGROUP_ID_CACHE:
+        return _CGROUP_ID_CACHE[key]
+    kn = None
+    name = None
+    if has_member("cgroup", "kn"):
+        try:
+            kn = addr_only(p_eval(f"((struct cgroup *){cg_addr})->kn"))
+            if kn:
+                name = _extract_cstr(p_eval(f"((struct kernfs_node *){kn})->name"))
+        except Exception as e:
+            dmsg(f"cgroup {cg_addr} kernfs identity failed: {e}")
+    if not name and has_member("cgroup", "dentry"):
+        try:
+            dentry = addr_only(p_eval(f"((struct cgroup *){cg_addr})->dentry"))
+            name = _qstr_name_from_dentry(dentry) if dentry else None
+        except Exception as e:
+            dmsg(f"cgroup {cg_addr} dentry identity failed: {e}")
+    path = cgroup_path_for(cg_addr, kn)
+    ident = (name, path, cg_addr, kn)
+    _CGROUP_ID_CACHE[key] = ident
+    return ident
+
+def cgroup_leaf_from_cgrp(cg_addr):
+    key = "leaf:" + str(cg_addr)
+    if key in _CGROUP_ID_CACHE:
+        return _CGROUP_ID_CACHE[key]
+    name = None
+    kn = None
+    if has_member("cgroup", "kn"):
+        try:
+            kn = addr_only(p_eval(f"((struct cgroup *){cg_addr})->kn"))
+            if kn:
+                name = _extract_cstr(p_eval(f"((struct kernfs_node *){kn})->name"))
+        except Exception as e:
+            dmsg(f"cgroup {cg_addr} leaf kernfs read failed: {e}")
+    if not name and has_member("cgroup", "dentry"):
+        try:
+            dentry = addr_only(p_eval(f"((struct cgroup *){cg_addr})->dentry"))
+            name = _qstr_name_from_dentry(dentry) if dentry else None
+        except Exception as e:
+            dmsg(f"cgroup {cg_addr} leaf dentry read failed: {e}")
+    if not name or name == "/":
+        name = ""
+    leaf = (name, kn)
+    _CGROUP_ID_CACHE[key] = leaf
+    return leaf
+
+def join_cgroup_path(parent_path, leaf):
+    if not leaf:
+        return parent_path or "/"
+    if not parent_path or parent_path == "/":
+        return "/" + leaf
+    return parent_path.rstrip("/") + "/" + leaf
+
+def root_cgroup_from_root_addr(root_addr, root_type):
+    if has_member(root_type, "cgrp"):
+        cg = struct_member_addr(root_type, root_addr, "cgrp")
+        if cg:
+            return cg
+    if has_member(root_type, "top_cgroup"):
+        cg = p_eval(f"((struct {root_type} *){root_addr})->top_cgroup")
+        return addr_only(cg)
+    return None
+
+def discover_cgroup_roots():
+    roots = []
+    seen = set()
+
+    dfl_root = symbol_addr("cgrp_dfl_root")
+    if dfl_root:
+        cg = root_cgroup_from_root_addr(dfl_root, "cgroup_root")
+        if cg and cg not in seen:
+            roots.append(cg)
+            seen.add(cg)
+            dmsg(f"found default cgroup root: root={dfl_root} cgrp={cg}")
+
+    root_list_head = None
+    for sym in ("cgroup_roots", "cgroup_root_list"):
+        root_list_head = symbol_addr(sym)
+        if root_list_head:
+            dmsg(f"found cgroup root list via {sym}: {root_list_head}")
+            break
+
+    if root_list_head:
+        for root_type in ("cgroup_root", "cgroupfs_root"):
+            if not has_member(root_type, "root_list"):
+                continue
+            for root_addr in walk_list_entries(root_list_head, root_type, "root_list", limit=128):
+                cg = root_cgroup_from_root_addr(root_addr, root_type)
+                if cg and cg not in seen:
+                    roots.append(cg)
+                    seen.add(cg)
+                    dmsg(f"found cgroup root from root list: type={root_type} root={root_addr} cgrp={cg}")
+                if not cg:
+                    dmsg(f"could not derive top cgroup from {root_type} {root_addr}")
+            if roots:
+                break
+
+    return roots
+
+def walk_list_entries(head_addr, typename, member, limit=100000):
+    off = member_addr_offset(typename, member)
+    if off is None:
+        return
+    head_i = addr_int(head_addr)
+    cur = list_head_next(head_addr)
+    seen = set()
+    count = 0
+    while cur:
+        cur_i = addr_int(cur)
+        if cur_i is None or cur_i == head_i or cur in seen:
+            break
+        seen.add(cur)
+        yield addr_hex(cur_i - off)
+        count += 1
+        if count >= limit:
+            dmsg(f"stopped walking {typename}.{member} at limit={limit}")
+            break
+        cur = list_head_next(cur)
+
+def cgroup_child_list_members():
+    global _CGROUP_CHILD_LIST_MEMBERS
+    if _CGROUP_CHILD_LIST_MEMBERS is not None:
+        return _CGROUP_CHILD_LIST_MEMBERS
+    for head_member, entry_member in (
+        ("children", "sibling"),
+        ("children", "sibling_node"),
+        ("self.children", "self.sibling"),
+        ("self.children", "self.sibling_node"),
+    ):
+        if member_addr_offset("cgroup", head_member) is not None and member_addr_offset("cgroup", entry_member) is not None:
+            _CGROUP_CHILD_LIST_MEMBERS = (head_member, entry_member)
+            dmsg(f"using cgroup child list members: {head_member}/{entry_member}")
+            return _CGROUP_CHILD_LIST_MEMBERS
+    _CGROUP_CHILD_LIST_MEMBERS = (None, None)
+    dmsg("no cgroup child list members discovered")
+    return _CGROUP_CHILD_LIST_MEMBERS
+
+def walk_cgroup_tree(root_cg, limit=100000):
+    stack = [root_cg]
+    seen = set()
+    head_member, entry_member = cgroup_child_list_members()
+    while stack:
+        cg = stack.pop()
+        if not cg or cg in seen:
+            continue
+        seen.add(cg)
+        yield cg
+        if len(seen) >= limit:
+            dmsg(f"stopped walking cgroup tree at limit={limit}")
+            break
+        if not head_member or not entry_member:
+            continue
+        try:
+            head = struct_member_addr("cgroup", cg, head_member)
+            children = list(walk_list_entries(head, "cgroup", entry_member, limit=limit))
+            stack.extend(reversed(children))
+        except Exception as e:
+            dmsg(f"children walk failed for cgroup {cg}: {e}")
+
+def walk_cgroup_tree_paths(root_cg, limit=100000):
+    stack = [(root_cg, "/")]
+    seen = set()
+    head_member, entry_member = cgroup_child_list_members()
+    while stack:
+        cg, path = stack.pop()
+        if not cg or cg in seen:
+            continue
+        seen.add(cg)
+        leaf, kn = cgroup_leaf_from_cgrp(cg)
+        cur_path = "/" if path == "/" and not leaf else path
+        yield cg, cur_path, kn
+        if DEBUG and len(seen) % 1000 == 0:
+            dmsg(f"walked {len(seen)} cgroups under root {root_cg}; current={cur_path}")
+        if len(seen) >= limit:
+            dmsg(f"stopped walking cgroup tree at limit={limit}")
+            break
+        if not head_member or not entry_member:
+            continue
+        try:
+            head = struct_member_addr("cgroup", cg, head_member)
+            children = []
+            for child in walk_list_entries(head, "cgroup", entry_member, limit=limit):
+                child_leaf, _child_kn = cgroup_leaf_from_cgrp(child)
+                children.append((child, join_cgroup_path(cur_path, child_leaf)))
+            stack.extend(reversed(children))
+        except Exception as e:
+            dmsg(f"children path walk failed for cgroup {cg}: {e}")
+
+def collect_task_cgroup_counts():
+    counts = {}
+    total_tasks = 0
+    for pid, task_ptr, comm in iter_ps_tasks():
+        total_tasks += 1
+        seen_for_task = set()
+        for ctl, expr in (
+            ("cpu", f"((struct task_struct *){task_ptr})->cgroups->subsys[1]"),
+            ("memory", f"((struct task_struct *){task_ptr})->cgroups->subsys[4]"),
+        ):
+            try:
+                css = p_eval(expr)
+                _name, _path, cg, _kn = cgroup_identity_from_css_cached(css)
+                if not cg:
+                    continue
+                row = counts.setdefault(cg, {"tasks": 0, "samples": [], "controllers": set()})
+                row["controllers"].add(ctl)
+                if cg in seen_for_task:
+                    continue
+                seen_for_task.add(cg)
+                row["tasks"] += 1
+                if len(row["samples"]) < 5:
+                    row["samples"].append(f"{pid}:{comm}")
+            except Exception as e:
+                dmsg(f"PID {pid} {ctl} count failed: {e}")
+    return counts, total_tasks
+
+def collect_all_cgroups():
+    rows = {}
+    roots = discover_cgroup_roots()
+    counts, total_tasks = collect_task_cgroup_counts()
+
+    for root in roots:
+        for cg, path, kn in walk_cgroup_tree_paths(root):
+            task_info = counts.get(cg, {})
+            rows[cg] = {
+                "path": path or "/",
+                "cgroup": cg,
+                "kn": kn,
+                "tasks": task_info.get("tasks", 0),
+                "samples": task_info.get("samples", []),
+                "controllers": ",".join(sorted(task_info.get("controllers", []))),
+            }
+
+    for cg_addr, task_info in counts.items():
+        if cg_addr in rows:
+            continue
+        name, path, _cg, kn = cgroup_identity_from_cgrp_cached(cg_addr)
+        rows[cg_addr] = {
+            "path": path or name or "/",
+            "cgroup": cg_addr,
+            "kn": kn,
+            "tasks": task_info.get("tasks", 0),
+            "samples": task_info.get("samples", []),
+            "controllers": ",".join(sorted(task_info.get("controllers", []))),
+        }
+
+    return rows, roots, total_tasks
 
 def collect_cgroup_list(controller="both"):
     groups = {}
@@ -1092,6 +1383,105 @@ def print_cgroup_list(controller="both", debug=False):
             else:
                 print(f"   memcg : {row['cgroup'] or 'unknown'}")
 
+def print_all_cgroups(debug=False):
+    rows, roots, total_tasks = collect_all_cgroups()
+    print(f"{C.BOLD}== All Cgroups =={C.RESET}")
+    print(" source : kernel cgroup tree")
+    print(f" roots  : {len(roots)}")
+    print(f" tasks  : {total_tasks}")
+    print(f" groups : {len(rows)}")
+    if not roots:
+        print(" note   : no cgroup roots discovered; falling back to task-visible cgroups only")
+
+    for row in sorted(rows.values(), key=lambda r: (r["path"], r["cgroup"])):
+        empty = row["tasks"] == 0
+        marker = f" {C.YELLOW}(empty){C.RESET}" if empty else ""
+        print(f" {C.CYAN}{row['path']}{C.RESET}{marker}")
+        samples = ", ".join(row["samples"]) if row["samples"] else "-"
+        print(f"   tasks : {row['tasks']}  samples: {samples}")
+        if row.get("controllers"):
+            print(f"   seen  : {row['controllers']}")
+        print(f"   cgrp  : {row['cgroup']}")
+        if row.get("kn"):
+            print(f"   kn    : {row['kn']}")
+
+def unit_suffix(path):
+    leaf = (path or "/").rstrip("/").split("/")[-1]
+    if "." not in leaf:
+        return "(no suffix)"
+    suffix = leaf.rsplit(".", 1)[-1]
+    return "." + suffix if suffix else "(no suffix)"
+
+def top_bucket(path):
+    parts = [p for p in (path or "/").split("/") if p]
+    if not parts:
+        return "/"
+    if parts[0] in ("system.slice", "user.slice", "machine.slice"):
+        return parts[0]
+    return "/" + parts[0]
+
+def inc_counter(d, key, n=1):
+    d[key] = d.get(key, 0) + n
+
+def print_counter(title, counts, limit=None):
+    print(f"\n{C.BOLD}== {title} =={C.RESET}")
+    if not counts:
+        print(" (none)")
+        return
+    rows = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    if limit is not None:
+        rows = rows[:limit]
+    for key, val in rows:
+        print(f" {key:32s} {val}")
+
+def print_cgroup_summary(debug=False):
+    rows, roots, total_tasks = collect_all_cgroups()
+    total = len(rows)
+    empty = sum(1 for r in rows.values() if r.get("tasks", 0) == 0)
+    non_empty = total - empty
+
+    suffix_counts = {}
+    empty_suffix_counts = {}
+    top_counts = {}
+    empty_top_counts = {}
+    mount_parent_counts = {}
+    empty_mount_parent_counts = {}
+
+    for row in rows.values():
+        path = row.get("path") or "/"
+        suffix = unit_suffix(path)
+        bucket = top_bucket(path)
+        inc_counter(suffix_counts, suffix)
+        inc_counter(top_counts, bucket)
+        if row.get("tasks", 0) == 0:
+            inc_counter(empty_suffix_counts, suffix)
+            inc_counter(empty_top_counts, bucket)
+        if suffix == ".mount":
+            parts = [p for p in path.split("/") if p]
+            parent = parts[0] if parts else "/"
+            inc_counter(mount_parent_counts, parent)
+            if row.get("tasks", 0) == 0:
+                inc_counter(empty_mount_parent_counts, parent)
+
+    print(f"{C.BOLD}== Cgroup Summary =={C.RESET}")
+    print(" source : kernel cgroup tree (--all implied)")
+    print(f" roots  : {len(roots)}")
+    print(f" tasks  : {total_tasks}")
+    print(f" groups : {total}")
+    print(f" empty  : {empty}")
+    print(f" active : {non_empty}")
+    if total:
+        print(f" empty% : {100.0 * empty / float(total):.2f}%")
+    if not roots:
+        print(" note   : no cgroup roots discovered; summary is task-visible cgroups only")
+
+    print_counter("By Unit Suffix", suffix_counts)
+    print_counter("Empty By Unit Suffix", empty_suffix_counts)
+    print_counter("Mount Units By Parent", mount_parent_counts, limit=20)
+    print_counter("Empty Mount Units By Parent", empty_mount_parent_counts, limit=20)
+    print_counter("By Top Path", top_counts, limit=20)
+    print_counter("Empty By Top Path", empty_top_counts, limit=20)
+
 # ---------------- main ----------------
 def main():
     global VERBOSE, DEBUG
@@ -1103,6 +1493,10 @@ def main():
                     help="PID, COMM substring, or task_struct pointer to inspect")
     ap.add_argument("-l", "--list-cgroups", action="store_true",
                     help="List cgroups discovered from all tasks in crash ps")
+    ap.add_argument("--all", action="store_true",
+                    help="With -l, walk kernel cgroup trees so empty cgroups are included")
+    ap.add_argument("--summary", action="store_true",
+                    help="With -l, print all-cgroup counts by suffix and top path; implies --all")
     ap.add_argument("-c", "--controller", choices=("cpu", "memory", "both"), default="both",
                     help="Controller to show with --list-cgroups (default: both)")
     ap.add_argument("-v", "--verbose", action="store_true",
@@ -1115,8 +1509,19 @@ def main():
     DEBUG = args.debug
 
     if args.list_cgroups:
+        if args.summary:
+            print_cgroup_summary(debug=args.debug)
+            return
+        if args.all:
+            print_all_cgroups(debug=args.debug)
+            return
         print_cgroup_list(args.controller, debug=args.debug)
         return
+
+    if args.all:
+        ap.error("--all is only valid with -l/--list-cgroups")
+    if args.summary:
+        ap.error("--summary is only valid with -l/--list-cgroups")
 
     if not args.target:
         ap.error("-p/--pid is required unless --list-cgroups is used")
