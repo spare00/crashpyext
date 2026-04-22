@@ -63,18 +63,40 @@ def rhel_major():
 
 # ---------------- crash/pykdump glue ----------------
 _CRASH = None
+_READPTR = None
+_READMEM = None
 _CRASH_IMPORT_ERR = None
 
 def _init_crash():
-    global _CRASH, _CRASH_IMPORT_ERR
+    global _CRASH, _READPTR, _READMEM, _CRASH_IMPORT_ERR
     try:
         from pykdump.API import exec_crash_command as _exec
         _CRASH = _exec
+        try:
+            from pykdump.API import readPtr as _rp
+            _READPTR = _rp
+        except Exception:
+            _READPTR = None
+        try:
+            from pykdump.API import readmem as _rm
+            _READMEM = _rm
+        except Exception:
+            _READMEM = None
         return
     except Exception as e_api:
         try:
             from pykdump import exec_crash_command as _exec
             _CRASH = _exec
+            try:
+                from pykdump import readPtr as _rp
+                _READPTR = _rp
+            except Exception:
+                _READPTR = None
+            try:
+                from pykdump import readmem as _rm
+                _READMEM = _rm
+            except Exception:
+                _READMEM = None
             return
         except Exception as e_base:
             _CRASH = None
@@ -192,6 +214,38 @@ def addr_int(s: str):
 
 def addr_hex(v: int) -> str:
     return f"0x{int(v):016x}"
+
+def ptr_hex(v):
+    try:
+        i = int(v)
+    except Exception:
+        return None
+    return addr_hex(i) if i else None
+
+def _readmem_bytes(addr, size):
+    if _CRASH is None:
+        _init_crash()
+    if _READMEM is None:
+        return None
+    data = _READMEM(addr, size)
+    if isinstance(data, bytes):
+        return data
+    if isinstance(data, str):
+        return data.encode("latin1", "ignore")
+    return bytes(data)
+
+def read_cstring(addr, maxlen=256):
+    if not addr:
+        return None
+    try:
+        data = _readmem_bytes(int(addr, 16) if isinstance(addr, str) else int(addr), maxlen)
+        if not data:
+            return None
+        data = data.split(b"\x00", 1)[0]
+        return data.decode("utf-8", "replace")
+    except Exception as e:
+        dmsg(f"read_cstring({addr}) failed: {e}")
+        return None
 
 def normalize_target(arg: str) -> str:
     # Pure PID
@@ -453,6 +507,11 @@ def cgroup_path_for(cg_addr: str, kn_addr: str):
 
 def _qstr_name_from_dentry(dentry_addr: str) -> str:
     try:
+        name_ptr = read_member_ptr("dentry", dentry_addr, "d_name.name")
+        if name_ptr:
+            name = read_cstring(name_ptr)
+            if name:
+                return name
         nm = p_eval(f"((struct dentry *){dentry_addr})->d_name.name")
         return _extract_cstr(nm)
     except Exception:
@@ -1015,6 +1074,13 @@ def collect_mem_list_entry(task_ptr):
     return out
 
 def list_head_next(head_addr):
+    if _CRASH is None:
+        _init_crash()
+    if _READPTR is not None:
+        try:
+            return ptr_hex(_READPTR(int(head_addr, 16)))
+        except Exception as e:
+            dmsg(f"readPtr(list_head.next {head_addr}) failed, falling back to p: {e}")
     nxt = p_eval(f"((struct list_head *){head_addr})->next")
     return addr_only(nxt)
 
@@ -1043,6 +1109,20 @@ def symbol_addr(name):
             dmsg(f"symbol lookup failed for {name}: {e}")
             return None
 
+def read_member_ptr(typename, obj_addr, member):
+    if _CRASH is None:
+        _init_crash()
+    if _READPTR is not None:
+        off = member_offset(typename, member)
+        if off is None and "." in member:
+            off = member_addr_offset(typename, member)
+        if off is not None:
+            try:
+                return ptr_hex(_READPTR(int(obj_addr, 16) + off))
+            except Exception as e:
+                dmsg(f"readPtr({typename}.{member} {obj_addr}) failed, falling back to p: {e}")
+    return addr_only(p_eval(f"((struct {typename} *){obj_addr})->{member}"))
+
 def cgroup_identity_from_cgrp_cached(cg_addr):
     key = "cg:" + str(cg_addr)
     if key in _CGROUP_ID_CACHE:
@@ -1051,14 +1131,17 @@ def cgroup_identity_from_cgrp_cached(cg_addr):
     name = None
     if has_member("cgroup", "kn"):
         try:
-            kn = addr_only(p_eval(f"((struct cgroup *){cg_addr})->kn"))
+            kn = read_member_ptr("cgroup", cg_addr, "kn")
             if kn:
-                name = _extract_cstr(p_eval(f"((struct kernfs_node *){kn})->name"))
+                name_ptr = read_member_ptr("kernfs_node", kn, "name")
+                name = read_cstring(name_ptr) if name_ptr else None
+                if not name:
+                    name = _extract_cstr(p_eval(f"((struct kernfs_node *){kn})->name"))
         except Exception as e:
             dmsg(f"cgroup {cg_addr} kernfs identity failed: {e}")
     if not name and has_member("cgroup", "dentry"):
         try:
-            dentry = addr_only(p_eval(f"((struct cgroup *){cg_addr})->dentry"))
+            dentry = read_member_ptr("cgroup", cg_addr, "dentry")
             name = _qstr_name_from_dentry(dentry) if dentry else None
         except Exception as e:
             dmsg(f"cgroup {cg_addr} dentry identity failed: {e}")
@@ -1075,14 +1158,17 @@ def cgroup_leaf_from_cgrp(cg_addr):
     kn = None
     if has_member("cgroup", "kn"):
         try:
-            kn = addr_only(p_eval(f"((struct cgroup *){cg_addr})->kn"))
+            kn = read_member_ptr("cgroup", cg_addr, "kn")
             if kn:
-                name = _extract_cstr(p_eval(f"((struct kernfs_node *){kn})->name"))
+                name_ptr = read_member_ptr("kernfs_node", kn, "name")
+                name = read_cstring(name_ptr) if name_ptr else None
+                if not name:
+                    name = _extract_cstr(p_eval(f"((struct kernfs_node *){kn})->name"))
         except Exception as e:
             dmsg(f"cgroup {cg_addr} leaf kernfs read failed: {e}")
     if not name and has_member("cgroup", "dentry"):
         try:
-            dentry = addr_only(p_eval(f"((struct cgroup *){cg_addr})->dentry"))
+            dentry = read_member_ptr("cgroup", cg_addr, "dentry")
             name = _qstr_name_from_dentry(dentry) if dentry else None
         except Exception as e:
             dmsg(f"cgroup {cg_addr} leaf dentry read failed: {e}")
@@ -1246,7 +1332,7 @@ def collect_task_cgroup_counts():
         ):
             try:
                 css = p_eval(expr)
-                _name, _path, cg, _kn = cgroup_identity_from_css_cached(css)
+                cg = cgroup_ptr_from_css(css)
                 if not cg:
                     continue
                 row = counts.setdefault(cg, {"tasks": 0, "samples": [], "controllers": set()})
@@ -1260,6 +1346,16 @@ def collect_task_cgroup_counts():
             except Exception as e:
                 dmsg(f"PID {pid} {ctl} count failed: {e}")
     return counts, total_tasks
+
+def cgroup_ptr_from_css(css_ptr_text):
+    css_addr = addr_only(css_ptr_text)
+    if not css_addr:
+        return None
+    try:
+        return read_member_ptr("cgroup_subsys_state", css_addr, "cgroup")
+    except Exception as e:
+        dmsg(f"css {css_addr} cgroup pointer read failed: {e}")
+        return None
 
 def collect_all_cgroups():
     rows = {}
