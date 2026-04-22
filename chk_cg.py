@@ -984,6 +984,21 @@ _CGROUP_ID_CACHE = {}
 _TG_BUDGET_CACHE = {}
 _CGROUP_CHILD_LIST_MEMBERS = None
 
+CGROUP_SUBSYS_BITS = {
+    "cpuset": 0,
+    "cpu": 1,
+    "cpuacct": 2,
+    "memory": 4,
+    "devices": 5,
+    "freezer": 6,
+    "net_cls": 7,
+    "blkio": 8,
+    "perf_event": 9,
+    "hugetlb": 10,
+    "pids": 11,
+    "rdma": 12,
+}
+
 def _budget_desc(quota, period):
     if quota is None:
         return "quota=?"
@@ -1195,6 +1210,26 @@ def root_cgroup_from_root_addr(root_addr, root_type):
         return addr_only(cg)
     return None
 
+def read_member_int(typename, obj_addr, member):
+    try:
+        return to_int(p_eval(f"((struct {typename} *){obj_addr})->{member}"))
+    except Exception:
+        return None
+
+def root_subsystems(root_addr, root_type):
+    names = []
+    mask = None
+    for field in ("subsys_mask", "subsys_bits"):
+        if has_member(root_type, field):
+            mask = read_member_int(root_type, root_addr, field)
+            if mask is not None:
+                break
+    if mask is not None:
+        for name, bit in CGROUP_SUBSYS_BITS.items():
+            if mask & (1 << bit):
+                names.append(name)
+    return names, mask
+
 def discover_cgroup_roots():
     roots = []
     seen = set()
@@ -1203,9 +1238,10 @@ def discover_cgroup_roots():
     if dfl_root:
         cg = root_cgroup_from_root_addr(dfl_root, "cgroup_root")
         if cg and cg not in seen:
-            roots.append(cg)
+            subsys, mask = root_subsystems(dfl_root, "cgroup_root")
+            roots.append({"cgroup": cg, "root": dfl_root, "type": "cgroup_root", "subsystems": subsys, "mask": mask})
             seen.add(cg)
-            dmsg(f"found default cgroup root: root={dfl_root} cgrp={cg}")
+            dmsg(f"found default cgroup root: root={dfl_root} cgrp={cg} subsystems={','.join(subsys) or '-'}")
 
     root_list_head = None
     for sym in ("cgroup_roots", "cgroup_root_list"):
@@ -1221,9 +1257,10 @@ def discover_cgroup_roots():
             for root_addr in walk_list_entries(root_list_head, root_type, "root_list", limit=128):
                 cg = root_cgroup_from_root_addr(root_addr, root_type)
                 if cg and cg not in seen:
-                    roots.append(cg)
+                    subsys, mask = root_subsystems(root_addr, root_type)
+                    roots.append({"cgroup": cg, "root": root_addr, "type": root_type, "subsystems": subsys, "mask": mask})
                     seen.add(cg)
-                    dmsg(f"found cgroup root from root list: type={root_type} root={root_addr} cgrp={cg}")
+                    dmsg(f"found cgroup root from root list: type={root_type} root={root_addr} cgrp={cg} subsystems={','.join(subsys) or '-'}")
                 if not cg:
                     dmsg(f"could not derive top cgroup from {root_type} {root_addr}")
             if roots:
@@ -1320,16 +1357,19 @@ def walk_cgroup_tree_paths(root_cg, limit=100000):
         except Exception as e:
             dmsg(f"children path walk failed for cgroup {cg}: {e}")
 
-def collect_task_cgroup_counts():
+def collect_task_cgroup_counts(controller="both"):
     counts = {}
     total_tasks = 0
     for pid, task_ptr, comm in iter_ps_tasks():
         total_tasks += 1
         seen_for_task = set()
-        for ctl, expr in (
+        ctl_exprs = (
             ("cpu", f"((struct task_struct *){task_ptr})->cgroups->subsys[1]"),
             ("memory", f"((struct task_struct *){task_ptr})->cgroups->subsys[4]"),
-        ):
+        )
+        for ctl, expr in ctl_exprs:
+            if controller not in ("both", ctl):
+                continue
             try:
                 css = p_eval(expr)
                 cg = cgroup_ptr_from_css(css)
@@ -1357,13 +1397,27 @@ def cgroup_ptr_from_css(css_ptr_text):
         dmsg(f"css {css_addr} cgroup pointer read failed: {e}")
         return None
 
-def collect_all_cgroups():
+def root_matches_controller(root, controller):
+    if controller in (None, "both"):
+        return True
+    subsys = set(root.get("subsystems") or [])
+    if controller == "cpu":
+        return bool(subsys & {"cpu", "cpuacct"})
+    if controller == "memory":
+        return "memory" in subsys
+    return True
+
+def collect_all_cgroups(controller="both"):
     rows = {}
     roots = discover_cgroup_roots()
-    counts, total_tasks = collect_task_cgroup_counts()
+    selected_roots = [r for r in roots if root_matches_controller(r, controller)]
+    counts, total_tasks = collect_task_cgroup_counts(controller)
 
-    for root in roots:
-        for cg, path, kn in walk_cgroup_tree_paths(root):
+    if controller not in (None, "both"):
+        dmsg(f"selected {len(selected_roots)} of {len(roots)} roots for controller={controller}")
+
+    for root in selected_roots:
+        for cg, path, kn in walk_cgroup_tree_paths(root["cgroup"]):
             task_info = counts.get(cg, {})
             rows[cg] = {
                 "path": path or "/",
@@ -1387,7 +1441,7 @@ def collect_all_cgroups():
             "controllers": ",".join(sorted(task_info.get("controllers", []))),
         }
 
-    return rows, roots, total_tasks
+    return rows, selected_roots, total_tasks
 
 def collect_cgroup_list(controller="both"):
     groups = {}
@@ -1479,10 +1533,11 @@ def print_cgroup_list(controller="both", debug=False):
             else:
                 print(f"   memcg : {row['cgroup'] or 'unknown'}")
 
-def print_all_cgroups(debug=False):
-    rows, roots, total_tasks = collect_all_cgroups()
+def print_all_cgroups(controller="both", debug=False):
+    rows, roots, total_tasks = collect_all_cgroups(controller)
     print(f"{C.BOLD}== All Cgroups =={C.RESET}")
     print(" source : kernel cgroup tree")
+    print(f" controller: {controller}")
     print(f" roots  : {len(roots)}")
     print(f" tasks  : {total_tasks}")
     print(f" groups : {len(rows)}")
@@ -1530,8 +1585,8 @@ def print_counter(title, counts, limit=None):
     for key, val in rows:
         print(f" {key:32s} {val}")
 
-def print_cgroup_summary(debug=False):
-    rows, roots, total_tasks = collect_all_cgroups()
+def print_cgroup_summary(controller="both", debug=False):
+    rows, roots, total_tasks = collect_all_cgroups(controller)
     total = len(rows)
     empty = sum(1 for r in rows.values() if r.get("tasks", 0) == 0)
     non_empty = total - empty
@@ -1561,6 +1616,7 @@ def print_cgroup_summary(debug=False):
 
     print(f"{C.BOLD}== Cgroup Summary =={C.RESET}")
     print(" source : kernel cgroup tree (--all implied)")
+    print(f" controller: {controller}")
     print(f" roots  : {len(roots)}")
     print(f" tasks  : {total_tasks}")
     print(f" groups : {total}")
@@ -1606,10 +1662,10 @@ def main():
 
     if args.list_cgroups:
         if args.summary:
-            print_cgroup_summary(debug=args.debug)
+            print_cgroup_summary(args.controller, debug=args.debug)
             return
         if args.all:
-            print_all_cgroups(debug=args.debug)
+            print_all_cgroups(args.controller, debug=args.debug)
             return
         print_cgroup_list(args.controller, debug=args.debug)
         return
