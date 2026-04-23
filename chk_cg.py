@@ -572,7 +572,7 @@ def collect_cpu(task_ptr: str):
     tg_addr = addr_only(tg) or tg
     out["tg"] = tg_addr
 
-    thr = to_int(p_eval(f"((struct task_struct *){task_ptr})->se->cfs_rq->throttled"))
+    thr = to_int(p_eval(f"((struct task_struct *){task_ptr})->se.cfs_rq->throttled"))
     out["throttled"] = thr
 
     per = to_int(p_eval(f"((struct task_group *){tg_addr})->cfs_bandwidth.period"))
@@ -618,7 +618,7 @@ def collect_cpu(task_ptr: str):
 
     # --- Per-rq snapshot (only read members that exist on this kernel) ---
     try:
-        rq = p_eval(f"((struct task_struct *){task_ptr})->se->cfs_rq")
+        rq = p_eval(f"((struct task_struct *){task_ptr})->se.cfs_rq")
         rq_addr = addr_only(rq) or rq
         out["cfs_rq"] = rq_addr
         if rq_addr:
@@ -686,9 +686,9 @@ def collect_rt(task_ptr: str):
     # If we can reach an rq pointer from the task (via its CFS rq->rq, which exists even for RT on many builds),
     # we can then read rq->rt fields.
     try:
-        # Re-use se->cfs_rq->rq to get the rq (works across classes on many RHEL kernels)
+        # Re-use se.cfs_rq->rq to get the rq (works across classes on many RHEL kernels)
         if has_member("task_struct", "se") and has_member("sched_entity", "cfs_rq"):
-            cfsrq = p_eval(f"((struct task_struct *){task_ptr})->se->cfs_rq")
+            cfsrq = p_eval(f"((struct task_struct *){task_ptr})->se.cfs_rq")
             cfsrq_addr = addr_only(cfsrq)
             if cfsrq_addr and has_member("cfs_rq", "rq"):
                 rq = p_eval(f"((struct cfs_rq *){cfsrq_addr})->rq")
