@@ -393,7 +393,7 @@ def get_sched_class(task):
 # implementations from silently diverging.
 
 
-def walk_task_list(filter_code=None, only_active=False, debug=False,
+def walk_task_list(filter_code=None, command_filter=None, only_active=False, debug=False,
                    collect_bt=False, depth=5):
     """
     Cross-version task walker (RHEL7–10+).
@@ -494,6 +494,14 @@ def walk_task_list(filter_code=None, only_active=False, debug=False,
                 print(
                     f"[DEBUG] Skipping {comm} (pid={pid}, state=0x{state_val:x}) "
                     f"ps_code={ps_code} != filter_code={filter_code}"
+                )
+            return
+
+        if command_filter and comm != command_filter:
+            if debug:
+                print(
+                    f"[DEBUG] Skipping {comm} (pid={pid}) "
+                    f"comm != command_filter={command_filter}"
                 )
             return
 
@@ -637,6 +645,8 @@ SORT_KEYS = {
 def main():
     parser = argparse.ArgumentParser(description="Crash/epython task list analyzer")
     parser.add_argument("--state",  help="Filter tasks by state code (e.g. RU, IN, UN)")
+    parser.add_argument("-c", "--command",
+                        help="Only show tasks whose COMMAND/comm exactly matches this name")
     parser.add_argument("--active", action="store_true",
                         help="Only show active RU tasks (on_cpu==1)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
@@ -673,6 +683,7 @@ def main():
     print("Collecting task list...")
     results, bt_counter = walk_task_list(
         filter_code=args.state,
+        command_filter=args.command,
         only_active=args.active,
         debug=args.debug,
         collect_bt=args.bt,
@@ -683,7 +694,8 @@ def main():
         # FIX #6: args.state is None when --state is not given; use "all" as
         # the label so the summary header never reads "summary(None tasks)".
         state_label = args.state or "all"
-        print(f"\nBacktrace pattern summary ({state_label} tasks):")
+        command_label = f", command={args.command}" if args.command else ""
+        print(f"\nBacktrace pattern summary ({state_label} tasks{command_label}):")
         print("=" * 50)
         for trace, count in sorted(bt_counter.items(), key=lambda kv: (-kv[1], kv[0])):
             print(f"{count:<5}  {trace}")
@@ -713,4 +725,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
