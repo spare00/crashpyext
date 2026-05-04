@@ -20,11 +20,320 @@ BOLD    = '\033[1m'
 # Callee-saved registers we care about, for validation
 CALLEE_SAVED_REGS = {"%r15", "%r14", "%r13", "%r12", "%rbp", "%rbx"}
 
+# `sym <addr>` line: leading address then symbol (see chk_po_analyze._ADDRLINE_RE)
+_SYM_LINE_RE = re.compile(r"^\s*(ffffffff[0-9a-fA-F]{8})\s+(?:\(\w\)\s+)?(.+?)\s*$")
+_DIS_S_FILE_RE = re.compile(r"^\s*FILE:\s*(.+?)\s*$", re.I)
+_DIS_S_LINE_RE = re.compile(r"^\s*LINE:\s*(\d+)\s*$", re.I)
+# gcc/clang out-of-line splits: .cold, .isra.N, .constprop.N, .part.N
+_SYM_OUTLINE_SUFFIX_RE = re.compile(
+    r"\.(?:cold|part\.\d+|isra\.\d+|constprop\.\d+)$"
+)
+
+
+def _parse_hex_addr(s):
+    s = s.strip()
+    if s.startswith(("0x", "0X")):
+        s = s[2:]
+    return int(s, 16)
+
+
+def _kaddr_str(addr):
+    """
+    Format a kernel address for crash/gdb subcommands. Crash accepts at most 16 hex digits
+    for dis/sym; Python's default int formatting is decimal and breaks `dis`/`sym`.
+    """
+    if isinstance(addr, str):
+        t = addr.strip()
+        if t.startswith(("0x", "0X")):
+            return t
+        return f"0x{t}"
+    return f"{int(addr):#x}"
+
+
+def parse_dis_s(addr):
+    """
+    Run `dis -s <addr>` and return (source_file, line_num) from FILE:/LINE: headers,
+    or (None, None) if not found.
+    """
+    out = exec_crash_command(f"dis -s {_kaddr_str(addr)}")
+    src_file = None
+    line_no = None
+    for ln in out.splitlines():
+        m = _DIS_S_FILE_RE.match(ln)
+        if m:
+            src_file = m.group(1).strip()
+            continue
+        m = _DIS_S_LINE_RE.match(ln)
+        if m:
+            line_no = int(m.group(1))
+            continue
+    return src_file, line_no
+
+
+def sym_line_for_addr(addr):
+    """First interesting line from `sym <addr>` (address + RHS)."""
+    out = exec_crash_command(f"sym {_kaddr_str(addr)}")
+    for ln in out.splitlines():
+        ln = ln.rstrip("\r\n")
+        if _SYM_LINE_RE.match(ln):
+            return ln
+    for ln in out.splitlines():
+        if ln.strip():
+            return ln.strip()
+    return ""
+
+
+def sym_rhs_base_name(addr):
+    """
+    From `sym <addr>`, get the symbol base name suitable for `sym <name>` / `gdb list <name>`
+    (strip +offset and trailing source annotation).
+    """
+    line = sym_line_for_addr(addr)
+    if not line:
+        return ""
+    m = _SYM_LINE_RE.match(line)
+    rhs = m.group(2) if m else line
+    rhs = re.sub(r"\s+/.+?:\s*\d+\s*$", "", rhs).strip()
+    moff = re.match(r"^(.+?)(\+0x[0-9a-fA-F]+)", rhs)
+    if moff:
+        return moff.group(1).strip()
+    return rhs.split()[0] if rhs else ""
+
+
+def sym_name_to_addr(symbol):
+    """Resolve a kernel text symbol to its start address via `sym <symbol>`."""
+    if not symbol:
+        return None
+    try:
+        out = exec_crash_command(f"sym {symbol}")
+    except Exception:
+        return None
+    for tok in out.split():
+        clean = tok.rstrip(":")
+        try:
+            val = int(clean, 16)
+            if val > 0x1000:
+                return val
+        except ValueError:
+            continue
+    return None
+
+
+def sym_outline_parent_name(symbol_base):
+    """
+    Strip gcc/clang suffix like `.cold` / `.isra.0` so we can resolve the enclosing C function
+    for source listings (cold/out-of-line IR shares line info with the split symbol entry).
+    """
+    if not symbol_base:
+        return None
+    m = _SYM_OUTLINE_SUFFIX_RE.search(symbol_base)
+    if not m:
+        return None
+    return symbol_base[: m.start()] or None
+
+
+def entry_line_before_pc(file_pc, line_pc, symbol_base, debug=False):
+    """
+    First source line of `sym <symbol>` in the same file as the PC, using symbol_base
+    and then a stripped parent (e.g. check_heap_object.cold → check_heap_object) if the
+    split symbol's `dis -s` entry line is not strictly before line_pc.
+    """
+    if not symbol_base:
+        return None, None
+    names = [symbol_base]
+    parent = sym_outline_parent_name(symbol_base)
+    if parent and parent not in names:
+        names.append(parent)
+
+    for name in names:
+        entry_addr = sym_name_to_addr(name)
+        if entry_addr is None:
+            if debug:
+                print(f"[DEBUG] sym {name!r} has no address, try next")
+            continue
+        file_ent, line_ent = parse_dis_s(entry_addr)
+        if not file_ent or line_ent is None:
+            continue
+        if file_ent != file_pc:
+            if debug:
+                print(f"[DEBUG] entry for {name!r} is {file_ent!r} != PC file {file_pc!r}, try next")
+            continue
+        if line_ent < line_pc:
+            if debug:
+                print(f"[DEBUG] entry line {line_ent} from sym {name!r} (file {file_pc})")
+            return line_ent, name
+    return None, None
+
+
+def gdb_list_range(src_file, start_line, end_line, debug=False):
+    """`gdb list file:start,end` — inclusive line range."""
+    if start_line < 1:
+        start_line = 1
+    if end_line < start_line:
+        end_line = start_line
+    cmd = f"gdb list {src_file}:{start_line},{end_line}"
+    if debug:
+        print(f"[DEBUG] {cmd}")
+    return exec_crash_command(cmd)
+
+
+_GDB_LIST_LINE_RE = re.compile(r"^\s*(\d+)\s+(.*)$")
+
+
+def parse_gdb_list_numbered_lines(gdb_out):
+    """Parse `gdb list` lines into {lineno: text} (last wins if duplicated)."""
+    mmap = {}
+    for ln in gdb_out.splitlines():
+        m = _GDB_LIST_LINE_RE.match(ln)
+        if m:
+            mmap[int(m.group(1))] = m.group(2).rstrip("\r")
+    return mmap
+
+
+def _brace_delta_raw(line):
+    """Net `{` minus `}` on a line; strips // comments and naive C strings first."""
+    if not line:
+        return 0
+    if "//" in line:
+        line = line.split("//", 1)[0]
+    s = line
+    s = re.sub(r'"(\\.|[^"\\])*"', '""', s)
+    s = re.sub(r"'(\\.|[^'\\])*'", "''", s)
+    return s.count("{") - s.count("}")
+
+
+def _is_lone_open_brace(text):
+    """Kernel style: function body often starts with a line containing only `{`."""
+    return bool(re.match(r"^\s*\{\s*$", text.rstrip()))
+
+
+def find_close_brace_line_from_gdb_list(gdb_out, min_line):
+    """
+    After the first lone `{` on or after min_line, walk lines in order and run a brace
+    balance until depth returns to zero — that line is the matching outer `}`.
+
+    This matches the common kernel pattern (signature lines then `{{` then ... `}}`).
+    Fails if no lone `{{`, depth goes negative, or listing ends before depth hits 0.
+    """
+    mmap = parse_gdb_list_numbered_lines(gdb_out)
+    if not mmap:
+        return None
+    nums = sorted(mmap.keys())
+    open_line = None
+    for n in nums:
+        if n < min_line:
+            continue
+        if _is_lone_open_brace(mmap[n]):
+            open_line = n
+            break
+    if open_line is None:
+        return None
+
+    depth = 1
+    for n in nums:
+        if n <= open_line:
+            continue
+        depth += _brace_delta_raw(mmap[n])
+        if depth <= 0:
+            return n if depth == 0 else None
+    return None
+
+
+def source_context_for_address(
+    addr_str,
+    whole_function=False,
+    fallback_before=80,
+    listsize=400,
+    entry_pad_before=6,
+    max_probe_lines=2500,
+    debug=False,
+):
+    """
+    Given a kernel text address, show C source context without knowing the function name.
+
+    Modes:
+      whole_function=False (default): from the enclosing symbol's entry line (via sym + dis -s)
+        up to and including the line for the PC. If the PC is in a gcc `.cold` / split symbol whose
+        entry maps to the same line as the PC, falls back to the parent symbol (e.g.
+        `check_heap_object`) so the range reaches the real function body.
+      whole_function=True: same resolved start line, probe source with `gdb list`, locate the first
+        lone opening-brace line (kernel style: `{` alone after the signature), then match `{`/`}`
+        until brace depth returns to 0 (equivalent to finding the matching lone closing `}`). If
+        that fails, end = max(PC line, start + listsize - 1); use -G / -M to widen.
+
+    If symbol entry cannot be resolved, falls back to gdb list file:(line-fallback_before),line.
+
+    `entry_pad_before`: when the start line comes from sym/dis (not the fallback window), move the
+    listing start up by this many lines so multi-line `static inline` / `void foo(` declarations
+    and `{` are included; DWARF often attributes the symbol address to the first executable line
+    only (e.g. 164) and omits the signature (161--163). Set to 0 to disable.
+    """
+    try:
+        addr_int = _parse_hex_addr(addr_str)
+    except ValueError:
+        print(f"[ERROR] Not a valid address: {addr_str!r}")
+        return
+
+    file_pc, line_pc = parse_dis_s(addr_int)
+    if not file_pc or line_pc is None:
+        print(f"[ERROR] No FILE:/LINE: in `dis -s {addr_str}` — build has no line info for this PC?")
+        return
+
+    base = sym_rhs_base_name(addr_int)
+    if debug:
+        print(f"[DEBUG] sym base name: {base!r}")
+
+    line_start, entry_sym = entry_line_before_pc(file_pc, line_pc, base, debug=debug)
+    resolved_by_sym = line_start is not None
+    if not resolved_by_sym:
+        line_start = max(1, line_pc - fallback_before)
+    elif line_start > line_pc:
+        if debug:
+            print(f"[DEBUG] entry line {line_start} > PC line {line_pc}; using fallback window")
+        resolved_by_sym = False
+        line_start = max(1, line_pc - fallback_before)
+    elif resolved_by_sym and entry_pad_before > 0:
+        if debug:
+            print(
+                f"[DEBUG] entry from sym/dis is first executable line; "
+                f"pad start by {entry_pad_before} line(s) for signature"
+            )
+        line_start = max(1, line_start - entry_pad_before)
+
+    line_end = line_pc
+    end_note = ""
+    if whole_function:
+        if not base:
+            print("[WARN] No symbol name for --whole; using entry-based range only.")
+        probe_hi = line_start + max(1, max_probe_lines) - 1
+        if debug:
+            print(f"[DEBUG] brace probe: {file_pc}:{line_start}–{probe_hi}")
+        probe_out = gdb_list_range(file_pc, line_start, probe_hi, debug=debug)
+        end_brace = find_close_brace_line_from_gdb_list(probe_out, line_start)
+        if end_brace is not None:
+            line_end = max(line_pc, end_brace)
+            end_note = "  |  end: matching `}` (brace balance)"
+        else:
+            line_end = max(line_pc, line_start + listsize - 1)
+            end_note = "  |  end: fallback (no lone `{`/balanced `}` in probe)"
+
+    if whole_function:
+        print(f"{BOLD}--- gdb list (wide range from entry){RESET}  {base or '?'}")
+    else:
+        print(f"{BOLD}--- gdb list (function entry → PC line){RESET}")
+    entry_note = ""
+    if entry_sym and base and entry_sym != base:
+        entry_note = f"  |  entry sym: {entry_sym}"
+    print(f"symbol: {base or '?'}{entry_note}{end_note}  |  {file_pc}:{line_start}–{line_end}")
+    out = gdb_list_range(file_pc, line_start, line_end, debug=debug)
+    print(out.rstrip() if out else "(no output)")
+
+
 def get_dis_symbol_context(addr, before_lines=1, debug=False):
     """
     Run 'dis -s <addr>' and return `*` line with N lines before it.
     """
-    output = exec_crash_command(f"dis -s {addr}")
+    output = exec_crash_command(f"dis -s {_kaddr_str(addr)}")
     lines = output.strip().splitlines()
 
     for i, line in enumerate(lines):
@@ -32,7 +341,7 @@ def get_dis_symbol_context(addr, before_lines=1, debug=False):
             start = max(i - before_lines, 0)
             selected = lines[start:i + 1]
             if debug:
-                print(f"[DEBUG] Symbol context for {addr}")
+                print(f"[DEBUG] Symbol context for {_kaddr_str(addr)}")
                 print(f"start: {start}")
                 print(f"selected: {selected}")
                 print(f"before_lines: {before_lines}")
@@ -334,13 +643,68 @@ def get_bt_addresses_range(start_frame, end_frame, debug=False):
 
 # --- Main ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Disassemble and annotate pushed register values")
-    parser.add_argument("frames", metavar="N", type=int, nargs="+",
-                        help="One frame number (exception RIP to frame), or a start and end range")
+    parser = argparse.ArgumentParser(
+        description="Disassemble and annotate pushed register values, or list C source for an address (gdb list).",
+    )
+    parser.add_argument("frames", metavar="N", type=int, nargs="*",
+                        help="One frame number (exception RIP to frame), or a start and end range (default mode)")
+    parser.add_argument(
+        "-S", "--src",
+        metavar="ADDR",
+        help="List C source for kernel text ADDR: from function entry to this line (default), or a wider range with -w",
+    )
+    parser.add_argument(
+        "-w", "--whole",
+        action="store_true",
+        help="With --src: from the same entry as default, extend listing to the matching `}` of the function "
+        "body (brace-balance on gdb list output), else fall back to end = max(PC, start+G-1) within a -M line probe",
+    )
+    parser.add_argument(
+        "-F", "--fallback-before",
+        type=int,
+        default=80,
+        help="With --src: if symbol entry cannot be resolved, list this many lines before the PC line (default: 80)",
+    )
+    parser.add_argument(
+        "-G", "--listsize",
+        type=int,
+        default=400,
+        help="With --src -w: if brace-matching fails, use end = max(PC, start+G-1) (default: 400)",
+    )
+    parser.add_argument(
+        "-M", "--max-probe",
+        type=int,
+        default=2500,
+        metavar="LINES",
+        help="With --src -w: gdb list this many source lines from entry for brace matching (default: 2500)",
+    )
+    parser.add_argument(
+        "-P", "--entry-pad",
+        type=int,
+        default=6,
+        metavar="N",
+        help="With --src: when start line is from sym/dis, include N extra lines above it "
+        "(signature/static inline; default: 6). Use 0 to disable, or 3 if only a few lines are missing.",
+    )
     parser.add_argument("-l", "--lines", type=int, default=3,
-                    help="Number of lines to show from dis -s <addr> (default: 3)")
+                    help="In backtrace disassembly mode: lines to show from dis -s <addr> (default: 3)")
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
     args = parser.parse_args()
+
+    if args.src:
+        source_context_for_address(
+            args.src,
+            whole_function=args.whole,
+            fallback_before=args.fallback_before,
+            listsize=args.listsize,
+            entry_pad_before=args.entry_pad,
+            max_probe_lines=args.max_probe,
+            debug=args.debug,
+        )
+        sys.exit(0)
+
+    if not args.frames:
+        parser.error("specify frame number(s) or use --src ADDR")
 
     if len(args.frames) == 1:
         addrs, frame_ids, deepest_frame = get_bt_addresses_exception_to_frame(args.frames[0], debug=args.debug)
