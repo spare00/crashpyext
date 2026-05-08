@@ -456,7 +456,7 @@ def annotate_pop_or_lea(instr_line, rsp, debug=False):
     return instr_line
 
 def disassemble_addresses_with_push_values(addresses, frames, deepest_frame, debug=False):
-    for addr, frame in zip(reversed(addresses), reversed(frames)):
+    for addr, frame in zip(addresses, frames):
         frame_str = f"frame #{frame}" if isinstance(frame, int) else f"frame {frame}"
         comm = f"dis -rl {addr}"
         print(f"\n\033[96m\033[1m--- {comm} ({frame_str}) ---\033[0m\n")
@@ -575,43 +575,57 @@ def get_deepest_frame_number_from_bt_lines(lines):
     return deepest
 
 def get_bt_addresses_exception_to_frame(upto_frame, debug=False):
+    """
+    Single-frame mode policy:
+      - Start from requested frame N and walk toward 0 (stack grows bottom-up).
+      - If an exception frame is encountered on that walk, stop there and use exception RIP
+        as a synthetic "exception" frame entry.
+      - If there is no exception on that path, return down to frame 0.
+    """
     lines = exec_crash_command("bt -f").splitlines()
     deepest_frame = get_deepest_frame_number_from_bt_lines(lines)
 
-    start_index = None
-    end_marker = f"#{upto_frame}"
+    frame_addr = {}
+    exception_anchor_frame = None  # frame number associated with [exception RIP: ...]
+    last_seen_frame = None
+
+    frame_line_re = re.compile(r"^#(\d+)\b")
+
+    for raw in lines:
+        line = raw.strip()
+        m = frame_line_re.match(line)
+        if m:
+            fnum = int(m.group(1))
+            toks = line.split()
+            if len(toks) > 4:
+                frame_addr[fnum] = toks[4]
+            last_seen_frame = fnum
+            continue
+
+        if "[exception RIP:" in line and last_seen_frame is not None:
+            exception_anchor_frame = last_seen_frame
+
+    if upto_frame not in frame_addr:
+        print(f"[ERROR] Could not find frame #{upto_frame} in backtrace.")
+        return [], [], None
+
     addresses = []
     frames = []
 
-    for idx, line in enumerate(lines):
-        if start_index is None and 'exception RIP' in line:
-            start_index = idx
-        if start_index is not None and line.strip().startswith(end_marker):
-            target_lines = lines[start_index:idx + 1]
-            break
-    else:
-        # If no 'exception RIP' found, start from the beginning
-        if start_index is None:
-            print("[WARN] 'exception RIP' not found. Starting from the first frame.")
-            start_index = 0
-            for idx, line in enumerate(lines):
-                if line.strip().startswith(end_marker):
-                    target_lines = lines[start_index:idx + 1]
-                    break
-            else:
-                print(f"[ERROR] Could not find frame #{upto_frame} from start of backtrace.")
-                return [], [], None
-        else:
-            print(f"[ERROR] Could not find frame #{upto_frame} after 'exception RIP'.")
-            return [], [], None
+    for fnum in range(upto_frame, -1, -1):
+        if fnum not in frame_addr:
+            continue
 
-    for line in target_lines:
-        tokens = line.strip().split()
-        if tokens and tokens[0].startswith('#') and len(tokens) > 4:
-            frames.append(int(tokens[0][1:]))
-            addresses.append(tokens[4])
-            if debug:
-                print(f"[DEBUG] Frame #{frames[-1]} => {addresses[-1]}")
+        if exception_anchor_frame is not None and fnum == exception_anchor_frame:
+            # Replace anchor frame with synthetic exception frame and stop.
+            addresses.append(frame_addr[fnum])  # temporary; may be replaced by parsed RIP below
+            frames.append("exception")
+            break
+
+        frames.append(fnum)
+        addresses.append(frame_addr[fnum])
+        if debug:
+            print(f"[DEBUG] Frame #{fnum} => {frame_addr[fnum]}")
 
     return addresses, frames, deepest_frame
 
@@ -619,27 +633,88 @@ def get_bt_addresses_range(start_frame, end_frame, debug=False):
     lines = exec_crash_command("bt -f").splitlines()
     deepest_frame = get_deepest_frame_number_from_bt_lines(lines)
 
+    lo = min(start_frame, end_frame)
+    hi = max(start_frame, end_frame)
+
     addresses = []
     frames = []
-    capturing = False
+    frame_line_re = re.compile(r"^#(\d+)\b")
 
-    for line in lines:
-        line = line.strip()
-        if line.startswith(f"#{start_frame}"):
-            capturing = True
-
-        if capturing and line.startswith("#"):
-            tokens = line.split()
-            if len(tokens) > 4:
-                frames.append(int(tokens[0][1:]))
-                addresses.append(tokens[4])
-                if line.startswith(f"#{end_frame}"):
-                    break
+    for raw in lines:
+        line = raw.strip()
+        m = frame_line_re.match(line)
+        if not m:
+            continue
+        fnum = int(m.group(1))
+        if fnum < lo or fnum > hi:
+            continue
+        tokens = line.split()
+        if len(tokens) > 4:
+            frames.append(fnum)
+            addresses.append(tokens[4])
 
     if not addresses and debug:
         print(f"[DEBUG] No addresses found between #{start_frame} and #{end_frame}")
 
     return addresses, frames, deepest_frame
+
+
+def reorder_for_display(addresses, frames):
+    """
+    Display order policy:
+      - numeric frames in descending order (human reading order)
+      - synthetic exception frame last
+    """
+    pairs = list(zip(frames, addresses))
+    normal = [(f, a) for f, a in pairs if isinstance(f, int)]
+    exc = [(f, a) for f, a in pairs if not isinstance(f, int)]
+
+    normal.sort(key=lambda x: x[0], reverse=True)
+    ordered = normal + exc
+
+    out_frames = [f for f, _ in ordered]
+    out_addrs = [a for _, a in ordered]
+    return out_addrs, out_frames
+
+
+def parse_exception_rip_rsp_from_bt(bt_lines, debug=False):
+    """
+    Parse exception RIP/RSP from bt/bt -f output.
+    We only trust the register dump line (e.g. 'RIP: <addr>  RSP: <addr>'),
+    not the '[exception RIP: symbol+offset]' descriptor.
+    """
+    in_exception_block = False
+    exception_rip = None
+    exception_rsp = None
+
+    for raw in bt_lines:
+        line = raw.strip()
+        if "[exception RIP:" in line:
+            in_exception_block = True
+            continue
+
+        if not in_exception_block:
+            continue
+
+        if line.startswith("#"):
+            break
+
+        rip_match = re.search(r"\bRIP:\s+([0-9a-fA-F]{16})\b", line)
+        rsp_match = re.search(r"\bRSP:\s+([0-9a-fA-F]{16})\b", line)
+        if rip_match:
+            exception_rip = rip_match.group(1)
+        if rsp_match:
+            exception_rsp = int(rsp_match.group(1), 16)
+        if exception_rip and exception_rsp is not None:
+            break
+
+    if debug:
+        print(
+            f"[DEBUG] Parsed exception context: "
+            f"RIP={exception_rip or 'None'} "
+            f"RSP={hex(exception_rsp) if exception_rsp is not None else 'None'}"
+        )
+    return exception_rip, exception_rsp
 
 # --- Main ---
 if __name__ == "__main__":
@@ -709,38 +784,34 @@ if __name__ == "__main__":
     if len(args.frames) == 1:
         addrs, frame_ids, deepest_frame = get_bt_addresses_exception_to_frame(args.frames[0], debug=args.debug)
 
-        # Check for exception RIP
-        bt_lines = exec_crash_command("bt").splitlines()
-        exception_rip = None
-        is_exception_rip = False
-        for line in bt_lines:
-            if 'exception RIP:' in line:
-                is_exception_rip = True
-            if is_exception_rip and 'RIP:' in line:
-                match = re.search(r'RIP:\s+([0-9a-fA-F]+)', line)
-                if match:
-                    exception_rip = match.group(1)
-                    is_exception_rip = False
-                    break
+        bt_lines = exec_crash_command("bt -f").splitlines()
+        exception_rip, exception_rsp = parse_exception_rip_rsp_from_bt(bt_lines, debug=args.debug)
 
-        if exception_rip:
-            first_addr = addrs[0] if addrs else None
-            if first_addr and exception_rip.lower() != first_addr.lower():
-                # Also extract RSP
-                for line in bt_lines:
-                    if 'RIP:' in line and 'RSP:' in line:
-                        m = re.search(r'RSP:\s+([0-9a-fA-F]+)', line)
-                        if m:
-                            EXCEPTION_RSP = int(m.group(1), 16)
-                            if args.debug:
-                                print(f"[DEBUG] Captured exception RSP: {hex(EXCEPTION_RSP)}")
-                        break
+        if exception_rsp is not None:
+            EXCEPTION_RSP = exception_rsp
+            if args.debug:
+                print(f"[DEBUG] Captured exception RSP: {hex(EXCEPTION_RSP)}")
 
-                if EXCEPTION_RSP:
+        if "exception" in frame_ids:
+            ex_idx = frame_ids.index("exception")
+            if exception_rip:
+                prev_addr = addrs[ex_idx - 1] if ex_idx > 0 else None
+                if prev_addr and prev_addr.lower() == exception_rip.lower():
+                    # Requested behavior: do not duplicate when previous frame already points at RIP.
                     if args.debug:
-                        print(f"[DEBUG] Adding exception RIP disassembly: {exception_rip}")
-                    addrs.insert(0, exception_rip)
-                    frame_ids.insert(0, "exception")
+                        print(f"[DEBUG] Dropping duplicate exception RIP: {exception_rip}")
+                    del addrs[ex_idx]
+                    del frame_ids[ex_idx]
+                else:
+                    if args.debug:
+                        print(f"[DEBUG] Using exception RIP for exception frame: {exception_rip}")
+                    addrs[ex_idx] = exception_rip
+            else:
+                # Could not parse RIP; avoid disassembling a misleading frame address.
+                if args.debug:
+                    print("[DEBUG] No exception RIP parsed; dropping synthetic exception frame")
+                del addrs[ex_idx]
+                del frame_ids[ex_idx]
 
     elif len(args.frames) == 2:
         addrs, frame_ids, deepest_frame = get_bt_addresses_range(args.frames[0], args.frames[1], debug=args.debug)
@@ -748,5 +819,6 @@ if __name__ == "__main__":
         print("[ERROR] Use chk_dis <frame> or chk_dis <start> <end>")
         sys.exit(1)
 
+    addrs, frame_ids = reorder_for_display(addrs, frame_ids)
     disassemble_addresses_with_push_values(addrs, frame_ids, deepest_frame, debug=args.debug)
 
