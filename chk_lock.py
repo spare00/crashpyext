@@ -77,9 +77,6 @@ def _init_environment(debug=False):
             else:
                 dbg(f"_init_environment(): unrecognised MACHINE line: {line.strip()!r}")
 
-    print(f"Detected RHEL Version : {RHEL_VERSION} (Kernel: {KERNEL_VERSION})")
-    print(f"Detected Architecture : {ARCH}")
-
 
 # ---------------------------------------------------------------------------
 # Shared: address resolution
