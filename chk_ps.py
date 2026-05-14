@@ -693,7 +693,11 @@ def main():
     if args.bt:
         # FIX #6: args.state is None when --state is not given; use "all" as
         # the label so the summary header never reads "summary(None tasks)".
-        state_label = args.state or "all"
+        # --active restricts to RU with on_cpu==1; reflect that in the header.
+        if args.active:
+            state_label = "Active RU"
+        else:
+            state_label = args.state or "all"
         command_label = f", command={args.command}" if args.command else ""
         print(f"\nBacktrace pattern summary ({state_label} tasks{command_label}):")
         print("=" * 50)
