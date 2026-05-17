@@ -574,6 +574,57 @@ def get_deepest_frame_number_from_bt_lines(lines):
                 continue
     return deepest
 
+
+_BT_FRAME_LINE_RE = re.compile(r"^#(\d+)\b")
+
+
+def parse_bt_frame_address(line):
+    """Return the text address from a `bt` / `bt -f` frame line, or None."""
+    toks = line.strip().split()
+    if not toks or not toks[0].startswith("#"):
+        return None
+    if "at" in toks:
+        at_idx = toks.index("at")
+        if at_idx + 1 < len(toks):
+            return toks[at_idx + 1]
+    if len(toks) > 4:
+        return toks[4]
+    return None
+
+
+def find_exception_anchor_frame(bt_lines, debug=False):
+    """
+    Frame number whose bt block contains the exception banner (the fault site).
+    The banner is printed after the owning #N line and before the next # line.
+    """
+    last_frame_before = None
+    for idx, raw in enumerate(bt_lines):
+        line = raw.strip()
+        m = _BT_FRAME_LINE_RE.match(line)
+        if m:
+            last_frame_before = int(m.group(1))
+            continue
+        if "exception RIP" not in raw:
+            continue
+        if last_frame_before is not None:
+            if debug:
+                print(f"[DEBUG] Exception anchor: frame #{last_frame_before} (banner follows # line)")
+            return last_frame_before
+        for ahead in bt_lines[idx + 1 :]:
+            am = _BT_FRAME_LINE_RE.match(ahead.strip())
+            if am:
+                fnum = int(am.group(1))
+                if debug:
+                    print(f"[DEBUG] Exception anchor: frame #{fnum} (banner before # line)")
+                return fnum
+            if ahead.strip().startswith("#"):
+                break
+        if debug:
+            print("[DEBUG] Exception banner found but no owning frame")
+        return None
+    return None
+
+
 def get_bt_addresses_exception_to_frame(upto_frame, debug=False):
     """
     Single-frame mode policy:
@@ -586,24 +637,17 @@ def get_bt_addresses_exception_to_frame(upto_frame, debug=False):
     deepest_frame = get_deepest_frame_number_from_bt_lines(lines)
 
     frame_addr = {}
-    exception_anchor_frame = None  # frame number associated with [exception RIP: ...]
-    last_seen_frame = None
-
-    frame_line_re = re.compile(r"^#(\d+)\b")
+    exception_anchor_frame = find_exception_anchor_frame(lines, debug=debug)
 
     for raw in lines:
         line = raw.strip()
-        m = frame_line_re.match(line)
-        if m:
-            fnum = int(m.group(1))
-            toks = line.split()
-            if len(toks) > 4:
-                frame_addr[fnum] = toks[4]
-            last_seen_frame = fnum
+        m = _BT_FRAME_LINE_RE.match(line)
+        if not m:
             continue
-
-        if "[exception RIP:" in line and last_seen_frame is not None:
-            exception_anchor_frame = last_seen_frame
+        fnum = int(m.group(1))
+        addr = parse_bt_frame_address(line)
+        if addr:
+            frame_addr[fnum] = addr
 
     if upto_frame not in frame_addr:
         print(f"[ERROR] Could not find frame #{upto_frame} in backtrace.")
@@ -613,14 +657,15 @@ def get_bt_addresses_exception_to_frame(upto_frame, debug=False):
     frames = []
 
     for fnum in range(upto_frame, -1, -1):
-        if fnum not in frame_addr:
-            continue
-
         if exception_anchor_frame is not None and fnum == exception_anchor_frame:
-            # Replace anchor frame with synthetic exception frame and stop.
-            addresses.append(frame_addr[fnum])  # temporary; may be replaced by parsed RIP below
+            # Stop at the fault site; main() may replace the placeholder with exception RIP.
+            if fnum in frame_addr:
+                addresses.append(frame_addr[fnum])
             frames.append("exception")
             break
+
+        if fnum not in frame_addr:
+            continue
 
         frames.append(fnum)
         addresses.append(frame_addr[fnum])
