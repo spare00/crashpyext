@@ -6,7 +6,11 @@ Shared infrastructure (RHEL version, architecture, task state, address
 resolution) is provided by chk_lock.py and injected before any analysis
 function is called.  This module only contains rwsem-specific logic.
 """
+import re
 from pykdump.API import *
+
+_CRASH_RWSEM_CACHE = {}
+_WAIT_LIST_OFFSET = None
 
 # Shared globals — injected by chk_lock._push_globals() at startup.
 RHEL_VERSION = 8
@@ -29,7 +33,6 @@ RWSEM_READ_FAILED_MASK = (RWSEM_WRITER_MASK | RWSEM_FLAG_WAITERS | RWSEM_FLAG_HA
 RWSEM_READER_OWNED     = 0x1
 RWSEM_NONSPINNABLE     = 0x2
 RWSEM_OWNER_FLAGS_MASK = (RWSEM_READER_OWNED | RWSEM_NONSPINNABLE)
-
 
 def dbg(msg):
     if DEBUG:
@@ -146,6 +149,19 @@ def get_owner_info(owner_task_addr):
         return f"{owner_task_addr:#x}"
 
 
+def is_stale_reader_owner(count, reader_owned, owner_task_addr):
+    """
+    RHEL 8+ rwsem owner can retain RWSEM_READER_OWNED after count drops to 0.
+    Treat it as a stale marker for display, not an active owner.
+    """
+    return (
+        RHEL_VERSION >= 8
+        and count == 0
+        and reader_owned
+        and owner_task_addr != 0
+    )
+
+
 # FIX #2: Removed the first (dead) definition of get_reader_count().
 # Only the second definition — which correctly handles READFAIL — is kept.
 def get_reader_count(count_raw, is_readfail_reliable):
@@ -167,6 +183,97 @@ def get_reader_count(count_raw, is_readfail_reliable):
     return reader_count
 
 
+def _crash_rwsem_output(rw_semaphore_addr):
+    """Cached 'struct rw_semaphore <addr>' text from crash."""
+    addr = int(rw_semaphore_addr)
+    if addr not in _CRASH_RWSEM_CACHE:
+        _CRASH_RWSEM_CACHE[addr] = exec_crash_command(f"struct rw_semaphore {addr:#x}")
+    return _CRASH_RWSEM_CACHE[addr]
+
+
+def _wait_list_offset():
+    """Byte offset of wait_list in struct rw_semaphore (RHEL 7/8/9), cached."""
+    global _WAIT_LIST_OFFSET
+    if _WAIT_LIST_OFFSET is not None:
+        return _WAIT_LIST_OFFSET
+    _WAIT_LIST_OFFSET = 8
+    try:
+        out = exec_crash_command("struct rw_semaphore -o")
+        m = re.search(
+            r"^\s*\[(0x[0-9a-fA-F]+|\d+)\].*\bwait_list\b",
+            out,
+            re.MULTILINE,
+        )
+        if m:
+            _WAIT_LIST_OFFSET = int(m.group(1), 0)
+    except Exception as e:
+        dbg(f"_wait_list_offset(): {e}")
+    return _WAIT_LIST_OFFSET
+
+
+def _parse_crash_rwsem_fields(rw_semaphore_addr):
+    """
+    Parse count/owner from crash 'struct rw_semaphore' output.
+
+    Used when pykdump cannot expose members (e.g. RHEL 8 KABI union around
+    owner) even though crash shows atomic_long_t count and owner.
+    """
+    out = _crash_rwsem_output(rw_semaphore_addr)
+    fields = {}
+
+    m = re.search(
+        r"count\s*=\s*(?:\{\s*counter\s*=\s*)?(0x[0-9a-fA-F]+|\d+)",
+        out,
+    )
+    if m:
+        fields["count"] = int(m.group(1), 0) & 0xFFFFFFFFFFFFFFFF
+
+    if RHEL_VERSION >= 8:
+        m = re.search(
+            r"owner\s*=\s*\{\s*counter\s*=\s*(0x[0-9a-fA-F]+|\d+)",
+            out,
+        )
+    else:
+        m = re.search(
+            r"(?:^|\n)\s*owner\s*=\s*(0x[0-9a-fA-F]+|\d+)",
+            out,
+        )
+    if m:
+        fields["owner"] = int(m.group(1), 0) & 0xFFFFFFFFFFFFFFFF
+
+    return fields
+
+
+def _rwsem_wait_list_head(rw_semaphore_addr):
+    """Address of embedded wait_list (list_head) for 'list -H'."""
+    addr = int(rw_semaphore_addr)
+    out = _crash_rwsem_output(addr)
+    m = re.search(
+        r"wait_list\s*=\s*\{\s*next\s*=\s*(0x[0-9a-fA-F]+|\d+),"
+        r"\s*prev\s*=\s*(0x[0-9a-fA-F]+|\d+)",
+        out,
+    )
+    if m:
+        next_addr = int(m.group(1), 0)
+        prev_addr = int(m.group(2), 0)
+        if next_addr == prev_addr:
+            return next_addr
+    return addr + _wait_list_offset()
+
+
+def _wait_list_is_empty(rw_semaphore_addr):
+    """True when wait_list.next == wait_list.prev (no rwsem_waiter nodes)."""
+    out = _crash_rwsem_output(rw_semaphore_addr)
+    m = re.search(
+        r"wait_list\s*=\s*\{\s*next\s*=\s*(0x[0-9a-fA-F]+|\d+),"
+        r"\s*prev\s*=\s*(0x[0-9a-fA-F]+|\d+)",
+        out,
+    )
+    if m:
+        return int(m.group(1), 0) == int(m.group(2), 0)
+    return False
+
+
 def list_waiting_tasks(wait_list_addr):
     """
     Return list of (pid, comm, state, task_addr, waiter_type) for tasks waiting on the
@@ -179,13 +286,19 @@ def list_waiting_tasks(wait_list_addr):
     try:
         cmd = f"list -s rwsem_waiter.task,type -l rwsem_waiter.list -H {wait_list_addr:#x}"
         output = exec_crash_command(cmd)
-        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        lines = [
+            line.strip()
+            for line in output.splitlines()
+            if line.strip() and line.strip().lower() not in ("(empty)", "empty")
+        ]
+        if not lines:
+            return result
 
         # Lines come in triplets: node_addr, "task = 0x...,", "type = ...,".
         i = 0
         while i < len(lines):
             if i + 2 >= len(lines):
-                print(f"Warning: incomplete rwsem_waiter entry at line {i}: {lines[i]!r}")
+                dbg(f"list_waiting_tasks(): incomplete entry at line {i}: {lines[i]!r}")
                 break
             try:
                 task_line = lines[i + 1]
@@ -310,7 +423,13 @@ def check_integrity(count, owner, reader_owned, owner_task_addr, is_readfail_rel
     # Free lock
     elif count == 0:
         if owner_task_addr != 0:
-            issues.append("WARN: `owner` field not cleared: lock is free but `owner` is set.")
+            if is_stale_reader_owner(count, reader_owned, owner_task_addr):
+                issues.append(
+                    "INFO: `owner` still set with RWSEM_READER_OWNED while count is 0 — "
+                    "common stale reader fastpath state; not necessarily a bug."
+                )
+            else:
+                issues.append("WARN: `owner` field not cleared: lock is free but `owner` is set.")
 
     # Reserved bits check (bits 3-7)
     reserved_mask = 0b11111000
@@ -534,7 +653,11 @@ def analyze_rw_semaphore(count, is_readfail_reliable, owner, arch="64-bit", verb
         reader_owned = 0
         owner_task_addr = owner
 
-    owner_info = get_owner_info(owner_task_addr)
+    stale_reader_owner = is_stale_reader_owner(count, reader_owned, owner_task_addr)
+    if stale_reader_owner:
+        owner_info = "None (stale RWSEM_READER_OWNED marker)"
+    else:
+        owner_info = get_owner_info(owner_task_addr)
     owner_address = owner & 0xFFFFFFFFFFFFFFFF
 
     integrity_issues = check_integrity(
@@ -557,7 +680,10 @@ def analyze_rw_semaphore(count, is_readfail_reliable, owner, arch="64-bit", verb
             print(f"  Bit mix:        {result['bits_desc']}")
             if result["matched_pattern"]:
                 print(f"  Known pattern:  {result['matched_pattern']}")
-        print_owner_bitfield(owner, owner_info, verbose=True)
+        raw_owner_info = get_owner_info(owner_task_addr)
+        print_owner_bitfield(owner, raw_owner_info, verbose=True)
+        if stale_reader_owner:
+            print("  Display owner: None (stale reader-owned marker on a free lock)")
         print("\nIntegrity check:")
         if integrity_issues:
             for issue in integrity_issues:
@@ -583,27 +709,55 @@ def analyze_rw_semaphore_from_vmcore(rw_semaphore_addr, list_waiters=False, verb
 
     global DEBUG
     DEBUG = debug
+    _CRASH_RWSEM_CACHE.clear()
 
     rwsem = readSU("struct rw_semaphore", rw_semaphore_addr)
-    count_raw = rwsem.count.counter
+
+    # Primary path (673df27): direct pykdump access.  Fallback: parse crash
+    # 'struct rw_semaphore' when pykdump cannot see count/owner (RHEL 8 KABI union).
+    try:
+        count_raw = rwsem.count.counter
+    except (KeyError, AttributeError, TypeError):
+        parsed = _parse_crash_rwsem_fields(rw_semaphore_addr)
+        if "count" not in parsed:
+            print(
+                f"Error: could not read rw_semaphore.count at {rw_semaphore_addr:#x}. "
+                f"Try: struct rw_semaphore {rw_semaphore_addr:#x}"
+            )
+            return
+        count_raw = parsed["count"]
+        dbg("count: using crash struct parse fallback")
 
     is_readfail_reliable = chk_readfail(count_raw)
     dbg(f"is_readfail_reliable: {is_readfail_reliable}")
 
     arch = ARCH  # injected by chk_lock._push_globals()
 
-    owner_raw = rwsem.owner.counter if RHEL_VERSION >= 8 else rwsem.owner
+    try:
+        owner_raw = rwsem.owner.counter if RHEL_VERSION >= 8 else rwsem.owner
+    except (KeyError, AttributeError, TypeError):
+        owner_raw = _parse_crash_rwsem_fields(rw_semaphore_addr).get("owner", 0)
+        dbg("owner: using crash struct parse fallback")
     owner_raw = owner_raw & 0xFFFFFFFFFFFFFFFF
 
     if verbose:
         print("\nRaw struct rw_semaphore (crash struct -x):")
-        raw_output = exec_crash_command(f"struct rw_semaphore {rw_semaphore_addr:#x} -x")
-        print(raw_output)
+        print(exec_crash_command(f"struct rw_semaphore {rw_semaphore_addr:#x} -x"))
 
     analyze_rw_semaphore(count_raw, is_readfail_reliable, owner_raw, arch, verbose)
 
     if list_waiters:
-        waiters = list_waiting_tasks(int(rwsem.wait_list))
+        try:
+            wait_list_head = int(rwsem.wait_list)
+        except KeyError:
+            wait_list_head = _rwsem_wait_list_head(rw_semaphore_addr)
+            if wait_list_head is None:
+                print("\nWaiting Tasks: could not locate wait_list")
+                return
+        if _wait_list_is_empty(rw_semaphore_addr):
+            waiters = []
+        else:
+            waiters = list_waiting_tasks(wait_list_head)
         if waiters:
             print("\nWaiting Tasks:")
             print(f"{'PID':<10} {'State':<25} {'Type':<8} {'Address':<18} Command")
