@@ -3,10 +3,12 @@ import argparse
 import crash
 from pykdump.API import *
 
-# Currently only support bnxt and tg3 drivers.
+# Supports bnxt, tg3, ice, virtio_net, igb, vmxnet3, sfc (Solarflare), and bridge masters.
 
 
 BUFFER_SIZE = 2048
+IFF_BRIDGE_PORT = 1 << 9
+SCTP_IFACE_RE = re.compile(r'^p?sctp\d+$', re.I)
 RX_BUF_RING_SIZE = 1024
 MAX_ERRORS_TO_PRINT = 10
 MAX_WARNINGS = 10
@@ -57,6 +59,109 @@ def read_driver_symbol(netdev):
     except:
         print(f"netdev.netdev_ops: {hex(int(netdev.netdev_ops))}")
         return ""
+
+def is_bridge_port(netdev):
+    return bool(int(netdev.priv_flags) & IFF_BRIDGE_PORT)
+
+def parse_netdev_ops(netdev_ops, debug=False):
+    sym_output = exec_crash_command(f"sym {hex(netdev_ops)}").strip()
+    if debug:
+        print(f"DEBUG: sym_output = {sym_output}")
+
+    match = re.search(r'(\S+)\s+\[\s*(\w+)\s*\]', sym_output)
+    if match:
+        return match.groups()
+
+    parts = sym_output.strip().split()
+    if len(parts) >= 3:
+        return parts[2], "<builtin>"
+    if parts:
+        return parts[0], "<unknown>"
+    return None, "<unknown>"
+
+def analyze_by_ops(dev_addr, func_name, buffer_size, verbose=False, debug=False):
+    if func_name == "bnxt_netdev_ops":
+        return analyze_bnxt(dev_addr, buffer_size, verbose, debug)
+    if func_name == "tg3_netdev_ops":
+        return analyze_tg3(dev_addr, buffer_size, verbose, debug)
+    if func_name == "ice_netdev_ops":
+        return analyze_ice(dev_addr, buffer_size, verbose, debug)
+    if func_name == "virtnet_netdev":
+        return analyze_virtio_net(dev_addr, buffer_size, verbose, debug)
+    if func_name == "igb_netdev_ops":
+        return analyze_igb(dev_addr, buffer_size, verbose, debug)
+    if func_name.startswith("vmxnet3_netdev_ops"):
+        return analyze_vmxnet3(dev_addr, buffer_size, verbose, debug)
+    if func_name in ("efx_netdev_ops", "ef100_netdev_ops"):
+        return analyze_sfc(dev_addr, buffer_size, verbose, debug)
+    return None
+
+def analyze_bridge(br_addr, buffer_size, verbose=False, debug=False, analyzed_ports=None):
+    """
+    Linux bridge master (br_netdev_ops): aggregate RX/TX ring buffers from enslaved ports.
+    sctp*/psctp* interfaces in VMware setups are often bridge masters, not hardware NICs.
+    """
+    MAX_PORTS = 64
+    analyzed_ports = analyzed_ports if analyzed_ports is not None else set()
+
+    try:
+        netdev_size = crash.struct_size("struct net_device")
+        port_list_off = crash.member_offset("struct net_bridge", "port_list")
+        port_list_ent_off = crash.member_offset("struct net_bridge_port", "list")
+        port_dev_off = crash.member_offset("struct net_bridge_port", "dev")
+
+        head = br_addr + port_list_off
+        cur = readPtr(head)
+
+        total_rx_buffers = 0
+        total_tx_buffers = 0
+        port_names = []
+
+        iterations = 0
+        while cur != head and iterations < MAX_PORTS:
+            if cur in (0, 0xffffffffffffffff):
+                break
+
+            port_addr = cur - port_list_ent_off
+            port_dev = readPtr(port_addr + port_dev_off)
+            if port_dev not in (0, 0xffffffffffffffff):
+                analyzed_ports.add(port_dev)
+                try:
+                    port_netdev = readSU("struct net_device", port_dev)
+                    port_name = str(port_netdev.name).strip("\x00")
+                    port_mtu = int(port_netdev.mtu)
+                    port_buffer_size = get_buffer_size_from_mtu(port_mtu)
+                    port_ops = int(port_netdev.netdev_ops)
+                    port_func, _ = parse_netdev_ops(port_ops, debug)
+                    if debug:
+                        print(f"DEBUG: bridge port '{port_name}' @ {hex(port_dev)} ops={port_func}")
+
+                    sub = analyze_by_ops(port_dev, port_func, port_buffer_size, verbose, debug)
+                    if sub:
+                        total_rx_buffers += sub["rx_buffers"]
+                        total_tx_buffers += sub["tx_buffers"]
+                        port_names.append(port_name)
+                except Exception as e:
+                    if debug:
+                        print(f"DEBUG: failed to analyze bridge port @ {hex(port_dev)}: {e}")
+
+            cur = readPtr(cur)
+            iterations += 1
+
+        if debug:
+            print(f"DEBUG: bridge @ {hex(br_addr)} ports analyzed: {port_names}")
+
+        return {
+            "driver": "bridge",
+            "rx_buffers": total_rx_buffers,
+            "tx_buffers": total_tx_buffers,
+            "rx_bytes": total_rx_buffers * buffer_size,
+            "tx_bytes": total_tx_buffers * buffer_size,
+        }
+
+    except Exception as e:
+        print(f"❌ Error analyzing bridge: {e}")
+        return None
 
 def analyze_bnxt(netdev_addr, buffer_size, verbose=False, debug=False):
     try:
@@ -751,6 +856,156 @@ def analyze_vmxnet3(dev_addr, buffer_size, verbose=False, debug=False):
         print(f"❌ Error analyzing vmxnet3: {e}")
         return None
 
+def analyze_sfc(dev_addr, buffer_size, verbose=False, debug=False):
+    """
+    Solarflare / Xilinx sfc driver (efx_netdev_ops, ef100_netdev_ops).
+    net_device private area holds a pointer to struct efx_probe_data; efx_nic is embedded there.
+    """
+    MAX_CHANNELS = 32
+    MAX_TXQ_PER_CHANNEL = 4
+    MAX_RING_SIZE = 8192
+    DEFAULT_RING_SIZE = 1024
+    PTR_SIZE = 8
+    ERROR_LOG_LIMIT = 10
+
+    def log_read_error(addr, error_count, label="buffer", limit=ERROR_LOG_LIMIT):
+        if error_count < limit:
+            print(f"⚠️  sfc: unreadable {label} at {hex(addr)}")
+        elif error_count == limit:
+            print(f"⚠️  sfc: Further unreadable {label}s suppressed...")
+
+    try:
+        netdev_size = crash.struct_size("struct net_device")
+        probe_ptr = readPtr(dev_addr + netdev_size)
+        if probe_ptr in (0, 0xffffffffffffffff):
+            if debug:
+                print(f"DEBUG: sfc probe_data pointer invalid: {hex(probe_ptr)}")
+            return None
+
+        efx_addr = probe_ptr + crash.member_offset("struct efx_probe_data", "efx")
+        if debug:
+            print(f"DEBUG: efx_probe_data @ {hex(probe_ptr)}, efx_nic @ {hex(efx_addr)}")
+
+        efx = readSU("struct efx_nic", efx_addr)
+        n_channels = min(int(efx.n_channels), MAX_CHANNELS)
+        rxq_entries = int(efx.rxq_entries)
+        txq_entries = int(efx.txq_entries)
+        tx_queues_per_channel = int(efx.tx_queues_per_channel) or 1
+        tx_queues_per_channel = min(tx_queues_per_channel, MAX_TXQ_PER_CHANNEL)
+
+        channel_off = crash.member_offset("struct efx_nic", "channel")
+        rx_queue_off = crash.member_offset("struct efx_channel", "rx_queue")
+        tx_queue_off = crash.member_offset("struct efx_channel", "tx_queue")
+        txq_size = crash.struct_size("struct efx_tx_queue")
+
+        rx_buf_size = crash.struct_size("struct efx_rx_buffer")
+        tx_buf_size = crash.struct_size("struct efx_tx_buffer")
+        rx_dma_off = crash.member_offset("struct efx_rx_buffer", "dma_addr")
+        tx_dma_off = crash.member_offset("struct efx_tx_buffer", "dma_addr")
+        rx_buffer_off = crash.member_offset("struct efx_rx_queue", "buffer")
+        rx_ptr_mask_off = crash.member_offset("struct efx_rx_queue", "ptr_mask")
+        tx_buffer_off = crash.member_offset("struct efx_tx_queue", "buffer")
+        tx_ptr_mask_off = crash.member_offset("struct efx_tx_queue", "ptr_mask")
+        tx_init_off = crash.member_offset("struct efx_tx_queue", "initialised")
+
+        total_rx_buffers = 0
+        total_tx_buffers = 0
+
+        for i in range(n_channels):
+            channel_ptr = readPtr(efx_addr + channel_off + i * PTR_SIZE)
+            if channel_ptr in (0, 0xffffffffffffffff):
+                if debug:
+                    print(f"DEBUG: channel {i} pointer invalid: {hex(channel_ptr)}")
+                continue
+
+            if debug:
+                print(f"DEBUG: efx_channel {i} @ {hex(channel_ptr)}")
+
+            # RX: embedded efx_rx_queue in each channel
+            rxq_addr = channel_ptr + rx_queue_off
+            rx_buf_ring = readPtr(rxq_addr + rx_buffer_off)
+            if rx_buf_ring not in (0, 0xffffffffffffffff):
+                ptr_mask = int.from_bytes(readmem(rxq_addr + rx_ptr_mask_off, 4), "little")
+                ring_size = (ptr_mask + 1) if ptr_mask else rxq_entries
+                if ring_size == 0 or ring_size > MAX_RING_SIZE:
+                    ring_size = DEFAULT_RING_SIZE
+
+                rx_count = 0
+                error_count = 0
+                for j in range(ring_size):
+                    entry_addr = rx_buf_ring + j * rx_buf_size
+                    try:
+                        dma_val = readULong(entry_addr + rx_dma_off)
+                        if dma_val:
+                            rx_count += 1
+                            if verbose:
+                                print(f"[RX {i}:{j:04d}] dma = {hex(dma_val)}")
+                    except Exception:
+                        log_read_error(entry_addr, error_count, label="RX buffer")
+                        error_count += 1
+
+                total_rx_buffers += rx_count
+                if debug:
+                    print(f"DEBUG: RX channel {i}: active buffers = {rx_count}/{ring_size}")
+            elif debug:
+                print(f"DEBUG: RX channel {i}: buffer ring unavailable")
+
+            # TX: up to tx_queues_per_channel queues per channel
+            for t in range(tx_queues_per_channel):
+                txq_addr = channel_ptr + tx_queue_off + t * txq_size
+                try:
+                    initialised = int.from_bytes(readmem(txq_addr + tx_init_off, 1), "little")
+                except Exception:
+                    initialised = 0
+                if not initialised:
+                    if debug:
+                        print(f"DEBUG: TX channel {i} queue {t} not initialised — skipping")
+                    continue
+
+                tx_buf_ring = readPtr(txq_addr + tx_buffer_off)
+                if tx_buf_ring in (0, 0xffffffffffffffff):
+                    if debug:
+                        print(f"DEBUG: TX channel {i} queue {t} buffer ring invalid")
+                    continue
+
+                ptr_mask = int.from_bytes(readmem(txq_addr + tx_ptr_mask_off, 4), "little")
+                ring_size = (ptr_mask + 1) if ptr_mask else txq_entries
+                if ring_size == 0 or ring_size > MAX_RING_SIZE:
+                    ring_size = DEFAULT_RING_SIZE
+
+                tx_count = 0
+                error_count = 0
+                for j in range(ring_size):
+                    entry_addr = tx_buf_ring + j * tx_buf_size
+                    try:
+                        dma_val = readULong(entry_addr + tx_dma_off)
+                        if dma_val:
+                            tx_count += 1
+                            if verbose:
+                                print(f"[TX {i}:{t}:{j:04d}] dma = {hex(dma_val)}")
+                    except Exception:
+                        log_read_error(entry_addr, error_count, label="TX buffer")
+                        error_count += 1
+
+                total_tx_buffers += tx_count
+                if debug:
+                    print(f"DEBUG: TX channel {i} queue {t}: active buffers = {tx_count}/{ring_size}")
+
+        if total_rx_buffers == 0 and total_tx_buffers == 0:
+            print("ℹ️  No RX/TX buffers found — descriptor memory may be unavailable in the dump.")
+
+        return {
+            "driver": "sfc",
+            "rx_buffers": total_rx_buffers,
+            "tx_buffers": total_tx_buffers,
+            "rx_bytes": total_rx_buffers * buffer_size,
+            "tx_bytes": total_tx_buffers * buffer_size,
+        }
+
+    except Exception as e:
+        print(f"❌ Error analyzing sfc: {e}")
+        return None
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
@@ -773,6 +1028,8 @@ def main():
     total_tx_buffers = 0
     total_rx_bytes = 0
     total_tx_bytes = 0
+    analyzed_bridge_ports = set()
+    netdev_size = crash.struct_size("struct net_device")
 
     known_builtin_drivers = {
         "loopback_ops": "loopback device",
@@ -784,6 +1041,7 @@ def main():
         "vxlan_netdev_ether_ops": "tunnel device",
     }
 
+    devices = []
     for addr in parse_net_devices(args.debug):
         try:
             netdev = readSU("struct net_device", addr)
@@ -791,36 +1049,23 @@ def main():
             mtu = int(netdev.mtu)
             max_mtu = int(netdev.max_mtu)
             buffer_size = get_buffer_size_from_mtu(mtu)
+            netdev_ops = int(netdev.netdev_ops)
+            func_name, module_name = parse_netdev_ops(netdev_ops, args.debug)
 
             if args.debug:
                 print(f"DEBUG: Got net_device at {hex(addr)}, name = '{name}'")
                 print(f"DEBUG: MTU = {mtu}, max_mtu = {max_mtu}, buffer_size = {buffer_size}")
-
-            netdev_ops = int(netdev.netdev_ops)
-            sym_output = exec_crash_command(f"sym {hex(netdev_ops)}").strip()
-            if args.debug:
-                print(f"DEBUG: sym_output = {sym_output}")
-
-            match = re.search(r'(\S+)\s+\[\s*(\w+)\s*\]', sym_output)
-            if match:
-                func_name, module_name = match.groups()
-            else:
-                # Try extracting just the symbol name manually
-                parts = sym_output.strip().split()
-                if len(parts) >= 3:
-                    func_name = parts[2]
-                    module_name = "<builtin>"
-                else:
-                    func_name = parts[0]  # fallback to raw address
-                    module_name = "<unknown>"
-                if args.debug:
-                    print(f"DEBUG: Could not parse full symbol format for {name}")
-
-                if args.debug:
-                    print(f"DEBUG: Could not parse symbol for {name}")
-            if args.debug:
                 print(f"DEBUG: Found netdev_ops: {func_name} in module {module_name}")
 
+            devices.append((addr, netdev, name, mtu, buffer_size, func_name))
+        except Exception as e:
+            print(f"⚠️  Failed to read device at {hex(addr)}: {e}")
+
+    # Bridge masters first so enslaved port addrs are marked before hardware pass.
+    devices.sort(key=lambda d: (0 if d[5] == "br_netdev_ops" else 1, d[2]))
+
+    for addr, netdev, name, mtu, buffer_size, func_name in devices:
+        try:
             # Check for known skip reasons
             if func_name in known_builtin_drivers:
                 note = known_builtin_drivers[func_name]
@@ -829,25 +1074,33 @@ def main():
                 print(f"{name:<12} {'-':<10} {'-':>6} {'-':>12} {'-':>12} {'-':>15} {'-':>15}  # skipped: {note}")
                 continue
 
-            # Process supported drivers
-            if func_name == "bnxt_netdev_ops":
-                result = analyze_bnxt(addr, buffer_size, args.verbose, args.debug)
-            elif func_name == "tg3_netdev_ops":
-                result = analyze_tg3(addr, buffer_size, args.verbose, args.debug)
-            elif func_name == "ice_netdev_ops":
-                result = analyze_ice(addr, buffer_size, args.verbose, args.debug)
-            elif func_name == "virtnet_netdev":
-                result = analyze_virtio_net(addr, buffer_size, args.verbose, args.debug)
-            elif func_name == "igb_netdev_ops":
-                result = analyze_igb(addr, buffer_size, args.verbose, args.debug)
-            elif func_name.startswith("vmxnet3_netdev_ops"):
-                result = analyze_vmxnet3(addr, buffer_size, args.verbose, args.debug)
-            else:
-                note = f"unsupported driver ({func_name})"
+            if is_bridge_port(netdev) and not SCTP_IFACE_RE.match(name):
+                note = "bridge port (counted under bridge master)"
                 if args.debug:
                     print(f"DEBUG: ⚠️  Skipping {name}: {note}")
                 print(f"{name:<12} {'-':<10} {'-':>6} {'-':>12} {'-':>12} {'-':>15} {'-':>15}  # skipped: {note}")
                 continue
+
+            if addr in analyzed_bridge_ports:
+                note = "bridge port (already counted)"
+                if args.debug:
+                    print(f"DEBUG: ⚠️  Skipping {name}: {note}")
+                print(f"{name:<12} {'-':<10} {'-':>6} {'-':>12} {'-':>12} {'-':>15} {'-':>15}  # skipped: {note}")
+                continue
+
+            # Process supported drivers
+            if func_name == "br_netdev_ops":
+                result = analyze_bridge(
+                    addr + netdev_size, buffer_size, args.verbose, args.debug, analyzed_bridge_ports
+                )
+            else:
+                result = analyze_by_ops(addr, func_name, buffer_size, args.verbose, args.debug)
+                if result is None:
+                    note = f"unsupported driver ({func_name})"
+                    if args.debug:
+                        print(f"DEBUG: ⚠️  Skipping {name}: {note}")
+                    print(f"{name:<12} {'-':<10} {'-':>6} {'-':>12} {'-':>12} {'-':>15} {'-':>15}  # skipped: {note}")
+                    continue
 
             if result:
                 rx_usage = format_value(result['rx_bytes'] / 1024, args.unit)
@@ -860,10 +1113,10 @@ def main():
                 total_tx_bytes += result["tx_bytes"]
 
         except Exception as e:
-            print(f"⚠️  Failed to analyze device at {hex(addr)}: {e}")
+            print(f"⚠️  Failed to analyze device at {hex(addr)} ({name}): {e}")
 
     total_rx = format_value(total_rx_bytes / 1024, args.unit)
-    total_tx = format_value(total_rx_bytes / 1024, args.unit)
+    total_tx = format_value(total_tx_bytes / 1024, args.unit)
     total_rx_tx = format_value((total_rx_bytes + total_tx_bytes) / 1024, args.unit)
 
     print("=" * 88)
