@@ -444,7 +444,10 @@ def make_argparser():
     p.add_argument("-M", action="store_true", help="Show in MB")
     p.add_argument("-K", action="store_true", help="Show in KB")
     p.add_argument("-G", action="store_true", help="Show in GB")
-    p.add_argument("-p", "--processes", action="store_true", help="Process report (varies by mode)")
+    p.add_argument("-p", "--processes", action="store_true",
+                   help="Process report: top processes by memory (default top 10)")
+    p.add_argument("--top-processes", type=int, default=10, dest="top_processes",
+                   help="Number of processes to show with -p (default: 10)")
     p.add_argument("-m", "--modules", action="store_true", help="Show top memory-using modules")
     p.add_argument("-s", "--slabs", action="store_true",
                    help="Show slab usage by process (Type-2 only). With -p, show slab vs non-slab breakdown")
@@ -878,22 +881,23 @@ def analyze(path, args):
                 print(f"  order {o:<2} : pages={order_pages[o]:>12}  bytes/page={per_b:<8} total={_fmt_bytes(tot_b, unit, div)}")
 
     if args.processes:
-        print("\n=== Processes (by total bytes) ===")
+        top_n = max(1, int(args.top_processes))
+        print(f"\n=== Top {top_n} processes (by total bytes) ===")
         if not per_pid_bytes:
             if fmt == "text":
                 print("(no pid/tgid in text records)")
             else:
                 print("(no pid information in file; likely RHEL7 NDJSON export)")
         else:
-            top = sorted(per_pid_bytes.items(), key=lambda kv: kv[1], reverse=True)
+            top = sorted(per_pid_bytes.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
             for pid, b in top:
                 print(f"PID {pid:<7}  bytes={b:>12} ({_fmt_bytes(b, unit, div)})  pages={per_pid_pages[pid]}")
             if args.filter_module and per_pid_module_bytes:
                 mod = args.filter_module
-                print(f"\n--- Top processes using module '{mod}' ---")
+                print(f"\n--- Top {top_n} processes using module '{mod}' ---")
                 filt = [(pid, b) for ((pid, m), b) in per_pid_module_bytes.items() if m == mod]
                 filt.sort(key=lambda x: x[1], reverse=True)
-                for pid, b in filt[:20]:
+                for pid, b in filt[:top_n]:
                     print(f"PID {pid:<7}  bytes={b:>12} ({_fmt_bytes(b, unit, div)})")
 
     if args.modules:
