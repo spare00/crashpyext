@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Fast page_owner exporter for crash/epython (RHEL7/8/9, x86_64).
+# RHEL7: page_cgroup.ext.owner + inline trace; RHEL8+: page_ext + page_owner (stack depot handle).
 # Uses pykdump.API, precomputes offsets once, and reads memory directly (no per-page 'p'/'sym').
 #
 # Output (NDJSON):
@@ -67,6 +68,45 @@ def _offsetof(expr: str) -> int:
     if a is None:
         raise RuntimeError(f"could not compute offset for: {expr}\n{out}")
     return a  # gdb prints this as an absolute offset from 0
+
+def member_offset(typename: str, member: str):
+    """Byte offset of member in typename, or None if absent."""
+    try:
+        import crash as _cr
+        if hasattr(_cr, "member_offset"):
+            off = _cr.member_offset(typename, member)
+            if off is not None and off != -1:
+                return int(off)
+    except Exception:
+        pass
+    try:
+        out = x(f"offset {typename} {member}")
+        line = out.strip().splitlines()[-1] if out.strip() else ""
+        m = re.search(r'=\s*(0x[0-9a-fA-F]+|\d+)', line)
+        if m:
+            return int(m.group(1), 0)
+    except Exception:
+        pass
+    return None
+
+def _has_member(typename: str, member: str) -> bool:
+    return member_offset(typename, member) is not None
+
+def _struct_size(typename: str, default: int = 0) -> int:
+    try:
+        out = x(f"p/x sizeof({typename})")
+        return _find_hex(out) or default
+    except Exception:
+        return default
+
+def _symbol_u64(name: str):
+    try:
+        a = _find_hex(x(f"p/x {name}"))
+        if a is not None:
+            return a
+    except Exception:
+        pass
+    return None
 
 def _u64_le(b: bytes) -> int:
     return struct.unpack("<Q", b)[0]
@@ -150,41 +190,51 @@ def _sections_slice(range_str: str):
         raise RuntimeError(f"No sections in requested range {lo}:{hi}")
     return sel
 
-# -------- page_cgroup / page_owner offsets (computed once) --------
+# -------- page extension / page_owner offsets (computed once) --------
+# layout "page_cgroup": RHEL7 (and some early backports) — mem_section.page_cgroup
+# layout "page_ext":    RHEL8+ (4.18+) — mem_section.page_ext, page_owner at page_owner_ops.offset
 _OFF = {
+    "layout": None,
+    "sec_field": None,  # mem_section field: page_cgroup | page_ext
     "pc_owner": None,   # offsetof(struct page_cgroup, ext.owner)
-    "pc_flags": None,   # offsetof(struct page_cgroup, ext.flags)
-    "pc_handle": None,  # offsetof(struct page_cgroup, ext.handle) -- RHEL8+
+    "pc_flags": None,   # page_cgroup.ext.flags or page_ext.flags
+    "pc_handle": None,  # page_cgroup.ext.handle (legacy r8) or page_owner.handle (absolute)
     "pc_pid": None,     # optional pid/tgid field if present
+    "po_base_delta": 0, # bytes from page_ext entry base to embedded struct page_owner
     "po_order": None,   # offsetof(struct page_owner, order)
     "po_gfp": None,     # offsetof(struct page_owner, gfp_mask)
     "po_nr": None,      # offsetof(struct page_owner, nr_entries)
     "po_tr0": None,     # offsetof(struct page_owner, trace_entries[0])
-    "page_cgroup_sz": None,
+    "po_handle": None,  # offsetof(struct page_owner, handle) within page_owner
+    "page_cgroup_sz": None,  # stride per page index (page_cgroup or page_ext entry)
     "PAGE_EXT_OWNER_bit": -1,
 }
 
-def _compute_offsets_once():
-    # page_cgroup size (optional)
+def _page_ext_owner_bit():
     try:
-        out = x("p/x sizeof(struct page_cgroup)")
-        _OFF["page_cgroup_sz"] = _find_hex(out) or 0
+        out = x("p PAGE_EXT_OWNER")
+        return int(out.split()[-1], 0)
     except Exception:
-        _OFF["page_cgroup_sz"] = 0
+        return -1
 
-    # page_cgroup.ext.* offsets
-    _OFF["pc_owner"]  = _offsetof("&(((struct page_cgroup *)0)->ext.owner)")
-    # flags may not exist in some backports; guard it
+def _compute_offsets_page_cgroup():
+    _OFF["layout"] = "page_cgroup"
+    _OFF["sec_field"] = "page_cgroup"
+    _OFF["po_base_delta"] = 0
+
+    _OFF["page_cgroup_sz"] = _struct_size("struct page_cgroup")
+    if not _OFF["page_cgroup_sz"]:
+        raise RuntimeError("struct page_cgroup not found in vmlinux debug info")
+
+    _OFF["pc_owner"] = _offsetof("&(((struct page_cgroup *)0)->ext.owner)")
     try:
-        _OFF["pc_flags"]  = _offsetof("&(((struct page_cgroup *)0)->ext.flags)")
+        _OFF["pc_flags"] = _offsetof("&(((struct page_cgroup *)0)->ext.flags)")
     except Exception:
         _OFF["pc_flags"] = None
-    # handle present in RHEL8+ only
     try:
         _OFF["pc_handle"] = _offsetof("&(((struct page_cgroup *)0)->ext.handle)")
     except Exception:
         _OFF["pc_handle"] = None
-    # opportunistic pid field (name differs across backports, skip if absent)
     for fld in ("pid", "tgid", "tsk_pid"):
         try:
             _OFF["pc_pid"] = _offsetof(f"&(((struct page_cgroup *)0)->ext.{fld})")
@@ -192,18 +242,92 @@ def _compute_offsets_once():
         except Exception:
             _OFF["pc_pid"] = None
 
-    # page_owner fields
     _OFF["po_order"] = _offsetof("&(((struct page_owner *)0)->order)")
     _OFF["po_gfp"]   = _offsetof("&(((struct page_owner *)0)->gfp_mask)")
-    _OFF["po_nr"]    = _offsetof("&(((struct page_owner *)0)->nr_entries)")
-    _OFF["po_tr0"]   = _offsetof("&(((struct page_owner *)0)->trace_entries[0])")
-
-    # PAGE_EXT_OWNER bit index (optional)
     try:
-        out = x("p PAGE_EXT_OWNER")
-        _OFF["PAGE_EXT_OWNER_bit"] = int(out.split()[-1], 0)
+        _OFF["po_nr"] = _offsetof("&(((struct page_owner *)0)->nr_entries)")
     except Exception:
-        _OFF["PAGE_EXT_OWNER_bit"] = -1
+        _OFF["po_nr"] = None
+    try:
+        _OFF["po_tr0"] = _offsetof("&(((struct page_owner *)0)->trace_entries[0])")
+    except Exception:
+        _OFF["po_tr0"] = None
+    try:
+        _OFF["po_handle"] = _offsetof("&(((struct page_owner *)0)->handle)")
+    except Exception:
+        _OFF["po_handle"] = None
+
+    _OFF["PAGE_EXT_OWNER_bit"] = _page_ext_owner_bit()
+
+def _compute_offsets_page_ext():
+    """RHEL8+ (4.18): page_owner lives at page_ext + page_owner_ops.offset."""
+    _OFF["layout"] = "page_ext"
+    _OFF["sec_field"] = "page_ext"
+    _OFF["pc_owner"] = None
+    _OFF["pc_pid"] = None
+    _OFF["po_nr"] = None
+    _OFF["po_tr0"] = None
+
+    pe_sz = _struct_size("struct page_ext")
+    if not pe_sz:
+        raise RuntimeError("struct page_ext not found in vmlinux debug info")
+
+    po_delta = _symbol_u64("page_owner_ops.offset")
+    if po_delta is None:
+        try:
+            out = x("p page_owner_ops")
+            for ln in out.splitlines():
+                m = re.search(r'\boffset\s*=\s*(0x[0-9a-fA-F]+|\d+)', ln)
+                if m:
+                    po_delta = int(m.group(1), 0)
+                    break
+        except Exception:
+            pass
+    if po_delta is None:
+        po_delta = pe_sz
+    _OFF["po_base_delta"] = int(po_delta)
+
+    po_extra = _symbol_u64("page_owner_ops.size")
+    if po_extra is None:
+        po_extra = _struct_size("struct page_owner")
+    entry_sz = _symbol_u64("page_ext_size")
+    if entry_sz is None or entry_sz <= 0:
+        entry_sz = pe_sz + int(po_extra or 0)
+    _OFF["page_cgroup_sz"] = entry_sz
+
+    _OFF["pc_flags"] = member_offset("struct page_ext", "flags")
+    if _OFF["pc_flags"] is None:
+        _OFF["pc_flags"] = 0
+
+    _OFF["po_order"] = member_offset("struct page_owner", "order")
+    _OFF["po_gfp"]   = member_offset("struct page_owner", "gfp_mask")
+    _OFF["po_handle"] = member_offset("struct page_owner", "handle")
+    if _OFF["po_order"] is None or _OFF["po_gfp"] is None:
+        raise RuntimeError("struct page_owner fields not found (order/gfp_mask)")
+    if _OFF["po_handle"] is None:
+        raise RuntimeError("struct page_owner.handle not found")
+
+    _OFF["pc_handle"] = _OFF["po_base_delta"] + _OFF["po_handle"]
+    _OFF["PAGE_EXT_OWNER_bit"] = _page_ext_owner_bit()
+
+def _compute_offsets_once(prefer_page_ext: bool = False):
+    if prefer_page_ext or _has_member("struct mem_section", "page_ext"):
+        order = ("page_ext", "page_cgroup")
+    else:
+        order = ("page_cgroup", "page_ext")
+    errors = []
+    for layout in order:
+        try:
+            if layout == "page_cgroup":
+                _compute_offsets_page_cgroup()
+            else:
+                _compute_offsets_page_ext()
+            return
+        except Exception as e:
+            errors.append(f"{layout}: {e}")
+    raise RuntimeError(
+        "could not determine page owner layout; tried: " + "; ".join(errors)
+    )
 
 # -------- page_cgroup base per section --------
 _PC_BASE_CACHE = {}
@@ -212,10 +336,27 @@ def _pc_base_for_section(sec_addr: int) -> int:
     if sec_addr in _PC_BASE_CACHE:
         return _PC_BASE_CACHE[sec_addr]
     sec = readSU("struct mem_section", sec_addr)
-    try:
-        base = int(getattr(sec, "page_cgroup"))
-    except Exception as e:
-        raise RuntimeError(f"mem_section.page_cgroup not accessible at {sec_addr:#x}: {e}")
+    field = _OFF.get("sec_field")
+    candidates = [field] if field else []
+    for f in ("page_ext", "page_cgroup"):
+        if f not in candidates:
+            candidates.append(f)
+    base = 0
+    last_err = None
+    for fld in candidates:
+        if not fld:
+            continue
+        try:
+            base = int(getattr(sec, fld))
+            if base:
+                break
+        except Exception as e:
+            last_err = e
+    if not base:
+        raise RuntimeError(
+            f"mem_section page extension base not accessible at {sec_addr:#x}"
+            + (f": {last_err}" if last_err else "")
+        )
     _PC_BASE_CACHE[sec_addr] = base
     return base
 
@@ -224,10 +365,11 @@ def _pc_addr_by_offset(pc_base: int, offset: int) -> int:
     if sz > 0:
         return pc_base + offset * sz
     # last resort: ask gdb to compute (rare path)
-    out = x(f"p &((struct page_cgroup *){pc_base:#x})[{offset}]")
+    typ = "struct page_ext" if _OFF.get("layout") == "page_ext" else "struct page_cgroup"
+    out = x(f"p &(({typ} *){pc_base:#x})[{offset}]")
     a = _find_hex(out)
     if not a:
-        raise RuntimeError("Failed to compute &page_cgroup[offset]")
+        raise RuntimeError(f"Failed to compute &{typ}[offset]")
     return a
 
 # --- small batched sym resolver (in-memory cache) ---
@@ -262,17 +404,20 @@ def _sym_lookup_many(addrs):
             _SYM_CACHE[a] = rhs or f"{a:#x}"
         return
     try:
-        out = x("sym " + "".join(args).strip())
-        lines = str(out).splitlines()
+        sym_out = x("sym " + "".join(args).strip())
+        sym_lines = sym_out.splitlines() if sym_out else []
         # Walk lines; pick those that start with address, map in same order we passed
-        it = iter([int(s,16) for s in re.findall(r'(ffffffff[0-9A-Fa-f]{8})', " ".join(args))])
+        it = iter([int(s, 16) for s in re.findall(r'(ffffffff[0-9A-Fa-f]{8})', " ".join(args))])
         current = None
-        for ln in lines:
+        for ln in sym_lines:
             m = re.match(r'^\s*(ffffffff[0-9A-Fa-f]{8})\s+(.*)$', ln)
-            if not m: continue
+            if not m:
+                continue
             if current is None:
-                try: current = next(it)
-                except StopIteration: break
+                try:
+                    current = next(it)
+                except StopIteration:
+                    break
             rhs = m.group(2)
             rhs = re.sub(r'(?:\s+/.+?:\s*\d+)\s*$', '', rhs).strip()
             _SYM_CACHE[current] = rhs or f"0x{current:x}"
@@ -311,17 +456,21 @@ def _read_owner_record(pc_addr: int):
         except Exception:
             pass  # continue
 
-    # RHEL8+ handle?
+    # RHEL8+ stack-depot handle (page_ext or legacy page_cgroup.ext.handle)
     if _OFF["pc_handle"] is not None:
         try:
+            po_base = pc_addr + int(_OFF.get("po_base_delta") or 0)
             handle = _rd64(pc_addr + _OFF["pc_handle"]) & 0xffffffff
             if handle:
                 order = gfp = pid = 0
-                # Best-effort order/gfp nearby (may be absent)
-                try: order = _rd32(pc_addr + _OFF["po_order"]) & 0xffffffff
-                except Exception: pass
-                try: gfp   = _rd32(pc_addr + _OFF["po_gfp"]) & 0xffffffff
-                except Exception: pass
+                try:
+                    order = _rd32(po_base + _OFF["po_order"]) & 0xffffffff
+                except Exception:
+                    pass
+                try:
+                    gfp = _rd32(po_base + _OFF["po_gfp"]) & 0xffffffff
+                except Exception:
+                    pass
                 if _OFF["pc_pid"] is not None:
                     try:
                         pidv = _rd32(pc_addr + _OFF["pc_pid"]) & 0xffffffff
@@ -336,6 +485,8 @@ def _read_owner_record(pc_addr: int):
             pass
 
     # RHEL7 inline owner: owner may be pointer or embedded.
+    if _OFF["pc_owner"] is None:
+        return None
     try:
         owner_field_addr = pc_addr + _OFF["pc_owner"]
         owner_val = _rd64(owner_field_addr)
@@ -585,37 +736,13 @@ def export_page_owner(out_path: str,
     # ---------- compute offsets once; fully mode-aware (no RHEL8 probes on --rhel7) ----------
     def _compute_offsets_once_respecting_mode():
         if force_mode == "r7":
-            # Only compute fields needed for r7; avoid probing r8 fields entirely.
-            # page_cgroup size (optional)
-            try:
-                out = x("p/x sizeof(struct page_cgroup)")
-                _OFF["page_cgroup_sz"] = _find_hex(out) or 0
-            except Exception:
-                _OFF["page_cgroup_sz"] = 0
-            # ext.owner (must)
-            _OFF["pc_owner"] = _offsetof("&(((struct page_cgroup *)0)->ext.owner)")
-            # ext.flags (optional)
-            try:
-                _OFF["pc_flags"] = _offsetof("&(((struct page_cgroup *)0)->ext.flags)")
-            except Exception:
-                _OFF["pc_flags"] = None
-            # r8-only fields: force None; do not probe
+            _compute_offsets_page_cgroup()
             _OFF["pc_handle"] = None
             _OFF["pc_pid"] = None
-            # page_owner fields
-            _OFF["po_order"] = _offsetof("&(((struct page_owner *)0)->order)")
-            _OFF["po_gfp"]   = _offsetof("&(((struct page_owner *)0)->gfp_mask)")
-            _OFF["po_nr"]    = _offsetof("&(((struct page_owner *)0)->nr_entries)")
-            _OFF["po_tr0"]   = _offsetof("&(((struct page_owner *)0)->trace_entries[0])")
-            # PAGE_EXT_OWNER bit index (optional)
-            try:
-                out = x("p PAGE_EXT_OWNER")
-                _OFF["PAGE_EXT_OWNER_bit"] = int(out.split()[-1], 0)
-            except Exception:
-                _OFF["PAGE_EXT_OWNER_bit"] = -1
+        elif force_mode == "r8":
+            _compute_offsets_once(prefer_page_ext=True)
         else:
-            # default: keep original behavior (may probe r8 fields)
-            _compute_offsets_once()
+            _compute_offsets_once(prefer_page_ext=False)
 
     rows = _sections_slice(sections_range)
     pps  = pps_override if pps_override else DEFAULT_PPS
@@ -853,4 +980,3 @@ def chk_export_po(*argv):
 if __name__ == "__main__":
     import sys
     main(sys.argv[1:])
-
