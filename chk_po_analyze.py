@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-# analyze_po.py — Analyze page_owner NDJSON exported from chk_export_po.py
+# analyze_po.py — Analyze page_owner dumps (NDJSON or kernel text format)
 # Crash-only symbolization via `sym -l` using pykdump.API (preferred) or pykdump (fallback).
 #
-# Supported records:
-#   RHEL7 inline traces: {"k":"r7","pfn":..., "o":order, "g":gfp, "t":[addr,...]}
-#   RHEL8+ depot:        {"k":"r8","pfn":..., "o":order, "g":gfp, "h":handle, ["pid":pid]}
+# Supported inputs:
+#   NDJSON (chk_po_export.py):
+#     RHEL7 inline traces: {"k":"r7","pfn":..., "o":order, "g":gfp, "t":[addr,...]}
+#     RHEL8+ depot:        {"k":"r8","pfn":..., "o":order, "g":gfp, "h":handle, ["pid":pid]}
+#   Kernel text (/sys/kernel/debug/page_owner or crash page_owner output):
+#     PFN ... / Page allocated via order N, ... pid X, tgid Y (comm) / [alloc] stack
 #
 # CLI:
 #   [-h] [-v] [-d] [-M] [-K] [-G] [-p] [-m] [-s] [-c] [-t]
@@ -488,9 +491,42 @@ def first_allocator_module(addrs):
             return (base or f"{a:#x}", mod)
     return (None, None)
 
-# -------- Detection --------
+# -------- Detection / text format parsing --------
+# Kernel page_owner text (see tools/mm/page_owner_sort.c)
+RE_TEXT_PFN = re.compile(r'^PFN\s+(\d+)')
+RE_TEXT_PAGE = re.compile(
+    r'^Page (allocated|freed) via order (\d+), mask (0x[0-9a-fA-F]+)'
+    r'(?:, pid (\d+), tgid (\d+) \(([^)]+)\))?'
+    r'(?:, ts (\d+) ns)?(?:, free_ts (\d+) ns)?'
+)
+RE_TEXT_FRAME = re.compile(r'^\s+(\S.+?)\s*$')
+
+def detect_format(path, detect_lines=5000):
+    """Return 'ndjson' or 'text'."""
+    ndjson = text = 0
+    with open(path, "r", errors="ignore") as f:
+        for i, ln in enumerate(f, 1):
+            if i > detect_lines:
+                break
+            s = ln.strip()
+            if not s:
+                continue
+            if s.startswith("{"):
+                try:
+                    json.loads(s)
+                    ndjson += 1
+                except Exception:
+                    pass
+            elif s.startswith("PFN") or "Page allocated via order" in s or "Page freed via order" in s:
+                text += 1
+    if text > ndjson:
+        return "text"
+    return "ndjson" if ndjson else ("text" if text else "ndjson")
+
 def detect_kind(path, detect_lines):
     r7 = r8 = 0
+    if detect_format(path, min(detect_lines, 500)) == "text":
+        return (0, 0)
     with open(path, "r", errors="ignore") as f:
         for i, ln in enumerate(f, 1):
             if i > detect_lines: break
@@ -503,9 +539,114 @@ def detect_kind(path, detect_lines):
             elif k == "r8": r8 += 1
     return (r7, r8)
 
-def report_modules_fast(path, unit, div, depth=8, topn=10, strict=False, verbose=False):
+def _mod_from_frame_str(rhs: str):
+    if rhs and rhs.endswith("]") and "[" in rhs:
+        return rhs[rhs.rfind("[") + 1 : -1]
+    return None
+
+def _parse_text_block(lines):
+    """Parse one blank-line-separated page_owner text block."""
+    order = pfn = pid = tgid = comm = None
+    frames = []
+    in_stack = False
+    for ln in lines:
+        s = ln.rstrip("\n\r")
+        if not s.strip():
+            continue
+        m = RE_TEXT_PFN.match(s)
+        if m:
+            pfn = int(m.group(1))
+            continue
+        m = RE_TEXT_PAGE.match(s)
+        if m:
+            if m.group(1) != "allocated":
+                return None
+            order = int(m.group(2))
+            if m.group(4) is not None:
+                pid = int(m.group(4))
+                tgid = int(m.group(5))
+                comm = m.group(6)
+            continue
+        tag = s.strip()
+        if tag in ("[alloc]", "[free]"):
+            in_stack = tag == "[alloc]"
+            continue
+        if in_stack:
+            fm = RE_TEXT_FRAME.match(s)
+            if fm:
+                frames.append(fm.group(1).strip())
+    if order is None:
+        return None
+    proc = tgid if tgid is not None else pid
+    rec = {"o": order, "pfn": pfn, "s": frames or None}
+    if proc is not None and proc > 0:
+        rec["pid"] = proc
+    if comm:
+        rec["comm"] = comm
+    for rhs in frames:
+        mod = _mod_from_frame_str(rhs)
+        if mod and mod != "vmlinux":
+            rec["mod"] = mod
+            break
+    return rec
+
+def iter_text_records(path):
+    block = []
+    with open(path, "r", errors="ignore") as f:
+        for ln in f:
+            if not ln.strip():
+                if block:
+                    rec = _parse_text_block(block)
+                    if rec:
+                        yield rec
+                    block = []
+            else:
+                block.append(ln)
+        if block:
+            rec = _parse_text_block(block)
+            if rec:
+                yield rec
+
+def _normalize_ndjson(o):
+    pid = None
+    if "pid" in o:
+        try:
+            v = int(o["pid"])
+            if v > 0:
+                pid = v
+        except Exception:
+            pass
+    return {
+        "k": o.get("k"),
+        "o": int(o.get("o", 0)),
+        "pid": pid,
+        "s": o.get("s"),
+        "mod": o.get("mod"),
+        "t": o.get("t"),
+    }
+
+def iter_ndjson_records(path):
+    with open(path, "r", errors="ignore") as f:
+        for ln in f:
+            if not ln or ln[0] != "{":
+                continue
+            try:
+                o = json.loads(ln)
+            except Exception:
+                continue
+            yield _normalize_ndjson(o)
+
+def iter_records(path, fmt=None):
+    if fmt is None:
+        fmt = detect_format(path)
+    if fmt == "text":
+        yield from iter_text_records(path)
+    else:
+        yield from iter_ndjson_records(path)
+
+def report_modules_fast(path, unit, div, depth=8, topn=10, strict=False, verbose=False, fmt=None):
     """
-    Fast '-m': consume enriched NDJSON ('s':[frames], optional 'mod').
+    Fast '-m': consume records ('s': frames, optional 'mod') from NDJSON or text dumps.
       • Use record['mod'] if present.
       • Else use _module_from_frames_rhs(record['s'][:depth], strict).
       • Else (raw 't' only) → attribute to (kernel) to avoid slow sym.
@@ -524,35 +665,24 @@ def report_modules_fast(path, unit, div, depth=8, topn=10, strict=False, verbose
         total_allocs += 1
         total_pages  += pages
 
-    with open(path, "r", errors="ignore") as f:
-        for ln in f:
-            if not ln or ln[0] != "{":
-                continue
-            try:
-                o = json.loads(ln)
-            except Exception:
-                continue
+    for o in iter_records(path, fmt=fmt):
+        order = int(o.get("o", 0))
+        if order < 0 or order > 20:
+            continue
+        pages = 1 << order
 
-            order = int(o.get("o", 0))
-            if order < 0 or order > 20:
-                continue
-            pages = 1 << order
+        mod = o.get("mod")
+        if mod:
+            bump(mod, pages)
+            continue
 
-            # 1) explicit module tag from enrichment phase
-            mod = o.get("mod")
-            if mod:
-                bump(mod, pages)
-                continue
+        rhs_list = o.get("s")
+        if rhs_list:
+            mod = _module_from_frames_rhs(rhs_list[:depth], strict=strict)
+            bump(mod, pages)
+            continue
 
-            # 2) pretty frames present → infer module locally (no sym)
-            rhs_list = o.get("s")
-            if rhs_list:
-                mod = _module_from_frames_rhs(rhs_list[:depth], strict=strict)
-                bump(mod, pages)
-                continue
-
-            # 3) raw PCs → we intentionally DO NOT symbolize here
-            bump("(kernel)", pages)
+        bump("(kernel)", pages)
 
     # print Top-N
     print("\nModule                       Allocations     Memory (G)")
@@ -586,6 +716,10 @@ def analyze(path, args):
         total_size = os.path.getsize(path)
     except Exception:
         total_size = 0
+
+    fmt = detect_format(path, args.detect_lines)
+    if args.verbose:
+        print(f"[info] input format: {fmt}", file=sys.stderr)
 
     unit, div = _unit_and_div(args)
 
@@ -621,120 +755,83 @@ def analyze(path, args):
     sig_key_bytes  = Counter()   # tuple[str] -> total bytes
     sig_key_sample = {}          # tuple[str] -> exemplar list[str]
 
-    with open(path, "r", errors="ignore") as f:
-        lines_read = 0
-        last_log_ts = start_ts
-        for ln in f:
-            lines_read += 1
+    lines_read = 0
+    last_log_ts = start_ts
+    for o in iter_records(path, fmt=fmt):
+        lines_read += 1
 
-            # periodic progress
-            if args.progress or args.progress_sec > 0:
-                do_log = False
-                if args.progress and (lines_read % args.progress == 0):
+        if args.progress or args.progress_sec > 0:
+            do_log = False
+            if args.progress and (lines_read % args.progress == 0):
+                do_log = True
+            else:
+                now = time.perf_counter()
+                if args.progress_sec > 0 and (now - last_log_ts) >= args.progress_sec:
                     do_log = True
-                else:
-                    now = time.perf_counter()
-                    if args.progress_sec > 0 and (now - last_log_ts) >= args.progress_sec:
-                        do_log = True
-                if do_log:
-                    pos = _file_pos(f)
-                    elapsed = time.perf_counter() - start_ts
-                    rate = lines_read / elapsed if elapsed > 0 else 0.0
+            if do_log:
+                elapsed = time.perf_counter() - start_ts
+                rate = lines_read / elapsed if elapsed > 0 else 0.0
+                print(
+                    f"[analyze] {lines_read:,} records  "
+                    f"elapsed {_fmt_hms(elapsed)}  rate {rate:,.0f}/s",
+                    file=sys.stderr, flush=True
+                )
+                last_log_ts = time.perf_counter()
 
-                    pct_str = "   n/a"
-                    eta_str = "   n/a"
-                    if total_size > 0 and pos > 0:
-                        pct = (pos / total_size) * 100.0
-                        pct_str = f"{pct:5.1f}%"
-                        if pos < total_size and rate > 0:
-                            # ETA based on byte-rate when possible
-                            byte_rate = pos / elapsed if elapsed > 0 else 0.0
-                            if byte_rate > 0:
-                                eta = (total_size - pos) / byte_rate
-                                eta_str = _fmt_hms(eta)
+        kind = o.get("k")
+        order = int(o.get("o", 0))
+        if order < args.min_order:
+            continue
 
-                    print(
-                        f"[analyze] {lines_read:,} lines  {pct_str}  "
-                        f"elapsed {_fmt_hms(elapsed)}  rate {rate:,.0f}/s  ETA {eta_str}",
-                        file=sys.stderr, flush=True
-                    )
-                    last_log_ts = time.perf_counter()
+        pages = 1 << order
+        bytes_ = pages * 4096
 
-            if not ln or ln[0] != "{":
-                continue
-            try:
-                o = json.loads(ln)
-            except Exception:
-                if args.debug: print("[debug] skip non-json line", file=sys.stderr)
-                continue
+        total_pages += pages
+        total_bytes += bytes_
+        order_pages[order] += pages
 
-            kind = o.get("k")
-            order = int(o.get("o", 0))
-            # inside loop:
-            if args.sample > 1:
-                # cheap sampler: use incrementing line index or a hash of PFN/order to subsample
-                # e.g., skip N-1 out of N lines uniformly by count
-                # (keep a simple counter outside the loop)
-                pass  # implement if you want
+        pid = o.get("pid")
+        if pid:
+            per_pid_pages[pid] += pages
+            per_pid_bytes[pid] += bytes_
 
-            if order < args.min_order:
-                continue
-
-            pages = 1 << order
-            bytes_ = pages * 4096  # exporter’s default (x86_64)
-
-            total_pages += pages
-            total_bytes += bytes_
-            order_pages[order] += pages
-
-            pid = int(o.get("pid", 0)) if (kind == "r8" and "pid" in o) else None
-            if pid:
-                per_pid_pages[pid] += pages
-                per_pid_bytes[pid] += bytes_
-
-            # RHEL7 traces → signatures
-            # Signatures (prefer enriched frames 's')
-            rhs_list = o.get("s")
-            if rhs_list:
-                key = tuple(rhs_list[:DEPTH])
+        rhs_list = o.get("s")
+        if rhs_list:
+            key = tuple(rhs_list[:DEPTH])
+            if key:
+                sig_key_counts[key] += 1
+                sig_key_bytes[key] += bytes_
+                sig_key_sample.setdefault(key, rhs_list[:DEPTH])
+        elif args.sym and kind == "r7":
+            addrs = [a for a in (o.get("t") or []) if _is_kernel_addr(a)]
+            if addrs:
+                key = tuple(_frame_rhs(a) for a in addrs[:DEPTH])
                 if key:
                     sig_key_counts[key] += 1
-                    sig_key_bytes[key]  += bytes_
-                    sig_key_sample.setdefault(key, rhs_list[:DEPTH])
-            elif args.sym and kind == "r7":
-                # optional crash fallback if user allowed
-                addrs = [a for a in (o.get("t") or []) if _is_kernel_addr(a)]
-                if addrs:
-                    key = tuple(_frame_rhs(a) for a in addrs[:DEPTH])  # uses crash
-                    if key:
-                        sig_key_counts[key] += 1
-                        sig_key_bytes[key]  += bytes_
-                        sig_key_sample.setdefault(key, list(key))
+                    sig_key_bytes[key] += bytes_
+                    sig_key_sample.setdefault(key, list(key))
 
-            # Modules (best-effort when inline PCs exist)
-            if args.modules or args.filter_module or args.strict:
-                mod = o.get("mod")
-                if not mod:
-                    rhs_list = o.get("s")  # enriched frames
-                    if rhs_list:
-                        mod = _module_from_frames_rhs(rhs_list[:DEPTH], strict=args.strict)
-                    elif args.sym and kind == "r7":
-                        # only if user allowed crash fallback AND no enriched frames
-                        addrs = [a for a in (o.get("t") or []) if _is_kernel_addr(a)]
-                        if addrs:
-                            if args.strict:
-                                _, mod = first_allocator_module(addrs)
-                            else:
-                                # first module frame via crash, as last resort
-                                for a in addrs:
-                                    name, m = SYM.lookup(a)
-                                    if m:
-                                        mod = m; break
-                if mod:
-                    per_module_pages[mod] += pages
-                    per_module_bytes[mod] += bytes_
-                    if pid:
-                        per_pid_module_bytes[(pid, mod)] += bytes_
+        if args.modules or args.filter_module or args.strict:
+            mod = o.get("mod")
+            if not mod:
+                if rhs_list:
+                    mod = _module_from_frames_rhs(rhs_list[:DEPTH], strict=args.strict)
+                elif args.sym and kind == "r7":
+                    addrs = [a for a in (o.get("t") or []) if _is_kernel_addr(a)]
+                    if addrs:
+                        if args.strict:
+                            _, mod = first_allocator_module(addrs)
+                        else:
+                            for a in addrs:
+                                name, m = SYM.lookup(a)
+                                if m:
+                                    mod = m
+                                    break
+            if mod:
+                per_module_pages[mod] += pages
+                per_module_bytes[mod] += bytes_
+                if pid:
+                    per_pid_module_bytes[(pid, mod)] += bytes_
 
     # ---- Reporting ----
     if args.total or (not any([args.processes, args.modules, args.slabs, args.calltraces])):
@@ -754,7 +851,10 @@ def analyze(path, args):
     if args.processes:
         print("\n=== Processes (by total bytes) ===")
         if not per_pid_bytes:
-            print("(no pid information in file; likely RHEL7 export)")
+            if fmt == "text":
+                print("(no pid/tgid in text records)")
+            else:
+                print("(no pid information in file; likely RHEL7 NDJSON export)")
         else:
             top = sorted(per_pid_bytes.items(), key=lambda kv: kv[1], reverse=True)
             for pid, b in top:
@@ -771,7 +871,8 @@ def analyze(path, args):
         print("\n=== Modules (by total bytes) ===")
         unit, div = _unit_and_div(args)
         # default Top-10; strict=False unless you want to be conservative
-        report_modules_fast(args.file, unit, div, depth=8, topn=10, strict=args.strict, verbose=args.debug)
+        report_modules_fast(args.file, unit, div, depth=8, topn=10,
+                            strict=args.strict, verbose=args.debug, fmt=fmt)
         return
 
     if args.slabs:
@@ -782,7 +883,10 @@ def analyze(path, args):
         print("\nTop 5 Call Traces:")
         print("=" * 50)
         if not sig_key_bytes:
-            print("(no enriched frames; re-run with --sym to allow crash symbolization fallback)")
+            if fmt == "text":
+                print("(no stack frames found in text records)")
+            else:
+                print("(no enriched frames; re-run with --sym to allow crash symbolization fallback)")
         else:
             top = sorted(sig_key_bytes.items(), key=lambda kv: kv[1], reverse=True)[:TOPN]
             for rank, (sig_key, tot_b) in enumerate(top, 1):
