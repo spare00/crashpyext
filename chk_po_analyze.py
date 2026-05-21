@@ -264,7 +264,33 @@ MODULE_ALLOC_LIKE_RE = re.compile(
 
 def _symbol_base(rhs: str) -> str:
     """Return the function token from a pretty frame 'func+off[/size] [mod]'. """
-    return rhs.split()[0] if rhs else ""
+    base = rhs.split()[0] if rhs else ""
+    return base.split("+", 1)[0] if base else ""
+
+def _process_label(o) -> Optional[str]:
+    """Process key for reports: comm from text dump, else PID."""
+    comm = o.get("comm")
+    if comm:
+        return comm
+    pid = o.get("pid")
+    if pid:
+        return f"PID {pid}"
+    return None
+
+def _frames_for_record(o, args):
+    """Return frame strings for slab/module heuristics."""
+    rhs_list = o.get("s")
+    if rhs_list:
+        return rhs_list
+    if args.sym and o.get("t"):
+        return [_frame_rhs(a) for a in o["t"] if _is_kernel_addr(a)]
+    return None
+
+def _is_slab_from_frames(rhs_list) -> bool:
+    """True if any frame matches slab/kmalloc allocator names (sospy chk_po.py)."""
+    if not rhs_list:
+        return False
+    return any(SLAB_ALLOCATOR_FUNC_RE.search(_symbol_base(rhs)) for rhs in rhs_list)
 
 def _frame_mod(rhs: str):
     """Return module name from a pretty frame (or None)."""
@@ -450,7 +476,7 @@ def make_argparser():
                    help="Number of processes to show with -p (default: 10)")
     p.add_argument("-m", "--modules", action="store_true", help="Show top memory-using modules")
     p.add_argument("-s", "--slabs", action="store_true",
-                   help="Show slab usage by process (Type-2 only). With -p, show slab vs non-slab breakdown")
+                   help="Slab vs non-slab by process (stack heuristics). With -p, combined breakdown")
     p.add_argument("-c", "--calltraces", action="store_true",
                    help="Show top 5 call trace patterns")
     p.add_argument("-t", "--total", action="store_true",
@@ -485,6 +511,68 @@ def _unit_and_div(args):
 
 def _fmt_bytes(b, unit, div):
     return f"{(b/float(div)):.2f} {unit}"
+
+def _pages_to_unit(pages: int, unit: str) -> float:
+    """Convert page count to display unit (pages * 4 KiB)."""
+    kb = pages * 4
+    if unit == "GB":
+        return kb / 1024 / 1024
+    if unit == "MB":
+        return kb / 1024
+    if unit == "KB":
+        return kb
+    return pages * 4096
+
+def _unit_short(unit: str) -> str:
+    return {"GB": "G", "MB": "M", "KB": "K"}.get(unit, "B")
+
+def show_slab_by_process(proc_slab_stats, unit, top_n=10):
+    """-s only: top processes by slab memory."""
+    unit_short = _unit_short(unit)
+    rows = [(p, st) for p, st in proc_slab_stats.items() if st["slab_pages"] > 0]
+    rows.sort(key=lambda x: x[1]["slab_pages"], reverse=True)
+    total_allocs = sum(st["slab_allocs"] for _, st in rows)
+    total_pages = sum(st["slab_pages"] for _, st in rows)
+
+    print(f"\nTop {top_n} processes (slab allocations):")
+    print("=" * 50)
+    print(f"{'Application':<20}{'Allocations':>15}{'Memory (' + unit_short + ')':>15}")
+    print("-" * 50)
+    for proc, st in rows[:top_n]:
+        mem = _pages_to_unit(st["slab_pages"], unit)
+        print(f"{proc:<20}{st['slab_allocs']:>15}{mem:>15.2f} {unit_short}")
+    print("-" * 50)
+    print(f"{'Total':<20}{total_allocs:>15}{_pages_to_unit(total_pages, unit):>15.2f} {unit_short}")
+
+def show_slab_breakdown(proc_slab_stats, unit, top_n=10):
+    """-p -s: slab vs non-slab per process (sospy layout)."""
+    unit_short = _unit_short(unit)
+    rows = []
+    total_slab_pages = total_non_pages = 0
+    for proc, st in proc_slab_stats.items():
+        tot_pages = st["slab_pages"] + st["non_slab_pages"]
+        slab_mem = _pages_to_unit(st["slab_pages"], unit)
+        non_mem = _pages_to_unit(st["non_slab_pages"], unit)
+        total_mem = _pages_to_unit(tot_pages, unit)
+        rows.append((proc, slab_mem, non_mem, total_mem))
+        total_slab_pages += st["slab_pages"]
+        total_non_pages += st["non_slab_pages"]
+
+    rows.sort(key=lambda x: x[3], reverse=True)
+    top_rows = rows[:top_n]
+
+    print(f"\nTop {top_n} processes (slab vs non-slab):")
+    print("=" * 50)
+    print(f"{'Application':<20}{'Slabs (' + unit_short + ')':>18}"
+          f"{'Non Slabs (' + unit_short + ')':>20}{'Total (' + unit_short + ')':>16}")
+    print("-" * 80)
+    for proc, slab_mem, non_mem, total_mem in top_rows:
+        print(f"{proc:<20}{slab_mem:>18.2f}{non_mem:>20.2f}{total_mem:>16.2f}")
+    print("-" * 80)
+    print(f"{'Total':<20}"
+          f"{_pages_to_unit(total_slab_pages, unit):>18.2f}"
+          f"{_pages_to_unit(total_non_pages, unit):>20.2f}"
+          f"{_pages_to_unit(total_slab_pages + total_non_pages, unit):>16.2f}")
 
 # -------- Signature helpers --------
 ALLOC_WRAPPERS = {
@@ -801,6 +889,11 @@ def analyze(path, args):
     sig_key_bytes  = Counter()   # tuple[str] -> total bytes
     sig_key_sample = {}          # tuple[str] -> exemplar list[str]
 
+    proc_slab_stats = defaultdict(lambda: {
+        "slab_pages": 0, "non_slab_pages": 0,
+        "slab_allocs": 0, "non_slab_allocs": 0,
+    })
+
     prog = None
     if args.progress:
         prog = Progress("Analyze", total_bytes=total_size or None,
@@ -825,6 +918,16 @@ def analyze(path, args):
             per_pid_bytes[pid] += bytes_
 
         rhs_list = o.get("s")
+        if args.slabs:
+            label = _process_label(o)
+            if label:
+                slab_frames = _frames_for_record(o, args)
+                if _is_slab_from_frames(slab_frames):
+                    proc_slab_stats[label]["slab_pages"] += pages
+                    proc_slab_stats[label]["slab_allocs"] += 1
+                else:
+                    proc_slab_stats[label]["non_slab_pages"] += pages
+                    proc_slab_stats[label]["non_slab_allocs"] += 1
         if rhs_list:
             key = tuple(rhs_list[:DEPTH])
             if key:
@@ -880,25 +983,33 @@ def analyze(path, args):
                 tot_b = order_pages[o] * 4096
                 print(f"  order {o:<2} : pages={order_pages[o]:>12}  bytes/page={per_b:<8} total={_fmt_bytes(tot_b, unit, div)}")
 
+    top_n = max(1, int(args.top_processes))
+
     if args.processes:
-        top_n = max(1, int(args.top_processes))
-        print(f"\n=== Top {top_n} processes (by total bytes) ===")
-        if not per_pid_bytes:
-            if fmt == "text":
-                print("(no pid/tgid in text records)")
+        if args.slabs:
+            if not proc_slab_stats:
+                print("\n=== Slabs ===")
+                print("(no process/stack data for slab classification; need text dump with [alloc] stacks)")
             else:
-                print("(no pid information in file; likely RHEL7 NDJSON export)")
+                show_slab_breakdown(proc_slab_stats, unit, top_n=top_n)
         else:
-            top = sorted(per_pid_bytes.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
-            for pid, b in top:
-                print(f"PID {pid:<7}  bytes={b:>12} ({_fmt_bytes(b, unit, div)})  pages={per_pid_pages[pid]}")
-            if args.filter_module and per_pid_module_bytes:
-                mod = args.filter_module
-                print(f"\n--- Top {top_n} processes using module '{mod}' ---")
-                filt = [(pid, b) for ((pid, m), b) in per_pid_module_bytes.items() if m == mod]
-                filt.sort(key=lambda x: x[1], reverse=True)
-                for pid, b in filt[:top_n]:
-                    print(f"PID {pid:<7}  bytes={b:>12} ({_fmt_bytes(b, unit, div)})")
+            print(f"\n=== Top {top_n} processes (by total bytes) ===")
+            if not per_pid_bytes:
+                if fmt == "text":
+                    print("(no pid/tgid in text records)")
+                else:
+                    print("(no pid information in file; likely RHEL7 NDJSON export)")
+            else:
+                top = sorted(per_pid_bytes.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+                for pid, b in top:
+                    print(f"PID {pid:<7}  bytes={b:>12} ({_fmt_bytes(b, unit, div)})  pages={per_pid_pages[pid]}")
+                if args.filter_module and per_pid_module_bytes:
+                    mod = args.filter_module
+                    print(f"\n--- Top {top_n} processes using module '{mod}' ---")
+                    filt = [(pid, b) for ((pid, m), b) in per_pid_module_bytes.items() if m == mod]
+                    filt.sort(key=lambda x: x[1], reverse=True)
+                    for pid, b in filt[:top_n]:
+                        print(f"PID {pid:<7}  bytes={b:>12} ({_fmt_bytes(b, unit, div)})")
 
     if args.modules:
         print("\n=== Modules (by total bytes) ===")
@@ -915,9 +1026,12 @@ def analyze(path, args):
             mod_prog.done(mod_prog.total if mod_prog.total else total_size)
         return
 
-    if args.slabs:
-        print("\n=== Slabs ===")
-        print("(slab vs non-slab classification not exported; not available)")
+    if args.slabs and not args.processes:
+        if not proc_slab_stats:
+            print("\n=== Slabs ===")
+            print("(no process/stack data for slab classification; need text dump with [alloc] stacks)")
+        else:
+            show_slab_by_process(proc_slab_stats, unit, top_n=top_n)
 
     if args.calltraces:
         print("\nTop 5 Call Traces:")
