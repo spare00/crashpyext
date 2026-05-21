@@ -65,6 +65,41 @@ def _file_pos(f) -> int:
     try: return f.tell()
     except Exception: return 0
 
+# -------- progress bar (stderr), like sospy/page_owner/chk_po.py --------
+class Progress:
+    """In-place stderr progress: pct, MB read/total, MB/s (\\r updates, \\n on done)."""
+
+    def __init__(self, label: str, total_bytes=None, interval: float = 0.5, stream=None):
+        self.label = label
+        self.total = total_bytes
+        self.interval = interval
+        self.stream = stream or sys.stderr
+        self.start = time.time()
+        self.last_t = 0.0
+
+    def update(self, bytes_read: int):
+        now = time.time()
+        if now - self.last_t < self.interval:
+            return
+        self._print(bytes_read, now)
+        self.last_t = now
+
+    def done(self, bytes_read: int):
+        self._print(bytes_read, time.time(), final=True)
+
+    def _print(self, bytes_read: int, now: float, final: bool = False):
+        elapsed = max(now - self.start, 1e-9)
+        rate = bytes_read / (1024 * 1024) / elapsed
+        if self.total and self.total > 0:
+            pct = min(100.0, (bytes_read / self.total) * 100.0)
+            msg = (f"{self.label}: {pct:6.2f}%  "
+                   f"{bytes_read / 1_048_576:.1f}/{self.total / 1_048_576:.1f} MB  "
+                   f"{rate:.1f} MB/s")
+        else:
+            msg = f"{self.label}: {bytes_read / 1_048_576:.1f} MB read  {rate:.1f} MB/s"
+        endc = "\n" if final else "\r"
+        print(msg, end=endc, file=self.stream, flush=True)
+
 def _fmt_dur(sec: float) -> str:
     m, s = divmod(int(sec), 60)
     h, m = divmod(m, 60)
@@ -432,10 +467,10 @@ def make_argparser():
     p.add_argument("--sample", type=int, default=1, help="Sample every Nth record (default 1)")
     p.add_argument("--sym", action="store_true",
                    help="Allow crash symbolization fallback when enriched fields are missing (default: off)")
-    p.add_argument("--progress", type=int, default=200000,
-                   help="Print progress every N lines (default 200000; 0 = disable)")
-    p.add_argument("--progress-sec", type=float, default=5.0,
-                   help="Also print progress at least every N seconds (default 5.0)")
+    p.add_argument("--progress", action="store_true",
+                   help="Show byte-based progress bar on stderr (like chk_po.py)")
+    p.add_argument("--progress-interval", type=float, default=0.5, dest="progress_interval",
+                   help="Seconds between progress bar updates (default: 0.5)")
     return p
 
 # -------- Units --------
@@ -590,10 +625,12 @@ def _parse_text_block(lines):
             break
     return rec
 
-def iter_text_records(path):
+def iter_text_records(path, progress=None):
     block = []
     with open(path, "r", errors="ignore") as f:
         for ln in f:
+            if progress:
+                progress.update(_file_pos(f))
             if not ln.strip():
                 if block:
                     rec = _parse_text_block(block)
@@ -606,6 +643,8 @@ def iter_text_records(path):
             rec = _parse_text_block(block)
             if rec:
                 yield rec
+        if progress:
+            progress.update(_file_pos(f))
 
 def _normalize_ndjson(o):
     pid = None
@@ -625,9 +664,11 @@ def _normalize_ndjson(o):
         "t": o.get("t"),
     }
 
-def iter_ndjson_records(path):
+def iter_ndjson_records(path, progress=None):
     with open(path, "r", errors="ignore") as f:
         for ln in f:
+            if progress:
+                progress.update(_file_pos(f))
             if not ln or ln[0] != "{":
                 continue
             try:
@@ -635,16 +676,18 @@ def iter_ndjson_records(path):
             except Exception:
                 continue
             yield _normalize_ndjson(o)
+        if progress:
+            progress.update(_file_pos(f))
 
-def iter_records(path, fmt=None):
+def iter_records(path, fmt=None, progress=None):
     if fmt is None:
         fmt = detect_format(path)
     if fmt == "text":
-        yield from iter_text_records(path)
+        yield from iter_text_records(path, progress=progress)
     else:
-        yield from iter_ndjson_records(path)
+        yield from iter_ndjson_records(path, progress=progress)
 
-def report_modules_fast(path, unit, div, depth=8, topn=10, strict=False, verbose=False, fmt=None):
+def report_modules_fast(path, unit, div, depth=8, topn=10, strict=False, verbose=False, fmt=None, progress=None):
     """
     Fast '-m': consume records ('s': frames, optional 'mod') from NDJSON or text dumps.
       • Use record['mod'] if present.
@@ -665,7 +708,7 @@ def report_modules_fast(path, unit, div, depth=8, topn=10, strict=False, verbose
         total_allocs += 1
         total_pages  += pages
 
-    for o in iter_records(path, fmt=fmt):
+    for o in iter_records(path, fmt=fmt, progress=progress):
         order = int(o.get("o", 0))
         if order < 0 or order > 20:
             continue
@@ -755,29 +798,12 @@ def analyze(path, args):
     sig_key_bytes  = Counter()   # tuple[str] -> total bytes
     sig_key_sample = {}          # tuple[str] -> exemplar list[str]
 
-    lines_read = 0
-    last_log_ts = start_ts
-    for o in iter_records(path, fmt=fmt):
-        lines_read += 1
+    prog = None
+    if args.progress:
+        prog = Progress("Analyze", total_bytes=total_size or None,
+                        interval=args.progress_interval)
 
-        if args.progress or args.progress_sec > 0:
-            do_log = False
-            if args.progress and (lines_read % args.progress == 0):
-                do_log = True
-            else:
-                now = time.perf_counter()
-                if args.progress_sec > 0 and (now - last_log_ts) >= args.progress_sec:
-                    do_log = True
-            if do_log:
-                elapsed = time.perf_counter() - start_ts
-                rate = lines_read / elapsed if elapsed > 0 else 0.0
-                print(
-                    f"[analyze] {lines_read:,} records  "
-                    f"elapsed {_fmt_hms(elapsed)}  rate {rate:,.0f}/s",
-                    file=sys.stderr, flush=True
-                )
-                last_log_ts = time.perf_counter()
-
+    for o in iter_records(path, fmt=fmt, progress=prog):
         kind = o.get("k")
         order = int(o.get("o", 0))
         if order < args.min_order:
@@ -833,6 +859,9 @@ def analyze(path, args):
                 if pid:
                     per_pid_module_bytes[(pid, mod)] += bytes_
 
+    if prog:
+        prog.done(prog.total if prog.total else total_size)
+
     # ---- Reporting ----
     if args.total or (not any([args.processes, args.modules, args.slabs, args.calltraces])):
         print("=== Totals ===")
@@ -871,8 +900,15 @@ def analyze(path, args):
         print("\n=== Modules (by total bytes) ===")
         unit, div = _unit_and_div(args)
         # default Top-10; strict=False unless you want to be conservative
+        mod_prog = None
+        if args.progress:
+            mod_prog = Progress("Modules", total_bytes=total_size or None,
+                                interval=args.progress_interval)
         report_modules_fast(args.file, unit, div, depth=8, topn=10,
-                            strict=args.strict, verbose=args.debug, fmt=fmt)
+                            strict=args.strict, verbose=args.debug, fmt=fmt,
+                            progress=mod_prog)
+        if mod_prog:
+            mod_prog.done(mod_prog.total if mod_prog.total else total_size)
         return
 
     if args.slabs:
