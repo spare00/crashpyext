@@ -11,7 +11,7 @@
 #
 # CLI:
 #   [-h] [-v] [-d] [-M] [-K] [-G] [-p] [-m] [-s] [-c] [-t]
-#   [--calltrace-process PID] [--filter-module MOD] [--strict]
+#   [--calltrace-process PID] [--calltrace-comm COMM] [--filter-module MOD] [--strict]
 #   [--detect-lines N] file
 #
 import argparse
@@ -292,6 +292,25 @@ def _is_slab_from_frames(rhs_list) -> bool:
         return False
     return any(SLAB_ALLOCATOR_FUNC_RE.search(_symbol_base(rhs)) for rhs in rhs_list)
 
+def _calltrace_filter_match(o, args) -> bool:
+    """True if record passes --calltrace-process / --calltrace-comm filters."""
+    if args.ct_pid is not None:
+        if o.get("pid") != args.ct_pid:
+            return False
+    if args.ct_comm:
+        comm = o.get("comm")
+        if not comm or comm != args.ct_comm:
+            return False
+    return True
+
+def _calltrace_filter_label(args) -> str:
+    parts = []
+    if args.ct_pid is not None:
+        parts.append(f"PID {args.ct_pid}")
+    if args.ct_comm:
+        parts.append(f"comm '{args.ct_comm}'")
+    return ", ".join(parts) if parts else ""
+
 def _frame_mod(rhs: str):
     """Return module name from a pretty frame (or None)."""
     if rhs and rhs.endswith(']') and '[' in rhs:
@@ -482,7 +501,9 @@ def make_argparser():
     p.add_argument("-t", "--total", action="store_true",
                    help="Show only total allocations/memory (with -v, also per-order breakdown)")
     p.add_argument("--calltrace-process", type=int, dest="ct_pid",
-                   help="Show call traces only for this process")
+                   help="With -c: show call traces only for this PID/tgid")
+    p.add_argument("--calltrace-comm", type=str, dest="ct_comm",
+                   help="With -c: show call traces only for this task comm (e.g. swapper/0)")
     p.add_argument("--filter-module", dest="filter_module",
                    help="Show top processes using this module")
     p.add_argument("--strict", action="store_true",
@@ -928,20 +949,22 @@ def analyze(path, args):
                 else:
                     proc_slab_stats[label]["non_slab_pages"] += pages
                     proc_slab_stats[label]["non_slab_allocs"] += 1
-        if rhs_list:
-            key = tuple(rhs_list[:DEPTH])
-            if key:
-                sig_key_counts[key] += 1
-                sig_key_bytes[key] += bytes_
-                sig_key_sample.setdefault(key, rhs_list[:DEPTH])
-        elif args.sym and kind == "r7":
-            addrs = [a for a in (o.get("t") or []) if _is_kernel_addr(a)]
-            if addrs:
-                key = tuple(_frame_rhs(a) for a in addrs[:DEPTH])
-                if key:
-                    sig_key_counts[key] += 1
-                    sig_key_bytes[key] += bytes_
-                    sig_key_sample.setdefault(key, list(key))
+        if args.calltraces or args.ct_pid is not None or args.ct_comm:
+            if _calltrace_filter_match(o, args):
+                if rhs_list:
+                    key = tuple(rhs_list[:DEPTH])
+                    if key:
+                        sig_key_counts[key] += 1
+                        sig_key_bytes[key] += bytes_
+                        sig_key_sample.setdefault(key, rhs_list[:DEPTH])
+                elif args.sym and kind == "r7":
+                    addrs = [a for a in (o.get("t") or []) if _is_kernel_addr(a)]
+                    if addrs:
+                        key = tuple(_frame_rhs(a) for a in addrs[:DEPTH])
+                        if key:
+                            sig_key_counts[key] += 1
+                            sig_key_bytes[key] += bytes_
+                            sig_key_sample.setdefault(key, list(key))
 
         if args.modules or args.filter_module or args.strict:
             mod = o.get("mod")
@@ -1034,10 +1057,16 @@ def analyze(path, args):
             show_slab_by_process(proc_slab_stats, unit, top_n=top_n)
 
     if args.calltraces:
-        print("\nTop 5 Call Traces:")
+        filt = _calltrace_filter_label(args)
+        title = f"Top {TOPN} Call Traces"
+        if filt:
+            title += f" ({filt})"
+        print(f"\n{title}:")
         print("=" * 50)
         if not sig_key_bytes:
-            if fmt == "text":
+            if filt:
+                print(f"No call traces found for {filt}")
+            elif fmt == "text":
                 print("(no stack frames found in text records)")
             else:
                 print("(no enriched frames; re-run with --sym to allow crash symbolization fallback)")
@@ -1045,8 +1074,8 @@ def analyze(path, args):
             top = sorted(sig_key_bytes.items(), key=lambda kv: kv[1], reverse=True)[:TOPN]
             for rank, (sig_key, tot_b) in enumerate(top, 1):
                 seen = sig_key_counts.get(sig_key, 0)
-                gb = tot_b / float(1024**3)
-                print(f"#{rank}: Seen {seen} times, {gb:.2f} GB")
+                mem = tot_b / float(div)
+                print(f"#{rank}: Seen {seen} times, {mem:.2f} {unit}")
                 for rhs in sig_key_sample.get(sig_key, sig_key):
                     print(rhs if rhs.startswith("[<") or "+" in rhs or " [" in rhs else str(rhs))
                 print("-" * 50)
@@ -1084,6 +1113,11 @@ def main():
 
     if args.debug:
         print(f"[debug] analyzing: {args.file}", file=sys.stderr)
+
+    if (args.ct_pid is not None or args.ct_comm) and not args.calltraces:
+        print("Error: '--calltrace-process' and '--calltrace-comm' require '-c' or '--calltraces'.",
+              file=sys.stderr)
+        sys.exit(2)
 
     r7, r8 = detect_kind(args.file, args.detect_lines)
     if args.verbose:
