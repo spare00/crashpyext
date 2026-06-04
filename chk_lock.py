@@ -203,6 +203,8 @@ def _push_globals():
             mod.RHEL_VERSION = RHEL_VERSION
         if hasattr(mod, "rhel_version"):
             mod.rhel_version = RHEL_VERSION
+        if hasattr(mod, "kernel_version"):
+            mod.kernel_version = KERNEL_VERSION
         if hasattr(mod, "DEBUG"):
             mod.DEBUG = DEBUG
 
@@ -279,9 +281,13 @@ def main():
         addr = resolve_address(args.addr)
         info = mutex.get_mutex_info(addr, args.list)
         if info:
-            next_addr = int(info["wait_list_next"], 16)
-            prev_addr = int(info["wait_list_prev"], 16)
-            warn_if_waiters(next_addr, prev_addr, flag_set=args.list)
+            if "wait_list_empty" in info:
+                if not info["wait_list_empty"] and not args.list:
+                    print("ℹ️  Wait list is non-empty — re-run with -l to list waiters.")
+            else:
+                next_addr = int(info["wait_list_next"], 16)
+                prev_addr = int(info["wait_list_prev"], 16)
+                warn_if_waiters(next_addr, prev_addr, flag_set=args.list)
         mutex.analyze_mutex(info, verbose=args.verbose)
 
     elif args.command == "rwsem":
