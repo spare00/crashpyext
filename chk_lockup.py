@@ -62,16 +62,29 @@ def if_bit_clear(rflags_str: str) -> bool:
         return False
 
 
+def _get_idle_reason(comm: str) -> str:
+    """Return a short string explaining why this CPU is considered idle."""
+    return "swapper" if comm.startswith("swapper") else "idle stack"
+
+
+def _print_backtraces(cpu_list, lockup_type):
+    """Print backtraces for affected CPUs, with limit for large sets."""
+    MAX_BT_DISPLAY = 10
+    if len(cpu_list) > MAX_BT_DISPLAY:
+        print(f"    ({len(cpu_list)} CPUs affected; showing first {MAX_BT_DISPLAY} backtraces)")
+        cpu_list = cpu_list[:MAX_BT_DISPLAY]
+
+    for cpu in cpu_list:
+        print(f"\n--- bt -c {cpu} " + "-" * 60)
+        print(exec_crash_command(f"bt -c {cpu}"))
+
+
 def _safe_read_symbol(name):
     """Read a global symbol, returning None on any failure."""
     try:
         return readSymbol(name)
     except Exception:
         return None
-
-
-# ---------------------------------------------------------------------------
-# ANSI colour helpers
 
 
 # ---------------------------------------------------------------------------
@@ -103,10 +116,12 @@ def get_rhel_version():
 
     Handles el7, el8, el9, el10, el10_1, etc.
     Returns an int (e.g. 7, 8, 9, 10).  Defaults to 8 if unparseable.
+    (RHEL 8 is chosen as the safe default because it is the most common current
+    version and has behavior closer to RHEL 9 than RHEL 7.)
     """
     sys_output = exec_crash_command("sys")
     kernel_version = "Unknown"
-    rhel_version = 8  # safe default
+    rhel_version = 8  # safe default (see docstring)
 
     el_re = re.compile(r"\.el(\d+)(?:[._]|$)")
 
@@ -191,7 +206,7 @@ def parse_bt_all():
         cpu = int(m.group(1))
 
         # COMMAND lives on the same CPU header line.
-        mco = re.search(r'\bCOM(?:M|MAND):\s*"([^"]+)"', lines[i])
+        mco = re.search(r'\b(?:COMMAND|COM):\s*"([^"]+)"', lines[i])
         comm = mco.group(1) if mco else "Unknown"
 
         rflags = "N/A"
@@ -213,7 +228,7 @@ def parse_bt_all():
                     cs = mcs.group(1)
             # Fallback: some crash versions print COMMAND in the body.
             if comm == "Unknown":
-                mco2 = re.search(r'\bCOM(?:M|MAND):\s*"([^"]+)"', line)
+                mco2 = re.search(r'\b(?:COMMAND|COM):\s*"([^"]+)"', line)
                 if mco2:
                     comm = mco2.group(1)
             if not idle_in_stack and _IDLE_STACK_RE.search(line):
@@ -282,9 +297,12 @@ def _get_softlockup_timestamps(rhel_version):
         touch_ts       = [readULong(addr) for addr in touch_ts_addrs]
 
         report_ts = None
-        if rhel_version >= 9 and symbol_exists("watchdog_report_ts"):
-            report_ts_addrs = percpu.get_cpu_var("watchdog_report_ts")
-            report_ts       = [readULong(addr) for addr in report_ts_addrs]
+        if rhel_version >= 9:
+            if symbol_exists("watchdog_report_ts"):
+                report_ts_addrs = percpu.get_cpu_var("watchdog_report_ts")
+                report_ts       = [readULong(addr) for addr in report_ts_addrs]
+            else:
+                print(f"Warning: RHEL {rhel_version} detected but watchdog_report_ts missing (unexpected kernel variant).")
 
         return rq_time_sec, touch_ts, report_ts, float(softlockup_thresh)
 
@@ -293,7 +311,7 @@ def _get_softlockup_timestamps(rhel_version):
         return None
 
 
-def detect_soft_lockup(rhel_version, bt_map, verbose=False):
+def detect_soft_lockup(rhel_version, bt_map, verbose=False, summary_only=False):
     """Detect soft lockups using per-CPU rq->clock and watchdog timestamps."""
     print(f"\n=== Soft Lockup Check (RHEL {rhel_version}) ===\n")
 
@@ -311,27 +329,31 @@ def detect_soft_lockup(rhel_version, bt_map, verbose=False):
     max_now = max(rq_time)
     has_report_ts = report_ts is not None
 
-    print(f"  Soft lockup threshold : {thresh:.0f} seconds")
-    print(f"  Timestamp source      : watchdog_touch_ts" +
-          (" + watchdog_report_ts (RHEL 9+)" if has_report_ts else " (RHEL 7/8)"))
-    print(f"  Max rq->clock         : {max_now:.2f} sec")
-    print()
+    if not summary_only:
+        print(f"  Soft lockup threshold : {thresh:.0f} seconds")
+        print(f"  Timestamp source      : watchdog_touch_ts" +
+              (" + watchdog_report_ts (RHEL 9+)" if has_report_ts else " (RHEL 7/8)"))
+        print(f"  Max rq->clock         : {max_now:.2f} sec")
+        print()
 
-    # Plain ASCII status keeps column alignment intact regardless of terminal.
-    HDR = f"{'CPU':<5} {'rq_clk(s)':>10} {'behind(s)':>10} {'elapsed(s)':>11} {'RFLAGS':>18} {'CS':>6}  {'Task':<20} Status"
-    print(HDR)
-    print("-" * len(HDR))
+        # Plain ASCII status keeps column alignment intact regardless of terminal.
+        hdr = f"{'CPU':<5} {'rq_clk(s)':>10} {'behind(s)':>10} {'elapsed(s)':>11} {'RFLAGS':>18} {'CS':>6}  {'Task':<20} Status"
+        print(hdr)
+        print("-" * len(hdr))
 
     locked_cpus = []
 
-    ULONG_MAX = (1 << 64) - 1
+    # ULONG_MAX for 64-bit (all RHEL 7+ targets are 64-bit)
+    import ctypes
+    ULONG_MAX = ctypes.c_ulong(-1).value
 
     for cpu in range(ncpus):
         delta = max_now - rq_time[cpu]
 
         if cpu not in bt_map:
-            _status = _yellow("WARN: not in bt -a")
-            print(f"{cpu:<5} {'N/A':>10} {'N/A':>10} {'N/A':>11} {'N/A':>18} {'N/A':>6}  {'N/A':<20} {_status}")
+            if not summary_only:
+                _status = _yellow("WARN: not in bt -a")
+                print(f"{cpu:<5} {'N/A':>10} {'N/A':>10} {'N/A':>11} {'N/A':>18} {'N/A':>6}  {'N/A':<20} {_status}")
             continue
 
         info    = bt_map[cpu]
@@ -343,8 +365,9 @@ def detect_soft_lockup(rhel_version, bt_map, verbose=False):
         # Skip idle CPUs: the watchdog is intentionally not touched during
         # intel_idle/cpuidle, so a stale timestamp is expected and normal.
         if is_idle:
-            idle_reason = "swapper" if comm.startswith("swapper") else "idle stack"
-            print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {'--':>11} {rflags:>18} {cs:>6}  {comm:<20} Idle ({idle_reason})")
+            if not summary_only:
+                idle_reason = _get_idle_reason(comm)
+                print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {'--':>11} {rflags:>18} {cs:>6}  {comm:<20} Idle ({idle_reason})")
             continue
 
         # --- Elapsed time calculation ---
@@ -376,12 +399,14 @@ def detect_soft_lockup(rhel_version, bt_map, verbose=False):
             if tts == 0:
                 if delta > thresh:
                     elapsed = delta
-                    _estatus = _red("INFERRED SOFT LOCKUP (touch_ts=0)")
-                    _elapsed_str = _red(f"{elapsed:>11.2f}")
-                    print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {_elapsed_str} {rflags:>18} {cs:>6}  {comm:<20} {_estatus}")
                     locked_cpus.append(cpu)
+                    if not summary_only:
+                        _estatus = _red("INFERRED SOFT LOCKUP (touch_ts=0)")
+                        _elapsed_str = _red(f"{elapsed:>11.2f}")
+                        print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {_elapsed_str} {rflags:>18} {cs:>6}  {comm:<20} {_estatus}")
                 else:
-                    print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {'--':>11} {rflags:>18} {cs:>6}  {comm:<20} OK (touch_ts=0, watchdog not yet run or touch pending)")
+                    if not summary_only:
+                        print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {'--':>11} {rflags:>18} {cs:>6}  {comm:<20} OK (touch_ts=0, watchdog not yet run or touch pending)")
                 continue
             elapsed = rq_time[cpu] - tts
         else:
@@ -390,34 +415,37 @@ def detect_soft_lockup(rhel_version, bt_map, verbose=False):
             # running, but guard against 0 in case the watchdog never started
             # on this CPU (e.g. hotplugged CPU, or watchdog enabled mid-run).
             if tts == 0:
-                _status = _yellow("WARN (touch_ts=0, watchdog never ran on this CPU)")
-                print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {'--':>11} {rflags:>18} {cs:>6}  {comm:<20} {_status}")
+                if not summary_only:
+                    _status = _yellow("WARN (touch_ts=0, watchdog never ran on this CPU)")
+                    print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {'--':>11} {rflags:>18} {cs:>6}  {comm:<20} {_status}")
                 continue
             elapsed = rq_time[cpu] - tts
             # Check whether reporting was suppressed by a recent reschedule.
             report_suppressed = (report_ts[cpu] == ULONG_MAX)
 
         if elapsed > thresh:
-            rflags_suspicious = if_bit_clear(rflags)
-            cs_kernel         = cs == "0010"
-            irq_note = " [IRQ-off+kernel]" if (rflags_suspicious and cs_kernel) else ""
-            if has_report_ts and report_suppressed:
-                # Elapsed exceeds threshold but a reschedule suppressed the
-                # kernel's own report.  Still flag it -- the CPU was stuck
-                # even if the kernel hadn't printed a warning yet.
-                status = f"SOFT LOCKUP (report suppressed by reschedule){irq_note}"
-            else:
-                status = f"SOFT LOCKUP{irq_note}"
-            _elapsed_str = _red(f"{elapsed:>11.2f}")
-            _status_str  = _red(status)
-            print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {_elapsed_str} {rflags:>18} {cs:>6}  {comm:<20} {_status_str}")
             locked_cpus.append(cpu)
+            if not summary_only:
+                rflags_suspicious = if_bit_clear(rflags)
+                cs_kernel         = cs == "0010"
+                irq_note = " [IRQ-off+kernel]" if (rflags_suspicious and cs_kernel) else ""
+                if has_report_ts and report_suppressed:
+                    # Elapsed exceeds threshold but a reschedule suppressed the
+                    # kernel's own report.  Still flag it -- the CPU was stuck
+                    # even if the kernel hadn't printed a warning yet.
+                    status = f"SOFT LOCKUP (report suppressed by reschedule){irq_note}"
+                else:
+                    status = f"SOFT LOCKUP{irq_note}"
+                _elapsed_str = _red(f"{elapsed:>11.2f}")
+                _status_str  = _red(status)
+                print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {_elapsed_str} {rflags:>18} {cs:>6}  {comm:<20} {_status_str}")
         else:
-            if has_report_ts and report_suppressed:
-                status = "OK (reschedule reset report timer)"
-            else:
-                status = "OK"
-            print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {elapsed:>11.2f} {rflags:>18} {cs:>6}  {comm:<20} {status}")
+            if not summary_only:
+                if has_report_ts and report_suppressed:
+                    status = "OK (reschedule reset report timer)"
+                else:
+                    status = "OK"
+                print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {elapsed:>11.2f} {rflags:>18} {cs:>6}  {comm:<20} {status}")
 
     # Summary
     print()
@@ -425,9 +453,7 @@ def detect_soft_lockup(rhel_version, bt_map, verbose=False):
         _summary = _red(f"Soft lockup detected on CPU(s): {', '.join(map(str, locked_cpus))}")
         print(_summary)
         if verbose:
-            for cpu in locked_cpus:
-                print(f"\n--- bt -c {cpu} " + "-" * 60)
-                print(exec_crash_command(f"bt -c {cpu}"))
+            _print_backtraces(locked_cpus, "soft lockup")
         else:
             print("    (run with -v to show backtraces for affected CPUs)")
     else:
@@ -515,8 +541,7 @@ def _hard_lockup_verdict(interrupts, saved, rflags, cs, hard_wd_on):
         return "WARN: watchdog never ran on this CPU", "warn"
 
     if not equal:
-        note = f"(diff={diff})" if diff == 1 else f"(diff={diff})"
-        return f"OK {note}", "ok"
+        return f"OK (diff={diff})", "ok"
 
     # Counters are equal -- potential hard lockup.
     if not hard_wd_on:
@@ -532,7 +557,7 @@ def _hard_lockup_verdict(interrupts, saved, rflags, cs, hard_wd_on):
         return _red("CONFIRMED (IRQs ON in kernel -- spinloop or IRQ-handler hang)"), "confirmed"
 
 
-def detect_hard_lockup(rhel_version, bt_map, verbose=False):
+def detect_hard_lockup(rhel_version, bt_map, verbose=False, summary_only=False):
     """Detect hard lockups and classify them as CONFIRMED / SUSPECT / WARN / OK."""
     print(f"\n=== Hard Lockup Check (RHEL {rhel_version}) ===\n")
 
@@ -545,9 +570,10 @@ def detect_hard_lockup(rhel_version, bt_map, verbose=False):
         print("Failed to read hrtimer values. Exiting.")
         return
 
-    HDR = f"{'CPU':<5} {'hrtimer_intr':<16} {'hrtimer_saved':<16} {'RFLAGS':<18} {'CS':<6}  {'Task':<20} Verdict"
-    print(HDR)
-    print("-" * len(HDR))
+    if not summary_only:
+        hdr = f"{'CPU':<5} {'hrtimer_intr':<16} {'hrtimer_saved':<16} {'RFLAGS':<18} {'CS':<6}  {'Task':<20} Verdict"
+        print(hdr)
+        print("-" * len(hdr))
 
     suspects, confirmed = [], []
 
@@ -566,12 +592,8 @@ def detect_hard_lockup(rhel_version, bt_map, verbose=False):
         elif category == "suspect":
             suspects.append(cpu)
 
-        row = f"{cpu:<5} {interrupts[cpu]:<16} {saved[cpu]:<16} {rflags:<18} {cs:<6}  {comm:<20} {verdict}"
-        if category == "confirmed":
-            print(row)
-        elif category in ("suspect", "warn"):
-            print(row)
-        else:
+        if not summary_only:
+            row = f"{cpu:<5} {interrupts[cpu]:<16} {saved[cpu]:<16} {rflags:<18} {cs:<6}  {comm:<20} {verdict}"
             print(row)
 
     # Summary
@@ -585,9 +607,7 @@ def detect_hard_lockup(rhel_version, bt_map, verbose=False):
         print("No hard lockup indicated.")
 
     if verbose:
-        for cpu in confirmed + suspects:
-            print(f"\n--- bt -c {cpu} " + "-" * 60)
-            print(exec_crash_command(f"bt -c {cpu}"))
+        _print_backtraces(confirmed + suspects, "hard lockup")
     elif confirmed or suspects:
         print("    (run with -v to show backtraces for affected CPUs)")
 
@@ -604,6 +624,8 @@ if __name__ == "__main__":
     parser.add_argument("-H", "--hard-lockup",  action="store_true", help="Detect hard lockup")
     parser.add_argument("-v", "--verbose",      action="store_true",
                         help="Print bt -c <N> backtraces for all affected CPUs")
+    parser.add_argument("--summary",           action="store_true",
+                        help="Show only summary (skip per-CPU details)")
     args = parser.parse_args()
 
     if not args.soft_lockup and not args.hard_lockup:
@@ -616,7 +638,7 @@ if __name__ == "__main__":
         print(f"Found {len(bt_map)} CPU(s) in bt output.\n")
 
         if args.soft_lockup:
-            detect_soft_lockup(rhel_version, bt_map, verbose=args.verbose)
+            detect_soft_lockup(rhel_version, bt_map, verbose=args.verbose, summary_only=args.summary)
 
         if args.hard_lockup:
-            detect_hard_lockup(rhel_version, bt_map, verbose=args.verbose)
+            detect_hard_lockup(rhel_version, bt_map, verbose=args.verbose, summary_only=args.summary)
