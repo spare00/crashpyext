@@ -343,9 +343,9 @@ def detect_soft_lockup(rhel_version, bt_map, verbose=False, summary_only=False):
 
     locked_cpus = []
 
-    # ULONG_MAX for 64-bit (all RHEL 7+ targets are 64-bit)
-    import ctypes
-    ULONG_MAX = ctypes.c_ulong(-1).value
+    # ULONG_MAX for 64-bit. All RHEL 7+ crash targets are 64-bit, so this is safe.
+    # Cannot use ctypes.c_ulong(-1).value because crash's epython lacks _ctypes module.
+    ULONG_MAX = (1 << 64) - 1
 
     for cpu in range(ncpus):
         delta = max_now - rq_time[cpu]
