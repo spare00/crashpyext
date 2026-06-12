@@ -448,13 +448,14 @@ def detect_soft_lockup(rhel_version, bt_map, verbose=False, summary_only=False):
                 print(f"{cpu:<5} {rq_time[cpu]:>10.2f} {delta:>10.2f} {elapsed:>11.2f} {rflags:>18} {cs:>6}  {comm:<20} {status}")
 
     # Summary
-    print()
+    if not summary_only:
+        print()
     if locked_cpus:
         _summary = _red(f"Soft lockup detected on CPU(s): {', '.join(map(str, locked_cpus))}")
         print(_summary)
-        if verbose:
+        if verbose and not summary_only:
             _print_backtraces(locked_cpus, "soft lockup")
-        else:
+        elif not summary_only:
             print("    (run with -v to show backtraces for affected CPUs)")
     else:
         print("No soft lockup detected.")
@@ -597,7 +598,8 @@ def detect_hard_lockup(rhel_version, bt_map, verbose=False, summary_only=False):
             print(row)
 
     # Summary
-    print()
+    if not summary_only:
+        print()
     if confirmed:
         _summary = _red(f"Hard lockup CONFIRMED on CPU(s): {', '.join(map(str, confirmed))}")
         print(_summary)
@@ -606,9 +608,9 @@ def detect_hard_lockup(rhel_version, bt_map, verbose=False, summary_only=False):
     if not confirmed and not suspects:
         print("No hard lockup indicated.")
 
-    if verbose:
+    if verbose and not summary_only:
         _print_backtraces(confirmed + suspects, "hard lockup")
-    elif confirmed or suspects:
+    elif (confirmed or suspects) and not summary_only:
         print("    (run with -v to show backtraces for affected CPUs)")
 
 
