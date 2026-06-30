@@ -11,6 +11,7 @@ from pykdump.API import *
 
 _CRASH_RWSEM_CACHE = {}
 _WAIT_LIST_OFFSET = None
+_OWNER_FIELD_OFFSET = None
 
 # Shared globals — injected by chk_lock._push_globals() at startup.
 RHEL_VERSION = 8
@@ -149,14 +150,35 @@ def get_owner_info(owner_task_addr):
         return f"{owner_task_addr:#x}"
 
 
+def _owner_has_embedded_flags(owner):
+    """
+    True when owner uses atomic_long_t flag bits (RHEL 8+ layout).
+
+    RHEL 8+ stores owner as atomic_long_t with RWSEM_READER_OWNED /
+    RWSEM_NONSPINNABLE in the low bits.  Fall back to inspecting the value
+    when version detection fails (e.g. el10 parsed as 1).
+    """
+    if RHEL_VERSION >= 8:
+        return True
+    if owner == 0:
+        return False
+    return bool(owner & RWSEM_OWNER_FLAGS_MASK)
+
+
+def _decode_rwsem_owner(owner):
+    """Split raw owner word into (reader_owned flag, owner_task_addr)."""
+    if _owner_has_embedded_flags(owner):
+        return owner & RWSEM_READER_OWNED, owner & ~RWSEM_OWNER_FLAGS_MASK
+    return 0, owner
+
+
 def is_stale_reader_owner(count, reader_owned, owner_task_addr):
     """
     RHEL 8+ rwsem owner can retain RWSEM_READER_OWNED after count drops to 0.
     Treat it as a stale marker for display, not an active owner.
     """
     return (
-        RHEL_VERSION >= 8
-        and count == 0
+        count == 0
         and reader_owned
         and owner_task_addr != 0
     )
@@ -211,6 +233,26 @@ def _wait_list_offset():
     return _WAIT_LIST_OFFSET
 
 
+def _owner_field_offset():
+    """Byte offset of owner in struct rw_semaphore, cached."""
+    global _OWNER_FIELD_OFFSET
+    if _OWNER_FIELD_OFFSET is not None:
+        return _OWNER_FIELD_OFFSET
+    _OWNER_FIELD_OFFSET = 8
+    try:
+        out = exec_crash_command("struct rw_semaphore -o")
+        m = re.search(
+            r"^\s*\[(0x[0-9a-fA-F]+|\d+)\].*\bowner\b",
+            out,
+            re.MULTILINE,
+        )
+        if m:
+            _OWNER_FIELD_OFFSET = int(m.group(1), 0)
+    except Exception as e:
+        dbg(f"_owner_field_offset(): {e}")
+    return _OWNER_FIELD_OFFSET
+
+
 def _parse_crash_rwsem_fields(rw_semaphore_addr):
     """
     Parse count/owner from crash 'struct rw_semaphore' output.
@@ -228,12 +270,11 @@ def _parse_crash_rwsem_fields(rw_semaphore_addr):
     if m:
         fields["count"] = int(m.group(1), 0) & 0xFFFFFFFFFFFFFFFF
 
-    if RHEL_VERSION >= 8:
-        m = re.search(
-            r"owner\s*=\s*\{\s*counter\s*=\s*(0x[0-9a-fA-F]+|\d+)",
-            out,
-        )
-    else:
+    m = re.search(
+        r"owner\s*=\s*\{\s*counter\s*=\s*(0x[0-9a-fA-F]+|\d+)",
+        out,
+    )
+    if not m:
         m = re.search(
             r"(?:^|\n)\s*owner\s*=\s*(0x[0-9a-fA-F]+|\d+)",
             out,
@@ -242,6 +283,44 @@ def _parse_crash_rwsem_fields(rw_semaphore_addr):
         fields["owner"] = int(m.group(1), 0) & 0xFFFFFFFFFFFFFFFF
 
     return fields
+
+
+def _read_rwsem_owner_raw(rwsem, rw_semaphore_addr):
+    """
+    Read the raw owner word from pykdump, with crash struct parse fallback.
+
+    RHEL 8+ (including el10+) uses atomic_long_t for owner; always prefer
+    .counter.  pykdump may return the field address when .owner is read
+    directly on layouts that embed owner in a union/KABI wrapper.
+    """
+    addr = int(rw_semaphore_addr)
+    owner_offset = _owner_field_offset()
+
+    try:
+        val = int(rwsem.owner.counter) & 0xFFFFFFFFFFFFFFFF
+        dbg(f"owner: read via owner.counter -> {val:#x}")
+        return val
+    except (KeyError, AttributeError, TypeError):
+        pass
+
+    try:
+        val = int(rwsem.owner) & 0xFFFFFFFFFFFFFFFF
+        if val == addr + owner_offset:
+            dbg(
+                f"owner: pykdump returned field address {val:#x}, "
+                "using crash struct parse fallback"
+            )
+            parsed = _parse_crash_rwsem_fields(addr).get("owner")
+            if parsed is not None:
+                return parsed
+        dbg(f"owner: read via owner -> {val:#x}")
+        return val
+    except (KeyError, AttributeError, TypeError):
+        pass
+
+    val = _parse_crash_rwsem_fields(addr).get("owner", 0)
+    dbg(f"owner: using crash struct parse fallback -> {val:#x}")
+    return val
 
 
 def _rwsem_wait_list_head(rw_semaphore_addr):
@@ -367,7 +446,7 @@ def check_integrity(count, owner, reader_owned, owner_task_addr, is_readfail_rel
     # Reader-associated state (not guaranteed active readers)
     reader_bias_count = count & RWSEM_READER_MASK
     if reader_bias_count > 0 and not (count & RWSEM_WRITER_LOCKED):
-        if RHEL_VERSION >= 8:
+        if _owner_has_embedded_flags(owner):
             # RWSEM_READER_OWNED / RWSEM_NONSPINNABLE flag bits in the owner
             # field only exist on RHEL 8+ (where owner is atomic_long_t).
             if not reader_owned:
@@ -409,7 +488,7 @@ def check_integrity(count, owner, reader_owned, owner_task_addr, is_readfail_rel
             )
 
         # reader_owned flag bits only exist in RHEL 8+ atomic_long_t owner
-        if RHEL_VERSION >= 8 and reader_owned:
+        if _owner_has_embedded_flags(owner) and reader_owned:
             issues.append(
                 "INFO: Transitional: `owner` marked as reader, and `count` is negative. Reader release may not be properly completed due to racing."
             )
@@ -606,7 +685,7 @@ def print_owner_bitfield(owner, owner_info, verbose=False):
     print("  Reader-owned (bit 0):           ──────────────────────────────────────────┘")
     print(f"  Owner task: {owner_info}")
 
-    if RHEL_VERSION >= 8:
+    if _owner_has_embedded_flags(owner):
         if verbose:
             print("\nVerbose explanation:")
             print("  - Reader-owned: 1 = a reader currently owns the lock")
@@ -646,12 +725,7 @@ def analyze_rw_semaphore(count, is_readfail_reliable, owner, arch="64-bit", verb
     reader_count = get_reader_count(count, is_readfail_reliable)
     result = classify_rwsem_state(count, is_readfail_reliable, reader_count)
 
-    if RHEL_VERSION >= 8:
-        reader_owned = owner & RWSEM_READER_OWNED
-        owner_task_addr = owner & ~RWSEM_OWNER_FLAGS_MASK
-    else:
-        reader_owned = 0
-        owner_task_addr = owner
+    reader_owned, owner_task_addr = _decode_rwsem_owner(owner)
 
     stale_reader_owner = is_stale_reader_owner(count, reader_owned, owner_task_addr)
     if stale_reader_owner:
@@ -733,11 +807,7 @@ def analyze_rw_semaphore_from_vmcore(rw_semaphore_addr, list_waiters=False, verb
 
     arch = ARCH  # injected by chk_lock._push_globals()
 
-    try:
-        owner_raw = rwsem.owner.counter if RHEL_VERSION >= 8 else rwsem.owner
-    except (KeyError, AttributeError, TypeError):
-        owner_raw = _parse_crash_rwsem_fields(rw_semaphore_addr).get("owner", 0)
-        dbg("owner: using crash struct parse fallback")
+    owner_raw = _read_rwsem_owner_raw(rwsem, rw_semaphore_addr)
     owner_raw = owner_raw & 0xFFFFFFFFFFFFFFFF
 
     if verbose:

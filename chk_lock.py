@@ -17,6 +17,7 @@ Usage (inside crash):
 """
 
 import argparse
+import re
 import sys
 from pykdump.API import *
 
@@ -60,12 +61,14 @@ def _init_environment(debug=False):
 
     for line in sys_output.splitlines():
         # RELEASE line — e.g.  "RELEASE: 5.14.0-427.13.1.el9_4.x86_64"
+        #                         "RELEASE: 6.12.0-55.12.1.el10_0.x86_64"
         if "RELEASE" in line:
             KERNEL_VERSION = line.split()[-1]
-            if "el" in KERNEL_VERSION:
+            m = re.search(r"\.el(\d+)", KERNEL_VERSION)
+            if m:
                 try:
-                    RHEL_VERSION = int(KERNEL_VERSION.split(".el")[1][0])
-                except (IndexError, ValueError) as e:
+                    RHEL_VERSION = int(m.group(1))
+                except ValueError as e:
                     dbg(f"_init_environment(): could not parse RHEL version: {e}")
 
         # MACHINE line — e.g.  "MACHINE: x86_64  (3100 Mhz)"
