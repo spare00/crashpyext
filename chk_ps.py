@@ -265,16 +265,12 @@ def get_ps_code(task, debug=False):
 
 def parse_bt_output(bt_output, max_depth=5):
     """
-    Extract function names from crash's 'bt -s PID' output.
+    Extract function names from crash's 'bt PID' output.
 
-    'bt -s' lists frames from innermost (top of stack, most recent call) to
+    'bt' lists frames from innermost (top of stack, most recent call) to
     outermost.  We take the top max_depth innermost frames and display them
     in caller → callee order (outermost → innermost of the slice) so the
     summary reads left-to-right as the call progression toward the sleep point.
-
-    FIX #9: The original docstring said "last N (innermost) frames" but the
-    code took funcs[:max_depth] which are the FIRST N lines = the INNERMOST
-    frames.  Docstring and comment now match the code.
 
     Example (max_depth=5):
         schedule_hrtimeout_range -> schedule_hrtimeout -> do_sys_poll ->
@@ -423,7 +419,8 @@ def walk_task_list(filter_code=None, command_filter=None, only_active=False, deb
             crash.member_offset(typename, member)
             return True
         except Exception:
-            return False
+            pass
+        return False
 
     # --- init_task and global ring ---
     try:
@@ -534,7 +531,9 @@ def walk_task_list(filter_code=None, command_filter=None, only_active=False, deb
 
         if collect_bt:
             try:
-                bt_output = exec_crash_command(f"bt -s {pid}")
+                # Use task_struct address instead of PID to uniquely identify tasks
+                # (especially idle tasks with PID 0 which exist on every CPU).
+                bt_output = exec_crash_command(f"bt -s 0x{addr:x}")
                 trace = parse_bt_output(bt_output, max_depth=depth)
                 if trace:
                     bt_counter[trace] += 1
