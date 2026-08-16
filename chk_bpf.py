@@ -21,8 +21,8 @@ Usage (inside crash, after setup_chk_tools.py):
     crash> chk_bpf -p <id>
     crash> chk_bpf -p <id> -m
     crash> chk_bpf -n <function or trampoline name>
-    crash> chk_bpf -n bpf_trampoline_6442501095
-    crash> chk_bpf -h
+    crash> chk_bpf bpf_trampoline_6442501095
+    crash> chk_bpf -n __x64_sys_write
 """
 
 import argparse
@@ -265,6 +265,32 @@ def struct_size(typename):
     return None
 
 
+KERNEL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
+BPF_PROG_KSYM_RE = re.compile(
+    r"^bpf_prog_[0-9a-fA-F]+_(.+)_(fentry|fexit|fmod_ret|modify_return)(?:_\d+)?$"
+)
+BPF_TRAMP_KSYM_RE = re.compile(r"^bpf_trampoline_(\d+)$")
+
+
+def kernel_ident(text):
+    """Return a C identifier from a crash/pykdump string, or '' if garbage."""
+    if text is None:
+        return ""
+    s = str(text).split("\x00")[0].strip().strip('"').strip("'")
+    if not s:
+        return ""
+    m = re.search(r'"([A-Za-z_][A-Za-z0-9_.]*)"', s)
+    if m:
+        return m.group(1)
+    tok = s.replace("<", " ").replace(">", " ").split()[-1]
+    tok = tok.split("+")[0].split("/")[-1].strip('"').strip("'")
+    if KERNEL_IDENT_RE.match(tok) and len(tok) >= 2:
+        return tok
+    if KERNEL_IDENT_RE.match(s) and len(s) >= 2:
+        return s
+    return ""
+
+
 def read_cstr(addr, maxlen=128):
     addr = ptr_int(addr)
     if not addr:
@@ -287,6 +313,17 @@ def read_cstr(addr, maxlen=128):
         return line.strip().strip('"')
     except Exception:
         return ""
+
+
+def read_kernel_name(val, maxlen=128):
+    """Read a kernel function name from a char * or an already-dereferenced string."""
+    ident = kernel_ident(val)
+    if ident:
+        return ident
+    addr = ptr_int(val)
+    if addr:
+        return kernel_ident(read_cstr(addr, maxlen))
+    return ""
 
 
 def addr2name(addr):
@@ -375,15 +412,34 @@ def read_su(typename, addr):
     raise last
 
 
-def walk_hlist(head_addr, maxel=HLIST_WALK_MAX):
-    """Yield hlist_node addresses starting from hlist_head.first."""
-    seen = set()
+def read_kptr(addr):
+    """Read a kernel pointer at addr (hlist_head.first / hlist_node.next)."""
+    addr = ptr_int(addr)
+    if not addr:
+        return 0
     try:
-        head = read_su("hlist_head", head_addr)
-        node = ptr_int(head.first)
-    except Exception as e:
-        dbg(f"walk_hlist: cannot read hlist_head {head_addr:#x}: {e}")
-        return
+        return ptr_int(readPtr(addr))
+    except Exception:
+        pass
+    try:
+        return ptr_int(readULong(addr))
+    except Exception:
+        pass
+    return 0
+
+
+def walk_hlist(head_addr, maxel=HLIST_WALK_MAX):
+    """Yield every hlist_node: head.first, then node.next until NULL."""
+    seen = set()
+    head_addr = ptr_int(head_addr)
+    node = read_kptr(head_addr)
+    if not node:
+        try:
+            head = read_su("hlist_head", head_addr)
+            node = ptr_int(head.first)
+        except Exception as e:
+            dbg(f"walk_hlist: cannot read hlist_head {head_addr:#x}: {e}")
+            return
     while node:
         if node in seen:
             dbg(f"walk_hlist: cycle at {node:#x}")
@@ -396,12 +452,14 @@ def walk_hlist(head_addr, maxel=HLIST_WALK_MAX):
         if len(seen) >= maxel:
             dbg(f"walk_hlist: hit max {maxel}")
             break
-        try:
-            hnode = read_su("hlist_node", node)
-            nxt = ptr_int(hnode.next)
-        except Exception as e:
-            dbg(f"walk_hlist: cannot read hlist_node {node:#x}: {e}")
-            break
+        nxt = read_kptr(node)
+        if not nxt:
+            try:
+                hnode = read_su("hlist_node", node)
+                nxt = ptr_int(hnode.next)
+            except Exception as e:
+                dbg(f"walk_hlist: cannot read hlist_node {node:#x}: {e}")
+                break
         if nxt == node:
             break
         node = nxt
@@ -574,7 +632,7 @@ def prog_info(prog_addr):
         except Exception:
             pass
         try:
-            info["attach_func"] = read_cstr(aux.attach_func_name)
+            info["attach_func"] = read_kernel_name(aux.attach_func_name)
         except Exception:
             pass
     return info
@@ -589,14 +647,26 @@ def collect_progs_from_trampoline(tr_addr):
     use_aux_hlist = has_member("bpf_prog_aux", "tramp_hlist")
     hlist_base = member_offset("bpf_trampoline", "progs_hlist")
     head_sz = struct_size("hlist_head") or 8
+    tramp_target = ""
+    try:
+        fa = ptr_int(tr.func.addr)
+        if fa:
+            tramp_target = kernel_ident(symbol_basename(addr2name(fa)))
+    except Exception:
+        tramp_target = ""
     dbg(f"trampoline {tr_addr:#x}: kinds={nkind} "
         f"tramp_link={use_tramp_link} aux_hlist={use_aux_hlist} "
-        f"progs_hlist_off={hlist_base}")
+        f"progs_hlist_off={hlist_base} target={tramp_target or '-'}")
+
+    def _finish_info(info):
+        if info and tramp_target and not info.get("attach_func"):
+            info["attach_func"] = tramp_target
+        return info
 
     # freplace / BPF_PROG_TYPE_EXT lives on extension_prog, not the hlist.
     ext = getattr_ptr(tr, "extension_prog")
     if looks_like_bpf_prog(ext):
-        info = prog_info(ext)
+        info = _finish_info(prog_info(ext))
         if info:
             results.append((None, "REPLACE", info, None))
 
@@ -654,7 +724,7 @@ def collect_progs_from_trampoline(tr_addr):
                 except Exception as e:
                     dbg(f"bpf_prog_aux {obj_addr:#x} failed: {e}")
                     continue
-            info = prog_info(paddr)
+            info = _finish_info(prog_info(paddr))
             if info:
                 results.append((kind, kind_name, info, link_id))
             else:
@@ -662,45 +732,77 @@ def collect_progs_from_trampoline(tr_addr):
     return results
 
 
-def trampoline_table_symbol():
+def parse_gdb_kaddr(text):
+    if not text:
+        return 0
+    m = re.search(r"0x([0-9a-fA-F]+)", text)
+    if m:
+        return int(m.group(1), 16)
+    m = re.search(r"\b(ffff[0-9a-fA-F]+|ffffffff[0-9a-fA-F]+)\b", text)
+    if m:
+        return int(m.group(1), 16)
+    return 0
+
+
+def trampoline_table_info():
+    """
+    trampoline_table is a static hlist_head[1024].
+
+    Must use `p &trampoline_table` to get the array address.  `sym` /
+    readSymbol() often return trampoline_table[0].first (one hlist_node),
+    which makes a 1024-bucket walk look like a single chain.
+    Returns (array_addr, n_buckets, sizeof(hlist_head)).
+    """
     for name in ("trampoline_table", "trampoline_key_table"):
-        try:
-            if symbol_exists(name):
-                return name
-        except Exception:
+        out = crash_cmd(f"p &{name}")
+        if not out:
             continue
-        # symbol_exists may miss static arrays; try readSymbol anyway.
-        try:
-            readSymbol(name)
-            return name
-        except Exception:
+        low = out.lower()
+        if "cannot" in low or "no symbol" in low or "syntax error" in low:
             continue
-    return None
+        n = TRAMPOLINE_TABLE_SIZE
+        m = re.search(r"\[(\d+)\]", out)
+        if m:
+            n = int(m.group(1))
+        addr = parse_gdb_kaddr(out)
+        if not addr:
+            continue
+        head_size = struct_size("hlist_head") or 8
+        if head_size not in (4, 8, 16):
+            head_size = 8
+        dbg(f"{name} array {addr:#x}  buckets={n}  sizeof(hlist_head)={head_size}")
+        return addr, n, head_size
+    dbg("trampoline_table not found via p &trampoline_table")
+    return 0, 0, 8
 
 
 def iter_all_trampolines():
-    """Yield bpf_trampoline addresses from trampoline_table[]."""
-    sym = trampoline_table_symbol()
-    if not sym:
-        dbg("trampoline_table symbol not found")
-        return
-    try:
-        table = readSymbol(sym)
-    except Exception as e:
-        dbg(f"readSymbol({sym}) failed: {e}")
+    """Yield every bpf_trampoline hashed on trampoline_table[]."""
+    table_addr, n_buckets, head_size = trampoline_table_info()
+    if not table_addr:
         return
     hlist_off = member_offset("bpf_trampoline", "hlist")
     if hlist_off is None:
         hlist_off = member_offset("bpf_trampoline", "hlist_key")
     if hlist_off is None:
         hlist_off = 0
-    head_size = struct_size("hlist_head") or 8
-    table_addr = ptr_int(table)
-    dbg(f"scanning {sym} at {table_addr:#x}, hlist_off={hlist_off}")
-    for i in range(TRAMPOLINE_TABLE_SIZE):
+    n = 0
+    occupied = 0
+    for i in range(n_buckets):
         head_addr = table_addr + i * head_size
+        first = True
         for node in walk_hlist(head_addr, maxel=256):
-            yield node - hlist_off
+            if first:
+                occupied += 1
+                first = False
+            tr = node - hlist_off
+            if looks_like_trampoline(tr):
+                n += 1
+                yield tr
+            else:
+                dbg(f"bucket[{i}] node {node:#x} -> {tr:#x} is not bpf_trampoline")
+    dbg(f"trampoline_table: {occupied}/{n_buckets} occupied buckets, "
+        f"{n} trampoline(s)")
 
 
 def find_trampoline_by_fops(fops_addr):
@@ -780,12 +882,59 @@ def symbol_basename(text):
     return tok.split("+")[0].split("/")[-1]
 
 
-def name_matches(candidate, needle):
+def parse_prog_ksym(kname):
+    m = BPF_PROG_KSYM_RE.match(kname or "")
+    if not m:
+        return None
+    return {"middle": m.group(1), "kind": m.group(2)}
+
+
+def ident_suffix_match(candidate, needle):
+    """True if candidate is needle, or ends with needle at an identifier boundary."""
     if not candidate or not needle:
         return False
     if candidate == needle:
         return True
-    return len(needle) >= 4 and needle in candidate
+    if len(needle) < 3 or not candidate.endswith(needle):
+        return False
+    prev = candidate[-len(needle) - 1]
+    return needle[:1] in "._" or prev in "._"
+
+
+def looks_like_kernel_func(name):
+    if not name or name.startswith("bpf_"):
+        return False
+    if not KERNEL_IDENT_RE.match(name):
+        return False
+    return name.startswith("__") or "_sys_" in name or name.startswith("sys_")
+
+
+def looks_like_lookup_name(text):
+    """True for a function / trampoline / BPF name, not a hex address."""
+    if not text:
+        return False
+    s = str(text).strip()
+    if s.startswith("0x") or s.startswith("0X"):
+        return False
+    if re.fullmatch(r"[0-9a-fA-F]+", s):
+        return False
+    if s.startswith("bpf_trampoline_") or s.startswith("bpf_prog_"):
+        return True
+    return bool(KERNEL_IDENT_RE.match(s))
+
+
+def ksym_matches_needle(kname, needle):
+    if not kname or not needle:
+        return False
+    if kname == needle:
+        return True
+    tm = BPF_TRAMP_KSYM_RE.fullmatch(kname)
+    if tm:
+        return needle == tm.group(1) or needle == kname
+    parsed = parse_prog_ksym(kname)
+    if parsed:
+        return ident_suffix_match(parsed["middle"], needle)
+    return ident_suffix_match(kname, needle)
 
 
 def trampoline_image_name(tr):
@@ -955,7 +1104,7 @@ def print_trampoline(tr_addr, verbose=False):
         pass
     print(f"struct bpf_trampoline *    {tr_addr:#x}")
     if key:
-        print(f"  key                      {key:#x}")
+        print(f"  key                      {key:#x}({int(key)})")
     if refcnt is not None:
         print(f"  refcnt                   {refcnt}")
     if flags:
@@ -1338,17 +1487,27 @@ def show_prog_maps(prog_id):
 
 
 def symbol_kaddr(name):
-    """Kernel address of a symbol; prefer `sym` so list_head is the object, not .next."""
+    """Kernel address of a symbol; prefer `sym` / `p &` so static names resolve."""
     try:
         out = exec_crash_command(f"sym {name}")
-        m = re.search(r"\b(ffff[0-9a-fA-F]+|ffffffff[0-9a-fA-F]+)\b", out)
+        m = re.search(r"\b(ffff[0-9a-fA-F]+|ffffffff[0-9a-fA-F]+)\b", out or "")
         if m:
             return int(m.group(1), 16)
-        m = re.search(r"0x([0-9a-fA-F]+)", out)
+        m = re.search(r"0x([0-9a-fA-F]+)", out or "")
         if m:
             return int(m.group(1), 16)
     except Exception as e:
         dbg(f"sym {name} failed: {e}")
+    try:
+        out = exec_crash_command(f"p &{name}")
+        m = re.search(r"\b(ffff[0-9a-fA-F]+|ffffffff[0-9a-fA-F]+)\b", out or "")
+        if m:
+            return int(m.group(1), 16)
+        m = re.search(r"0x([0-9a-fA-F]+)", out or "")
+        if m:
+            return int(m.group(1), 16)
+    except Exception as e:
+        dbg(f"p &{name} failed: {e}")
     try:
         return ptr_int(readSymbol(name))
     except Exception:
@@ -1377,10 +1536,69 @@ def aux_from_prog_ksym(ksym_addr):
     return None
 
 
+_IMAGE_TRAMP_CACHE = {}
+_KEY_TRAMP_CACHE = {}
+
+
+def _search_ptr_locations(cmd):
+    """Parse crash `search` output into addresses that contain the searched value."""
+    out = crash_cmd(cmd)
+    if not out:
+        return
+    for line in out.splitlines():
+        m = re.match(r"^\s*([0-9a-fA-F]{8,})\s*:", line)
+        if not m:
+            m = re.match(r"^\s*([0-9a-fA-F]{8,})\s+[0-9a-fA-Fx]+", line)
+        if not m:
+            continue
+        yield int(m.group(1), 16)
+
+
+def trampoline_from_image_search(image_addr):
+    """Fallback: search kernel for a pointer to cur_image, then container_of."""
+    image_addr = ptr_int(image_addr)
+    if not image_addr:
+        return None
+    if image_addr in _IMAGE_TRAMP_CACHE:
+        return _IMAGE_TRAMP_CACHE[image_addr]
+    off = member_offset("bpf_trampoline", "cur_image")
+    found = None
+    if off is not None:
+        for loc in _search_ptr_locations(f"search -K {image_addr:#x}"):
+            tr = loc - off
+            if looks_like_trampoline(tr):
+                found = tr
+                break
+    _IMAGE_TRAMP_CACHE[image_addr] = found
+    if found:
+        dbg(f"search -K {image_addr:#x} -> trampoline {found:#x}")
+    return found
+
+
+def trampoline_from_key_search(key):
+    """Fallback: search kernel for trampoline->key when trampoline_table is missing."""
+    key = int(key)
+    if key in _KEY_TRAMP_CACHE:
+        return _KEY_TRAMP_CACHE[key]
+    off = member_offset("bpf_trampoline", "key")
+    found = None
+    if off is not None:
+        for loc in _search_ptr_locations(f"search -k {key:#x}"):
+            tr = loc - off
+            if looks_like_trampoline(tr):
+                found = tr
+                break
+    _KEY_TRAMP_CACHE[key] = found
+    if found:
+        dbg(f"search -k {key:#x} -> trampoline {found:#x}")
+    return found
+
+
 def trampoline_from_ksym(ksym_addr, kname=""):
     """
     bpf_ksym is embedded in bpf_tramp_image.  Find the owning bpf_trampoline
-    via cur_image (trampoline_table walk) or the key encoded in the ksym name.
+    via cur_image (trampoline_table walk), the key encoded in the ksym name,
+    or a targeted search for the image pointer.
     """
     off = member_offset("bpf_tramp_image", "ksym")
     if off is None:
@@ -1394,16 +1612,64 @@ def trampoline_from_ksym(ksym_addr, kname=""):
         tr = find_trampoline_by_key(int(m.group(1)))
         if tr:
             return tr, image_addr
+    if is_kptr(image_addr):
+        tr = trampoline_from_image_search(image_addr)
+        if tr:
+            return tr, image_addr
+    if m:
+        tr = trampoline_from_key_search(int(m.group(1)))
+        if tr:
+            return tr, image_addr
     return None, image_addr
+
+
+def trampoline_match_reasons(tr, tr_addr, needle, func_addr, func_style):
+    """Why this trampoline matches a -n search, or []."""
+    reasons = []
+    try:
+        key = int(tr.key)
+        if needle == str(key) or needle == "bpf_trampoline_%d" % key:
+            reasons.append("key=%s" % key)
+    except Exception:
+        pass
+    tr_func = 0
+    try:
+        tr_func = ptr_int(tr.func.addr)
+    except Exception:
+        pass
+    func_sym = ""
+    if tr_func:
+        func_sym = symbol_basename(addr2name(tr_func))
+    if func_addr and tr_func == func_addr:
+        reasons.append("func.addr %s (%#x)" % (needle, tr_func))
+    elif ident_suffix_match(func_sym, needle):
+        reasons.append("func.addr %s (%#x)" % (func_sym, tr_func))
+    img_name, _img = trampoline_image_name(tr)
+    if ksym_matches_needle(img_name, needle):
+        reasons.append("cur_image.ksym.name %s" % img_name)
+    try:
+        rows = collect_progs_from_trampoline(tr_addr)
+    except Exception:
+        rows = []
+    for _kind, _kname, info, _lid in rows:
+        if not info:
+            continue
+        attach = info.get("attach_func") or ""
+        aux_name = info.get("name") or ""
+        if ident_suffix_match(attach, needle) or attach == needle:
+            reasons.append("attach_func_name %s" % attach)
+        elif (not func_style) and aux_name == needle:
+            reasons.append("prog name %s (truncated aux.name)" % aux_name)
+    return reasons
 
 
 def find_by_name(needle):
     """
     Resolve a function / trampoline / program name to trampolines and programs.
 
-    Better than `search -k` / `kmem`: walk trampoline_table (by key, func.addr
-    symbol, cur_image.ksym.name, attach_func_name) and bpf_kallsyms (prog vs
-    trampoline ksyms) using DWARF member offsets.
+    Match kernel attach-function names (exact / identifier-boundary suffix) and
+    bpf_trampoline_<key>.  Do not substring-match truncated 16-byte aux.name
+    against unrelated ksyms.
     """
     tramp_hits = {}  # tr_addr -> list of reasons
     prog_hits = {}   # prog_addr -> {info, reasons}
@@ -1425,48 +1691,30 @@ def find_by_name(needle):
         if reason not in ent["reasons"]:
             ent["reasons"].append(reason)
 
-    key_m = re.fullmatch(r"bpf_trampoline_(\d+)", needle)
-    if key_m:
-        tr = find_trampoline_by_key(int(key_m.group(1)))
-        if tr:
-            add_tramp(tr, f"trampoline_table key={key_m.group(1)}")
+    key_m = BPF_TRAMP_KSYM_RE.fullmatch(needle)
+    func_style = bool(key_m) or looks_like_kernel_func(needle)
+    func_addr = 0
+    if (not key_m) and func_style:
+        func_addr = symbol_kaddr(needle)
 
-    # trampoline_table: func.addr symbol, image ksym name, attached names
+    if key_m:
+        key = int(key_m.group(1))
+        tr = find_trampoline_by_key(key)
+        if not tr:
+            tr = trampoline_from_key_search(key)
+        if tr:
+            add_tramp(tr, "trampoline key=%s" % key)
+
+    if func_addr:
+        dbg("kernel symbol %s at %#x" % (needle, func_addr))
+
     for tr_addr in all_trampoline_addrs():
         try:
             tr = read_su("bpf_trampoline", tr_addr)
         except Exception:
             continue
-        reasons = []
-        try:
-            key = int(tr.key)
-            if needle == str(key) or needle == f"bpf_trampoline_{key}":
-                reasons.append(f"key={key}")
-        except Exception:
-            key = None
-        func_addr = 0
-        try:
-            func_addr = ptr_int(tr.func.addr)
-        except Exception:
-            pass
-        func_sym = symbol_basename(addr2name(func_addr)) if func_addr else ""
-        if name_matches(func_sym, needle):
-            reasons.append(f"func.addr {func_sym} ({func_addr:#x})")
-        img_name, img = trampoline_image_name(tr)
-        if name_matches(img_name, needle):
-            reasons.append(f"cur_image.ksym.name {img_name}")
-        # Attached program names / attach targets
-        try:
-            rows = collect_progs_from_trampoline(tr_addr)
-        except Exception:
-            rows = []
-        for _kind, _kname, info, _lid in rows:
-            if not info:
-                continue
-            if name_matches(info.get("attach_func") or "", needle):
-                reasons.append(f"attach_func_name {info.get('attach_func')}")
-            if name_matches(info.get("name") or "", needle):
-                reasons.append(f"prog name {info.get('name')}")
+        reasons = trampoline_match_reasons(
+            tr, tr_addr, needle, func_addr, func_style)
         if reasons:
             add_tramp(tr_addr, "; ".join(dict.fromkeys(reasons)))
 
@@ -1483,19 +1731,41 @@ def find_by_name(needle):
             except Exception:
                 continue
             kname = ksym_name_at(ksym_addr, ksym)
-            if not name_matches(kname, needle):
-                continue
+            ksym_hit = ksym_matches_needle(kname, needle)
             is_prog = False
             try:
                 is_prog = bool(int(ksym.prog))
             except Exception:
-                is_prog = kname.startswith("bpf_prog_")
+                is_prog = bool(kname.startswith("bpf_prog_"))
+            if not ksym_hit:
+                # Exact truncated BPF object name, not a kernel-function search.
+                if func_style or is_prog is False:
+                    continue
+                got = aux_from_prog_ksym(ksym_addr)
+                if not got:
+                    continue
+                aux_addr, paddr = got
+                info = prog_info(paddr)
+                if not info:
+                    continue
+                if (info.get("attach_func") or "") == needle:
+                    add_prog(paddr, f"bpf_kallsyms attach_func_name {needle} "
+                             f"(ksym {ksym_addr:#x}, aux {aux_addr:#x})", info)
+                elif (info.get("name") or "") == needle:
+                    add_prog(paddr, f"bpf_kallsyms prog name {needle} "
+                             f"(truncated aux.name; ksym {kname})", info)
+                continue
             if is_prog:
                 got = aux_from_prog_ksym(ksym_addr)
                 if got:
                     aux_addr, paddr = got
+                    info = prog_info(paddr)
+                    parsed = parse_prog_ksym(kname)
+                    if info and parsed and not info.get("attach_func"):
+                        if ident_suffix_match(parsed["middle"], needle):
+                            info["attach_func"] = needle
                     add_prog(paddr, f"bpf_kallsyms prog ksym {kname} "
-                             f"(ksym {ksym_addr:#x}, aux {aux_addr:#x})")
+                             f"(ksym {ksym_addr:#x}, aux {aux_addr:#x})", info)
             else:
                 tr, image = trampoline_from_ksym(ksym_addr, kname)
                 if tr:
@@ -1514,9 +1784,15 @@ def find_by_name(needle):
 def analyze_name(needle, verbose=False, show_maps=False):
     print()
     print(f"Search name: {needle}")
+    if looks_like_kernel_func(needle):
+        fa = symbol_kaddr(needle)
+        if fa:
+            print(f"Kernel symbol: {needle}  {fa:#x}")
     tramp_hits, prog_hits = find_by_name(needle)
     if not tramp_hits and not prog_hits:
         print("No match in trampoline_table or bpf_kallsyms.")
+        print("Hint:    use the kernel attach function (e.g. __x64_sys_write),")
+        print("         not the truncated 16-byte BPF program name.")
         return
 
     ids = []
@@ -1637,14 +1913,17 @@ How it works
   chk_bpf -p ID is a wrapper for crash `bpf -p ID`.  With -m, every map in
   bpf_prog_aux.used_maps is dumped (crash `bpf -m ID` per map).
 
-  chk_bpf -n NAME looks up a kernel function, BPF program, or trampoline
-  ksym name without `search`/`kmem`:
-    - bpf_trampoline_<key>  -> trampoline_table keyed by that u64
-    - trampoline_table walk -> func.addr symbol, cur_image.ksym.name,
-                               attach_func_name, prog name
+  chk_bpf -n NAME looks up a kernel function or trampoline ksym:
+    - bpf_trampoline_<key>  -> trampoline_table (or kallsyms + cur_image)
+    - kernel function       -> trampoline func.addr / attach_func_name
+                               (identifier-boundary match, so __ia32_sys_write
+                               does not match __ia32_sys_madvise)
     - bpf_kallsyms walk     -> bpf_prog_aux.ksym (prog) or
-                               bpf_tramp_image.ksym (trampoline), using
-                               DWARF member offsets (not hardcoded 0x10/0xa8)
+                               bpf_tramp_image.ksym (trampoline)
+
+  Prefer the kernel attach function over the truncated 16-byte aux.name
+  (e.g. __x64_sys_write, not fs_write___x64_).  A positional NAME that is
+  not a hex address is treated as -n.
 
   If ADDR is not forced with -f/-t, the type is auto-detected using the
   fops <-> private back-pointer.  kprobe-multi attachments (fprobe-embedded
@@ -1657,8 +1936,9 @@ Examples
   crash> chk_bpf -p 298
   crash> chk_bpf -p 298 -m
   crash> chk_bpf -n bpf_trampoline_6442501095
+  crash> chk_bpf bpf_trampoline_6442501095
   crash> chk_bpf -n __ia32_sys_write
-  crash> chk_bpf -n fs_write___ia32 -m
+  crash> chk_bpf -n __x64_sys_write -m
 """,
     )
     parser.add_argument(
@@ -1712,6 +1992,13 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     DEBUG = args.debug
+
+    # Bare function / trampoline names are -n lookups, not addresses.
+    if (args.addr and args.name is None and args.prog is None
+            and not args.ftrace_ops and not args.trampoline
+            and looks_like_lookup_name(args.addr)):
+        args.name = args.addr
+        args.addr = None
 
     if args.prog is not None and args.addr:
         print("Error: use either ADDR or -p ID, not both")
