@@ -4,7 +4,8 @@
 Parse OOM logs from 'log -T' inside crash tool, extract memory usage of
 processes listed during each OOM event, and show top RSS/swap consumers.
 
-Supports -s (include swap), -d (debug), -v (verbose).
+Grouping: -c (comm name), -p (pid), -u (uid).
+Supports -s (include swap), -T N (top N), -d (debug), -v (verbose).
 """
 
 import re
@@ -78,11 +79,15 @@ def parse_oom_log(log_lines, debug=False, verbose=False):
 
     return oom_events
 
-def extract_rss_and_swap_usage(oom_events, include_swap, debug=False, verbose=False):
+def extract_rss_and_swap_usage(oom_events, include_swap, group_by='comm', debug=False, verbose=False):
     """
     Parses each OOM event's lines and extracts process memory usage.
+
+    group_by: 'comm' (process name), 'pid', or 'uid'
     """
-    event_usage = defaultdict(lambda: defaultdict(lambda: {'rss_kb': 0, 'swap_kb': 0, 'count': 0}))
+    event_usage = defaultdict(lambda: defaultdict(lambda: {
+        'rss_kb': 0, 'swap_kb': 0, 'count': 0, 'name': '', 'pid': 0, 'uid': 0
+    }))
     usage_pattern = re.compile(
         r'\[\s*(\d+)]\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(-?\d+)\s+(.+)$'
     )
@@ -100,16 +105,28 @@ def extract_rss_and_swap_usage(oom_events, include_swap, debug=False, verbose=Fa
             process_line = line[second:]
             match = usage_pattern.match(process_line)
             if match:
+                pid = int(match.group(1))
+                uid = int(match.group(2))
                 rss_pages = int(match.group(5))
                 swapents = int(match.group(7))
                 name = match.group(9).strip()
                 rss_kb = rss_pages * 4
                 swap_kb = swapents * 4
-                event_usage[event][name]['rss_kb'] += rss_kb
-                event_usage[event][name]['swap_kb'] += swap_kb
-                event_usage[event][name]['count'] += 1
+                if group_by == 'pid':
+                    key = pid
+                elif group_by == 'uid':
+                    key = uid
+                else:
+                    key = name
+                entry = event_usage[event][key]
+                entry['rss_kb'] += rss_kb
+                entry['swap_kb'] += swap_kb
+                entry['count'] += 1
+                entry['name'] = name
+                entry['pid'] = pid
+                entry['uid'] = uid
                 if debug:
-                    print(f"[DEBUG] Parsed: name={name}, rss_kb={rss_kb}, swap_kb={swap_kb}")
+                    print(f"[DEBUG] Parsed: pid={pid}, uid={uid}, name={name}, rss_kb={rss_kb}, swap_kb={swap_kb}")
         if verbose:
             print(f"[INFO] Parsed {len(lines)} lines from event: {event[:80]}...")
 
@@ -118,7 +135,7 @@ def extract_rss_and_swap_usage(oom_events, include_swap, debug=False, verbose=Fa
 
     return event_usage
 
-def display_usage(event_usage, include_swap, unit='GB'):
+def display_usage(event_usage, include_swap, unit='GB', group_by='comm', top_n=10):
     """
     Displays top memory consumers per OOM event with formatting.
     """
@@ -129,22 +146,48 @@ def display_usage(event_usage, include_swap, unit='GB'):
             continue
 
         sorted_usage = sorted(usage.items(), key=lambda x: x[1]['rss_kb'], reverse=True)
+        if top_n and top_n > 0:
+            sorted_usage = sorted_usage[:top_n]
 
-        if include_swap:
-            print(f"{f'RSS ({unit})':>10} {f'Swap ({unit})':>12} {'Count':>10} {'Name':<20}")
+        rss_h = f'RSS ({unit})'
+        swap_h = f'Swap ({unit})'
+        if group_by == 'pid':
+            if include_swap:
+                print(f"{rss_h:>10} {swap_h:>12} {'Count':>10} {'PID':>10} {'Name':<20}")
+            else:
+                print(f"{rss_h:>10} {'Count':>10} {'PID':>10} {'Name':<20}")
+        elif group_by == 'uid':
+            if include_swap:
+                print(f"{rss_h:>10} {swap_h:>12} {'Count':>10} {'UID':>10}")
+            else:
+                print(f"{rss_h:>10} {'Count':>10} {'UID':>10}")
         else:
-            print(f"{f'RSS ({unit})':>10} {'Count':>10} {'Name':<20}")
+            if include_swap:
+                print(f"{rss_h:>10} {swap_h:>12} {'Count':>10} {'Name':<20}")
+            else:
+                print(f"{rss_h:>10} {'Count':>10} {'Name':<20}")
 
         total_rss_kb = total_swap_kb = 0
 
-        for name, data in sorted_usage[:10]:
+        for key, data in sorted_usage:
             rss = format_value(data['rss_kb'], unit)
             swap = format_value(data['swap_kb'], unit) if include_swap else 0
             count = data['count']
-            if include_swap:
-                print(f"{rss:>10.2f} {swap:>12.2f} {count:>10} {name:<20}")
+            if group_by == 'pid':
+                if include_swap:
+                    print(f"{rss:>10.2f} {swap:>12.2f} {count:>10} {key:>10} {data['name']:<20}")
+                else:
+                    print(f"{rss:>10.2f} {count:>10} {key:>10} {data['name']:<20}")
+            elif group_by == 'uid':
+                if include_swap:
+                    print(f"{rss:>10.2f} {swap:>12.2f} {count:>10} {key:>10}")
+                else:
+                    print(f"{rss:>10.2f} {count:>10} {key:>10}")
             else:
-                print(f"{rss:>10.2f} {count:>10} {name:<20}")
+                if include_swap:
+                    print(f"{rss:>10.2f} {swap:>12.2f} {count:>10} {key:<20}")
+                else:
+                    print(f"{rss:>10.2f} {count:>10} {key:<20}")
 
             total_rss_kb += data['rss_kb']
             total_swap_kb += data['swap_kb']
@@ -278,7 +321,7 @@ def extract_and_display_meminfo_blocks(log_lines, show_unaccounted=False, show_f
             print(f"{'Unaccounted Memory':<35}{format_value(unaccounted, unit):>{width}.2f}")
         print("=" * (35 + width))
 
-def extract_and_display_slab_info(log_lines, unit='MB'):
+def extract_and_display_slab_info(log_lines, unit='MB', top_n=10):
     current_event = None
     slab_entries = []
     collecting = False
@@ -306,7 +349,8 @@ def extract_and_display_slab_info(log_lines, unit='MB'):
                     print(f"\nEvent: {current_event}")
                     print("Top Slab Usage (Unreclaimable):")
                     print(f"{f'Used ({unit})':>12}   Name")
-                    top_entries = sorted(slab_entries, key=lambda x: x[1], reverse=True)[:10]
+                    ranked = sorted(slab_entries, key=lambda x: x[1], reverse=True)
+                    top_entries = ranked[:top_n] if top_n and top_n > 0 else ranked
                     total = sum(x[1] for x in top_entries)
 
                     for name, used_mb in top_entries:
@@ -346,15 +390,24 @@ def scan_lowmem_warnings(log_lines):
         print("No low memory events detected in log.")
 
 def main():
-    import argparse
     parser = argparse.ArgumentParser(description="Parse OOM logs from crash log")
-    parser.add_argument('-p', '--process', action='store_true', help="Show per-process memory usage (optional with -i/-u)")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('-c', '--comm', action='store_true',
+                       help="Group/sort by process name (comm)")
+    group.add_argument('-p', '--pid', action='store_true',
+                       help="Group/sort by PID")
+    group.add_argument('-u', '--uid', action='store_true',
+                       help="Group/sort by UID")
     parser.add_argument('-s', '--swap', action='store_true', help="Include swap usage")
+    parser.add_argument('-T', '--top', type=int, default=10, metavar='N',
+                        help="Show top N rankers (default 10)")
     parser.add_argument('-d', '--debug', action='store_true', help="Enable debug output")
     parser.add_argument('-v', '--verbose', action='store_true', help="Enable verbose output")
     parser.add_argument('-i', '--meminfo', action='store_true', help="Show memory info summary per event")
-    parser.add_argument('-u', '--unaccounted', action='store_true', help="Include unaccounted memory")
-    parser.add_argument('-f', '--full', action='store_true', help="With -u, include detailed fields")
+    parser.add_argument('--un', dest='unaccounted', action='store_true',
+                        help="Include unaccounted memory")
+    parser.add_argument('-f', '--full', action='store_true',
+                        help="With --un/-i, include detailed fields")
     parser.add_argument('-l', '--slab', action='store_true', help="Show top unreclaimable slab usage")
 
     unit_group = parser.add_mutually_exclusive_group()
@@ -364,27 +417,36 @@ def main():
     parser.set_defaults(unit='GB')
 
     args = parser.parse_args()
+    grouping = args.comm or args.pid or args.uid
+    if args.pid:
+        group_by = 'pid'
+    elif args.uid:
+        group_by = 'uid'
+    else:
+        group_by = 'comm'
 
     raw_log = exec_crash_command('log')
     log_lines = raw_log.splitlines()
 
-    no_analysis_flags = not any([args.process, args.meminfo, args.unaccounted, args.full, args.slab,args.swap])
+    no_analysis_flags = not any([grouping, args.meminfo, args.unaccounted, args.full, args.slab, args.swap])
     if no_analysis_flags:
         scan_lowmem_warnings(log_lines)
         return
-    if args.swap and not args.process:
-        print("[WARN] --swap (-s) has no effect unless used with --process (-p).")
+    if args.swap and not grouping:
+        print("[WARN] --swap (-s) has no effect unless used with -c/-p/-u.")
 
     oom_events = parse_oom_log(log_lines, debug=args.debug, verbose=args.verbose)
 
-    if args.process:
+    if grouping:
         event_usage = extract_rss_and_swap_usage(
             oom_events,
             include_swap=args.swap,
+            group_by=group_by,
             debug=args.debug,
             verbose=args.verbose
         )
-        display_usage(event_usage, include_swap=args.swap, unit=args.unit)
+        display_usage(event_usage, include_swap=args.swap, unit=args.unit,
+                      group_by=group_by, top_n=args.top)
 
     elif args.meminfo or args.unaccounted or args.full:
         extract_and_display_meminfo_blocks(
@@ -395,8 +457,8 @@ def main():
             verbose=args.verbose
         )
 
-    if args.slab and not (args.meminfo or args.unaccounted or args.full or args.process):
-        extract_and_display_slab_info(log_lines, unit=args.unit)
+    if args.slab and not (args.meminfo or args.unaccounted or args.full or grouping):
+        extract_and_display_slab_info(log_lines, unit=args.unit, top_n=args.top)
 
 main()
 
