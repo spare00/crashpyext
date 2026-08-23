@@ -127,8 +127,12 @@ def member_offset(typename: str, member: str):
             return int(off) if off is not None and off != -1 else None
     except Exception:
         pass
-    # Fallback: textual 'offset <type> <member>' and parse
-    out = x(f"offset {typename} {member}")
+    # Fallback: textual 'offset <type> <member>' and parse.
+    # Missing members may raise crash.error on some kernels (e.g. renamed fields).
+    try:
+        out = x(f"offset {typename} {member}")
+    except Exception:
+        return None
     line = out.strip().splitlines()[-1] if out.strip() else ""
     m = re.search(r'=\s*(0x[0-9a-fA-F]+|\d+)', line)
     if not m:
@@ -393,6 +397,14 @@ def print_hierarchy(cpu, policy):
         print(" " + line)
 
 # ---------------- kernfs/cgroup helpers ----------------
+def _unescape_gdb_cstr(s: str) -> str:
+    """Stop at first NUL. Crash/gdb often prints NULs as \\000 rather than \\x00."""
+    if not s:
+        return s
+    s = s.split('\x00', 1)[0]
+    s = re.split(r'\\0{1,3}', s, maxsplit=1)[0]
+    return ''.join(ch for ch in s if 32 <= ord(ch) < 127)
+
 def _extract_cstr(val: str) -> str:
     """Best-effort to extract the printable name from crash output.
        Accepts: '0xffff... "name"', '"name"', or plain 'name'.
@@ -403,7 +415,7 @@ def _extract_cstr(val: str) -> str:
     # Prefer quoted content if present
     m = re.search(r'"([^"]*)"', txt)
     if m:
-        return m.group(1)
+        return _unescape_gdb_cstr(m.group(1))
     # If it looks like: 0xffff... <maybe>name — try the last token
     toks = txt.split()
     if toks:
@@ -412,9 +424,28 @@ def _extract_cstr(val: str) -> str:
         last = last.rstrip(",;")
         # If it's not a hex-looking token, take it as a name
         if not ADDR_RE.fullmatch(last):
-            return last.strip('"')
+            return _unescape_gdb_cstr(last.strip('"'))
     # Address only or nothing printable
     return ""
+
+# RHEL 9.8+ / newer kernels renamed kernfs_node.parent -> __parent (RCU).
+_KERNFS_PARENT_MEMBER = None
+
+def kernfs_parent_member():
+    """Return the kernfs_node parent field name for this kernel ('parent' or '__parent')."""
+    global _KERNFS_PARENT_MEMBER
+    if _KERNFS_PARENT_MEMBER is not None:
+        return _KERNFS_PARENT_MEMBER
+    for cand in ("parent", "__parent"):
+        try:
+            if has_member("kernfs_node", cand):
+                _KERNFS_PARENT_MEMBER = cand
+                dmsg(f"kernfs_node parent field: {cand}")
+                return cand
+        except Exception as e:
+            dmsg(f"kernfs_node.{cand} probe failed: {e}")
+    _KERNFS_PARENT_MEMBER = "__parent"
+    return _KERNFS_PARENT_MEMBER
 
 def cgroup_name_from_css(css_ptr_text: str):
     """Return (name, cgroup_ptr_addr, kn_or_none).
@@ -482,12 +513,28 @@ def cgroup_path_from_kn(kn_addr: str):
     parts = []
     cur = kn_addr
     hops = 0
+    parent_field = kernfs_parent_member()
     while cur and hops < 16:
-        nm = _extract_cstr(p_eval(f"((struct kernfs_node *){cur})->name"))
+        nm = None
+        try:
+            name_ptr = read_member_ptr("kernfs_node", cur, "name")
+            if name_ptr:
+                nm = read_cstring(name_ptr)
+            if not nm:
+                nm = _extract_cstr(p_eval(f"((struct kernfs_node *){cur})->name"))
+        except Exception as e:
+            dmsg(f"kernfs_node.name read failed at {cur}: {e}")
         if nm and nm != "/" and not ADDR_RE.fullmatch(nm):
             parts.append(nm)
-        parent = p_eval(f"((struct kernfs_node *){cur})->parent")
-        cur = addr_only(parent)
+        parent = None
+        try:
+            parent = read_member_ptr("kernfs_node", cur, parent_field)
+        except Exception as e:
+            dmsg(f"kernfs_node.{parent_field} read failed at {cur}: {e}")
+            break
+        if not parent or parent == cur:
+            break
+        cur = parent
         hops += 1
     # Build only if we actually have components
     return ("/" + "/".join(reversed(parts))) if parts else None
@@ -1680,12 +1727,9 @@ def main():
 
     target = normalize_target(args.target)
     pid  = to_int(p_eval(f"((struct task_struct *){target})->pid"))
-    # strip quotes and any trailing NULs crash prints
+    # strip quotes and any trailing NULs crash/gdb prints (\\000 or real NULs)
     raw_comm = p_eval(f"((struct task_struct *){target})->comm") or ""
-    comm_s = raw_comm.strip().strip('"')
-    comm_clean = comm_s.split('\x00', 1)[0]
-    # drop non-printables
-    comm_clean = ''.join(ch for ch in comm_clean if 32 <= ord(ch) < 127)
+    comm_clean = _extract_cstr(raw_comm) or _unescape_gdb_cstr(raw_comm.strip().strip('"'))
     print(f"Task: {target}  PID: {pid}  COMM: {comm_clean}")
 
     cpu = collect_cpu(target); print_cpu(cpu)
