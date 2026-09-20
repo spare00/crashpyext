@@ -725,7 +725,6 @@ def print_command_memory_usage(unit="G", debug=False, top_n=10):
     unit_label = f"{unit}iB"
 
     print(f"\nTop {top_n} commands by total RSS (unit: {unit_label}):")
-    print(f"  (SHM column omitted; use -p for per-process SHM detail)")
     print(f"{'Count':>8}{'RSS':>15}{'VSZ':>15}  {'COMMAND'}")
     print("-" * 68)
 
