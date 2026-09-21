@@ -122,7 +122,7 @@ def get_tmpfs_superblocks(debug=False):
     all_tmpfs_sbs     = set()
     visible_tmpfs_sbs = set()
 
-    # Collect visible tmpfs mounts from `mount`
+    # Collect visible tmpfs mounts from mount
     try:
         output = exec_crash_command("mount")
         for line in output.splitlines():
@@ -142,7 +142,7 @@ def get_tmpfs_superblocks(debug=False):
             print(f"[debug] Failed to parse mount output: {e}")
 
     # Walk super_blocks linked list to find ALL tmpfs superblocks,
-    # including internal/hidden ones not visible in `mount`.
+    # including internal/hidden ones not visible in mount.
     # Use sym2addr() so we get the raw address of the list_head symbol
     # rather than dereferencing it (which breaks on some kernel builds).
     try:
@@ -331,7 +331,7 @@ def get_buffers_kb_from_blockdev(debug=False):
 
 def get_hugepage_info(debug=False):
     """
-    Parse `kmem -h` and return (total_kb, used_kb).
+    Parse kmem -h and return (total_kb, used_kb).
     Handles size suffixes: kB/KB, MB, GB (case-insensitive, mixed-case safe).
     Result is cached on the function object.
     """
@@ -404,12 +404,10 @@ def get_swap_info(debug=False):
 # ---------------------------------------------------------------------------
 
 def get_vmalloc_memory_kb(debug=False):
-    """
-    Parse `kmem -v` and sum the SIZE column.
-    Column index is determined from the header line for robustness across
-    crash versions and kernel configurations.
-    Returns total in KiB.
-    """
+    # Parse kmem -v and sum the SIZE column.
+    # Column index is determined from the header line for robustness across
+    # crash versions and kernel configurations.
+    # Returns total in KiB.
     total_kb = 0
     size_col = None
 
@@ -627,13 +625,14 @@ def get_process_shmem_kb(task_addr, debug=False):
             print(f"[debug] get_process_shmem_kb failed for {addr_str}: {e}")
         return 0
 
-def _parse_ps_lines(debug=False):
-    """Parse `ps -G` output into a list of process dicts (shm not computed)."""
+def _parse_ps_lines(debug=False, leaders_only=True):
+    # leaders_only True: ps -G (processes). False: ps (all tasks).
+    cmd = "ps -G" if leaders_only else "ps"
     try:
-        output = exec_crash_command("ps -G")
+        output = exec_crash_command(cmd)
     except Exception as e:
         if debug:
-            print(f"[debug] Failed to run ps -G: {e}")
+            print(f"[debug] Failed to run {cmd}: {e}")
         return []
 
     procs = []
@@ -703,44 +702,87 @@ def print_top_processes(n=10, unit="G", debug=False):
           f"{scale(total_rss):>12.2f} {scale(total_vsz):>12.2f} "
           f"{scale(total_shm):>12.2f}")
 
-def print_command_memory_usage(unit="G", debug=False, top_n=10):
-    """
-    Aggregate RSS/VSZ by command name.
-    SHM walk is intentionally skipped here — walking every process's VMA list
-    is very slow on large vmcores.  Use -p for per-process SHM on the top-N.
-    """
-    procs = _parse_ps_lines(debug)
+def _thread_counts_by_comm(leaders, all_tasks):
+    # Map tasks to a process command. Threads share VSZ/RSS with their
+    # leader even if pthread_setname_np renamed task.comm (e.g. Java GC).
+    # Unique (vsz, rss) -> that command; otherwise use the task comm.
+    sig_to_comms = defaultdict(set)
+    for p in leaders:
+        sig_to_comms[(p["vsz"], p["rss"])].add(p["comm"])
+
+    counts = defaultdict(int)
+    for t in all_tasks:
+        comms = sig_to_comms.get((t["vsz"], t["rss"]), set())
+        if len(comms) == 1:
+            for c in comms:
+                counts[c] += 1
+        else:
+            counts[t["comm"]] += 1
+    return counts
+
+def print_command_memory_usage(unit="G", debug=False, top_n=10, verbose=False):
+    # RSS/VSZ/Count from ps -G (thread-group leaders).
+    # -v also counts threads from ps, mapping renamed threads via VSZ/RSS.
+    procs = _parse_ps_lines(debug, True)
     if not procs:
         print("No process data available.")
         return
 
-    command_map = defaultdict(lambda: {"rss": 0, "vsz": 0, "count": 0})
+    command_map = defaultdict(lambda: {"rss": 0, "vsz": 0, "count": 0, "threads": 0})
     for p in procs:
         entry = command_map[p["comm"]]
         entry["rss"]   += p["rss"]
         entry["vsz"]   += p["vsz"]
         entry["count"] += 1
 
+    if verbose:
+        all_tasks = _parse_ps_lines(debug, False)
+        thread_counts = _thread_counts_by_comm(procs, all_tasks)
+        for comm, nthreads in thread_counts.items():
+            command_map[comm]["threads"] = nthreads
+        for comm, entry in command_map.items():
+            if entry["count"] and not entry["threads"]:
+                entry["threads"] = entry["count"]
+
     scale      = lambda val: scale_value(val, unit)
     unit_label = f"{unit}iB"
 
     print(f"\nTop {top_n} commands by total RSS (unit: {unit_label}):")
-    print(f"{'Count':>8}{'RSS':>15}{'VSZ':>15}  {'COMMAND'}")
-    print("-" * 68)
+    if verbose:
+        print(f"{'Count':>8}{'Threads':>10}{'Thr/Proc':>10}"
+              f"{'RSS':>15}{'VSZ':>15}  {'COMMAND'}")
+        sep = "-" * 88
+    else:
+        print(f"{'Count':>8}{'RSS':>15}{'VSZ':>15}  {'COMMAND'}")
+        sep = "-" * 68
+    print(sep)
 
-    sorted_cmds = sorted(command_map.items(),
-                         key=lambda x: x[1]["rss"], reverse=True)[:top_n]
+    sorted_cmds = sorted(
+        ((c, d) for c, d in command_map.items() if d["count"]),
+        key=lambda x: x[1]["rss"], reverse=True)[:top_n]
     for comm, data in sorted_cmds:
-        print(f"{data['count']:>8}{scale(data['rss']):>15.2f}"
-              f"{scale(data['vsz']):>15.2f}  {comm}")
+        if verbose:
+            avg = (data["threads"] / data["count"]) if data["count"] else 0
+            print(f"{data['count']:>8}{data['threads']:>10}{avg:>10.1f}"
+                  f"{scale(data['rss']):>15.2f}{scale(data['vsz']):>15.2f}  {comm}")
+        else:
+            print(f"{data['count']:>8}{scale(data['rss']):>15.2f}"
+                  f"{scale(data['vsz']):>15.2f}  {comm}")
 
-    total_rss   = sum(d["rss"]   for d in command_map.values())
-    total_vsz   = sum(d["vsz"]   for d in command_map.values())
-    total_count = sum(d["count"] for d in command_map.values())
+    total_rss     = sum(d["rss"]     for d in command_map.values())
+    total_vsz     = sum(d["vsz"]     for d in command_map.values())
+    total_count   = sum(d["count"]   for d in command_map.values())
+    total_threads = sum(d["threads"] for d in command_map.values())
 
-    print("-" * 68)
-    print(f"{total_count:>8}{scale(total_rss):>15.2f}"
-          f"{scale(total_vsz):>15.2f}  TOTAL (all processes)")
+    print(sep)
+    if verbose:
+        avg = (total_threads / total_count) if total_count else 0
+        print(f"{total_count:>8}{total_threads:>10}{avg:>10.1f}"
+              f"{scale(total_rss):>15.2f}{scale(total_vsz):>15.2f}  "
+              f"TOTAL (all processes)")
+    else:
+        print(f"{total_count:>8}{scale(total_rss):>15.2f}"
+              f"{scale(total_vsz):>15.2f}  TOTAL (all processes)")
 
 # ---------------------------------------------------------------------------
 # Verbose formula output
@@ -921,11 +963,12 @@ def main():
                        help="Show top 10 processes by RSS")
     group.add_argument("-c", "--commands", action="store_true",
                        help="Show aggregated memory usage per command "
-                            "(SHM omitted for performance; use -p for SHM detail)")
+                            "(with -v: also show thread counts)")
     group.add_argument("-s", "--slab", action="store_true",
                        help="Show slab cache memory usage (from kmem -s)")
 
-    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Verbose output (with -c: thread counts per command)")
     parser.add_argument("-d", "--debug",   action="store_true")
     parser.add_argument("-K", action="store_const", dest="unit", const="K",
                         help="Show memory in KiB")
@@ -947,9 +990,10 @@ def main():
         print_top_processes(10, unit=unit, debug=args.debug)
         return
 
-    # -c
+    # -c / -c -v
     if args.commands:
-        print_command_memory_usage(unit=unit, debug=args.debug, top_n=10)
+        print_command_memory_usage(unit=unit, debug=args.debug, top_n=10,
+                                   verbose=args.verbose)
         return
 
     # -s
