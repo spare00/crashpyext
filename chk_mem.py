@@ -720,9 +720,50 @@ def _thread_counts_by_comm(leaders, all_tasks):
             counts[t["comm"]] += 1
     return counts
 
-def print_command_memory_usage(unit="G", debug=False, top_n=10, verbose=False):
+def _canonical_sort_field(name):
+    if not name:
+        return "rss"
+    key = name.lower().strip().replace(" ", "")
+    aliases = (
+        ("count", "count"),
+        ("rss", "rss"),
+        ("vsz", "vsz"),
+        ("threads", "threads"),
+        ("thread", "threads"),
+        ("thr/proc", "thrproc"),
+        ("thrproc", "thrproc"),
+        ("thr_proc", "thrproc"),
+        ("command", "comm"),
+        ("comm", "comm"),
+        ("cmd", "comm"),
+    )
+    for alias, canon in aliases:
+        if key == alias:
+            return canon
+    return None
+
+def _command_sort_value(item, field):
+    comm, data = item
+    if field == "comm":
+        return comm.lower()
+    if field == "thrproc":
+        if data["count"]:
+            return float(data["threads"]) / data["count"]
+        return 0.0
+    return data[field]
+
+def print_command_memory_usage(unit="G", debug=False, top_n=10,
+                               verbose=False, sort="rss"):
     # RSS/VSZ/Count from ps -G (thread-group leaders).
     # -v also counts threads from ps, mapping renamed threads via VSZ/RSS.
+    sort_field = _canonical_sort_field(sort)
+    if sort_field is None:
+        print("Unknown --sort field: %s" % sort)
+        print("Valid fields: count, rss, vsz, threads, thr/proc, command")
+        return
+
+    show_threads = verbose or sort_field in ("threads", "thrproc")
+
     procs = _parse_ps_lines(debug, True)
     if not procs:
         print("No process data available.")
@@ -735,7 +776,7 @@ def print_command_memory_usage(unit="G", debug=False, top_n=10, verbose=False):
         entry["vsz"]   += p["vsz"]
         entry["count"] += 1
 
-    if verbose:
+    if show_threads:
         all_tasks = _parse_ps_lines(debug, False)
         thread_counts = _thread_counts_by_comm(procs, all_tasks)
         for comm, nthreads in thread_counts.items():
@@ -746,9 +787,18 @@ def print_command_memory_usage(unit="G", debug=False, top_n=10, verbose=False):
 
     scale      = lambda val: scale_value(val, unit)
     unit_label = f"{unit}iB"
+    sort_labels = {
+        "count": "Count",
+        "rss": "RSS",
+        "vsz": "VSZ",
+        "threads": "Threads",
+        "thrproc": "Thr/Proc",
+        "comm": "COMMAND",
+    }
+    sort_label = sort_labels[sort_field]
 
-    print(f"\nTop {top_n} commands by total RSS (unit: {unit_label}):")
-    if verbose:
+    print(f"\nTop {top_n} commands by {sort_label} (unit: {unit_label}):")
+    if show_threads:
         print(f"{'Count':>8}{'Threads':>10}{'Thr/Proc':>10}"
               f"{'RSS':>15}{'VSZ':>15}  {'COMMAND'}")
         sep = "-" * 88
@@ -757,11 +807,13 @@ def print_command_memory_usage(unit="G", debug=False, top_n=10, verbose=False):
         sep = "-" * 68
     print(sep)
 
+    reverse = sort_field != "comm"
     sorted_cmds = sorted(
         ((c, d) for c, d in command_map.items() if d["count"]),
-        key=lambda x: x[1]["rss"], reverse=True)[:top_n]
+        key=lambda x: _command_sort_value(x, sort_field),
+        reverse=reverse)[:top_n]
     for comm, data in sorted_cmds:
-        if verbose:
+        if show_threads:
             avg = (data["threads"] / data["count"]) if data["count"] else 0
             print(f"{data['count']:>8}{data['threads']:>10}{avg:>10.1f}"
                   f"{scale(data['rss']):>15.2f}{scale(data['vsz']):>15.2f}  {comm}")
@@ -775,7 +827,7 @@ def print_command_memory_usage(unit="G", debug=False, top_n=10, verbose=False):
     total_threads = sum(d["threads"] for d in command_map.values())
 
     print(sep)
-    if verbose:
+    if show_threads:
         avg = (total_threads / total_count) if total_count else 0
         print(f"{total_count:>8}{total_threads:>10}{avg:>10.1f}"
               f"{scale(total_rss):>15.2f}{scale(total_vsz):>15.2f}  "
@@ -969,6 +1021,9 @@ def main():
 
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Verbose output (with -c: thread counts per command)")
+    parser.add_argument("--sort", default="rss", metavar="FIELD",
+                        help="With -c: sort by field (count, rss, vsz, threads, "
+                             "thr/proc, command). Case-insensitive. Default: rss")
     parser.add_argument("-d", "--debug",   action="store_true")
     parser.add_argument("-K", action="store_const", dest="unit", const="K",
                         help="Show memory in KiB")
@@ -993,7 +1048,7 @@ def main():
     # -c / -c -v
     if args.commands:
         print_command_memory_usage(unit=unit, debug=args.debug, top_n=10,
-                                   verbose=args.verbose)
+                                   verbose=args.verbose, sort=args.sort)
         return
 
     # -s
