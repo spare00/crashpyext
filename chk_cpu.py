@@ -7,6 +7,7 @@ Default listing is --topo: physical id, core id, and cpu index.
     crash> chk_cpu
     crash> chk_cpu --topo
     crash> chk_cpu --topo -v
+    crash> chk_cpu --highlight 0,64,127
 
 x86 field names depend on the kernel:
 
@@ -768,7 +769,17 @@ def _column_values(rows, verbose):
     return headers, body
 
 
-def format_table(rows, verbose):
+# Bold black on yellow. The "<<" stays visible if the pager drops color.
+_HL_ON = "\033[1;30;43m"
+_HL_OFF = "\033[0m"
+
+
+def _paint(line):
+    return f"{_HL_ON}{line} <<{_HL_OFF}"
+
+
+def format_table(rows, verbose, highlight=None):
+    highlight = highlight or set()
     headers, body = _column_values(rows, verbose)
     widths = [len(header) for header in headers]
     for vals in body:
@@ -784,12 +795,25 @@ def format_table(rows, verbose):
     for row, vals in zip(rows, body):
         if prev is not None and row.phys != prev:
             lines.append("")
-        lines.append(fmt(vals))
+        line = fmt(vals)
+        if row.cpu in highlight:
+            line = _paint(line)
+        lines.append(line)
         prev = row.phys
     return "\n".join(lines)
 
 
-def show_topo(verbose):
+def _highlight_note(rows, highlight):
+    shown = ",".join(str(cpu) for cpu in sorted(highlight))
+    present = {row.cpu for row in rows}
+    missing = [cpu for cpu in sorted(highlight) if cpu not in present]
+    if missing:
+        miss = ",".join(str(cpu) for cpu in missing)
+        return f"highlight: {shown}  (not found: {miss})"
+    return f"highlight: {shown}"
+
+
+def show_topo(verbose, highlight=None):
     rows, model, sources = collect_topo()
     if not rows:
         print(
@@ -804,9 +828,30 @@ def show_topo(verbose):
     print(summarize(rows))
     if verbose and sources:
         print("fields: " + "  ".join(f"{label}={name}" for label, name in sources.items()))
+    if highlight:
+        print(_highlight_note(rows, highlight))
     print()
-    print(format_table(rows, verbose))
+    print(format_table(rows, verbose, highlight))
     return True
+
+
+def parse_highlight(text):
+    """Comma-separated cpu indexes: 0,64,127."""
+    if text is None or not str(text).strip():
+        raise argparse.ArgumentTypeError("expected a comma-separated cpu index list")
+    cpus = set()
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            raise argparse.ArgumentTypeError(f"empty cpu index in '{text}'")
+        try:
+            cpu = int(part, 0)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"not a cpu index: {part}")
+        if cpu < 0:
+            raise argparse.ArgumentTypeError(f"not a cpu index: {part}")
+        cpus.add(cpu)
+    return cpus
 
 
 def main(argv=None):
@@ -820,6 +865,7 @@ def main(argv=None):
             "  chk_cpu\n"
             "  chk_cpu --topo\n"
             "  chk_cpu --topo -v\n"
+            "  chk_cpu --highlight 0,64,127\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -827,6 +873,12 @@ def main(argv=None):
         "--topo",
         action="store_true",
         help="list physical id, core id, and cpu index (default)",
+    )
+    parser.add_argument(
+        "--highlight",
+        metavar="CPU,...",
+        type=parse_highlight,
+        help="comma-separated cpu indexes to highlight, e.g. 0,64,127",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -851,7 +903,7 @@ def main(argv=None):
     ok = True
     for mode in modes:
         if mode == "topo":
-            ok = show_topo(verbose=args.verbose) and ok
+            ok = show_topo(verbose=args.verbose, highlight=args.highlight) and ok
     if not ok:
         sys.exit(1)
 
