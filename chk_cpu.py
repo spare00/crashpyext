@@ -1,12 +1,14 @@
 #!/usr/bin/env epython
 """
-chk_cpu.py — CPU topology from a vmcore (crash / epython).
+chk_cpu.py — CPU topology and idle (C-state) data from a vmcore (crash / epython).
 
 Default listing is --topo: physical id, core id, and cpu index.
 
     crash> chk_cpu
     crash> chk_cpu --topo
     crash> chk_cpu --topo -v
+    crash> chk_cpu --cstate
+    crash> chk_cpu --cstate -v
     crash> chk_cpu --highlight 0,64,127
     crash> chk_cpu --filter-cpu-index 0,64,127
 
@@ -17,6 +19,15 @@ x86 field names depend on the kernel:
 
 aarch64 and s390 use cpu_topology (package_id or socket_id, plus core_id).
 The cpu index there is the logical CPU number.
+
+--cstate walks per-cpu cpuidle_devices and the cpuidle_driver state table.
+Those layouts also move between kernels:
+
+    RHEL 9:   cpuidle_state_usage.time_ns, cpuidle_state.exit_latency_ns,
+              state disabled via flags & CPUIDLE_FLAG_OFF
+    RHEL 8:   time_ns/exit_latency_ns present through RH_KABI_REPLACE/EXTEND
+    RHEL 7:   cpuidle_state_usage.time (us), cpuidle_state.disabled,
+              and flag bit 0 means TIME_INVALID rather than POLLING
 """
 
 import argparse
@@ -31,8 +42,32 @@ from LinuxDump import percpu
 DEBUG = False
 
 Topo = namedtuple("Topo", "phys core cpu die apic")
+CState = namedtuple("CState", "idx name desc latency_us residency_us flags off")
+CpuCState = namedtuple(
+    "CpuCState", "cpu idx usage time_us above below rejected disable"
+)
 _OFFSET_CACHE = {}
 _SIZE_CACHE = {}
+
+# include/linux/cpuidle.h
+CPUIDLE_STATE_MAX = 10
+CPUIDLE_FLAG_OFF = 0x10
+
+# Bit 0 changed meaning: RHEL 7 used TIME_INVALID, RHEL 8+ uses POLLING.
+_IDLE_FLAGS_MODERN = (
+    (0x01, "polling"),
+    (0x02, "coupled"),
+    (0x04, "timer-stop"),
+    (0x08, "unusable"),
+    (0x10, "off"),
+    (0x20, "tlb-flushed"),
+    (0x40, "rcu-idle"),
+)
+_IDLE_FLAGS_RHEL7 = (
+    (0x01, "time-invalid"),
+    (0x02, "coupled"),
+    (0x04, "timer-stop"),
+)
 
 _FIELD_RE = re.compile(
     r"\b(pkg_id|phys_proc_id|package_id|socket_id|"
@@ -805,12 +840,12 @@ def format_table(rows, verbose, highlight=None):
 
 
 def _highlight_note(rows, highlight):
-    return _cpu_list_note("highlight", highlight, rows)
+    return _cpu_list_note("highlight", highlight, {row.cpu for row in rows})
 
 
-def _cpu_list_note(label, requested, rows):
+def _cpu_list_note(label, requested, present):
     shown = ",".join(str(cpu) for cpu in sorted(requested))
-    present = {row.cpu for row in rows}
+    present = set(present)
     missing = [cpu for cpu in sorted(requested) if cpu not in present]
     if missing:
         miss = ",".join(str(cpu) for cpu in missing)
@@ -831,7 +866,9 @@ def show_topo(verbose, highlight=None, cpu_filter=None):
     total = len(rows)
     filter_note = None
     if cpu_filter:
-        filter_note = _cpu_list_note("filter cpu index", cpu_filter, rows)
+        filter_note = _cpu_list_note(
+            "filter cpu index", cpu_filter, {row.cpu for row in rows}
+        )
         rows = [row for row in rows if row.cpu in cpu_filter]
         if not rows:
             print(filter_note)
@@ -850,6 +887,439 @@ def show_topo(verbose, highlight=None, cpu_filter=None):
         print(_highlight_note(rows, highlight))
     print()
     print(format_table(rows, verbose, highlight))
+    return True
+
+
+def _read_ptr(addr):
+    """Read a kernel pointer at addr, 0 when it cannot be read."""
+    if not addr:
+        return 0
+    for reader in ("readPtr", "readULong"):
+        fn = globals().get(reader)
+        if fn is None:
+            continue
+        try:
+            return int(fn(addr)) & 0xFFFFFFFFFFFFFFFF
+        except Exception as e:
+            dbg(f"{reader}({addr:#x}): {e}")
+    return 0
+
+
+def _global_ptr(name):
+    """Dereference a global pointer symbol."""
+    addr = symbol_addr(name)
+    if addr is None:
+        return 0
+    return _read_ptr(addr)
+
+
+def _modern_cpuidle():
+    """RHEL 8+ layout: exit_latency_ns exists and flag bit 0 means POLLING."""
+    return has_member("struct cpuidle_state", "exit_latency_ns")
+
+
+def decode_idle_flags(flags):
+    if flags is None:
+        return ""
+    bits = _IDLE_FLAGS_MODERN if _modern_cpuidle() else _IDLE_FLAGS_RHEL7
+    names = [name for bit, name in bits if flags & bit]
+    left = flags & ~sum(bit for bit, _ in bits)
+    if left:
+        names.append(f"{left:#x}")
+    return ",".join(names)
+
+
+def _us_from(obj, ns_field, us_field):
+    """Prefer the nanosecond member, fall back to the microsecond one."""
+    if ns_field and has_member("struct cpuidle_state", ns_field):
+        ns = _int_field(obj, ns_field)
+        if ns is not None:
+            return ns / 1000.0
+    us = _int_field(obj, us_field)
+    return None if us is None else float(us)
+
+
+def read_driver_states(drv_addr):
+    """State table of one struct cpuidle_driver."""
+    if not drv_addr:
+        return None, []
+    try:
+        drv = readSU("struct cpuidle_driver", drv_addr)
+    except Exception as e:
+        dbg(f"readSU(cpuidle_driver {drv_addr:#x}): {e}")
+        return None, []
+
+    name = _text_field(drv, "name")
+    off = member_offset("struct cpuidle_driver", "states")
+    size = struct_size("struct cpuidle_state")
+    if off is None or not size:
+        dbg(f"cpuidle_driver.states offset={off} size={size}")
+        return name, []
+
+    count = _int_field(drv, "state_count")
+    if not count or count < 0 or count > CPUIDLE_STATE_MAX:
+        dbg(f"state_count={count}, scanning up to {CPUIDLE_STATE_MAX}")
+        count = CPUIDLE_STATE_MAX
+
+    modern = _modern_cpuidle()
+    states = []
+    for idx in range(count):
+        try:
+            st = readSU("struct cpuidle_state", drv_addr + off + idx * size)
+        except Exception as e:
+            dbg(f"state {idx}: {e}")
+            break
+        sname = _text_field(st, "name")
+        if not sname:
+            # An unpopulated slot ends the table when state_count was unusable.
+            break
+        flags = _int_field(st, "flags")
+        if modern:
+            off_state = bool(flags and flags & CPUIDLE_FLAG_OFF)
+        else:
+            off_state = bool(_int_field(st, "disabled"))
+        states.append(CState(
+            idx,
+            sname,
+            _text_field(st, "desc"),
+            _us_from(st, "exit_latency_ns", "exit_latency"),
+            _us_from(st, "target_residency_ns", "target_residency"),
+            flags,
+            off_state,
+        ))
+    return name, states
+
+
+def _driver_addr_for_cpu(cpu, percpu_drv):
+    if cpu in percpu_drv:
+        return percpu_drv[cpu]
+    return _global_ptr("cpuidle_curr_driver")
+
+
+def _load_percpu_driver_addrs():
+    """CONFIG_CPU_IDLE_MULTIPLE_DRIVERS keeps a per-cpu cpuidle_drivers pointer."""
+    try:
+        if not symbol_exists("cpuidle_drivers"):
+            return {}
+    except Exception:
+        return {}
+    drivers = {}
+    for cpu, addr in load_percpu_addrs("cpuidle_drivers").items():
+        ptr = _read_ptr(addr)
+        if ptr:
+            drivers[cpu] = ptr
+    dbg(f"cpuidle_drivers: {len(drivers)} per-cpu drivers")
+    return drivers
+
+
+def load_cpuidle_devices():
+    """Map logical CPU -> struct cpuidle_device address."""
+    devices = {}
+    try:
+        have = symbol_exists("cpuidle_devices")
+    except Exception:
+        have = False
+    if have:
+        for cpu, addr in load_percpu_addrs("cpuidle_devices").items():
+            ptr = _read_ptr(addr)
+            if ptr:
+                devices[cpu] = ptr
+    if devices:
+        return devices
+
+    # Older paths register the per-cpu cpuidle_dev directly.
+    try:
+        have_dev = symbol_exists("cpuidle_dev")
+    except Exception:
+        have_dev = False
+    if not have_dev:
+        return devices
+    for cpu, addr in load_percpu_addrs("cpuidle_dev").items():
+        try:
+            dev = readSU("struct cpuidle_device", addr)
+        except Exception as e:
+            dbg(f"cpuidle_dev cpu {cpu}: {e}")
+            continue
+        if _int_field(dev, "registered"):
+            devices[cpu] = addr
+    return devices
+
+
+def read_cpu_usage(cpu, dev_addr, nstates):
+    """Per-state usage counters of one CPU, plus its last state index."""
+    off = member_offset("struct cpuidle_device", "states_usage")
+    size = struct_size("struct cpuidle_state_usage")
+    if off is None or not size:
+        dbg(f"states_usage offset={off} size={size}")
+        return [], None
+    try:
+        dev = readSU("struct cpuidle_device", dev_addr)
+    except Exception as e:
+        dbg(f"cpu {cpu}: readSU(cpuidle_device): {e}")
+        return [], None
+
+    last = _int_field(dev, "last_state_idx")
+    use_ns = has_member("struct cpuidle_state_usage", "time_ns")
+    count = nstates or _int_field(dev, "state_count") or CPUIDLE_STATE_MAX
+    count = min(count, CPUIDLE_STATE_MAX)
+
+    rows = []
+    for idx in range(count):
+        try:
+            usage = readSU("struct cpuidle_state_usage", dev_addr + off + idx * size)
+        except Exception as e:
+            dbg(f"cpu {cpu} state {idx}: {e}")
+            break
+        raw = _int_field(usage, "time_ns") if use_ns else _int_field(usage, "time")
+        time_us = None if raw is None else (raw / 1000.0 if use_ns else float(raw))
+        rows.append(CpuCState(
+            cpu,
+            idx,
+            _int_field(usage, "usage") or 0,
+            time_us or 0.0,
+            _int_field(usage, "above"),
+            _int_field(usage, "below"),
+            _int_field(usage, "rejected"),
+            _int_field(usage, "disable"),
+        ))
+    return rows, last
+
+
+def collect_cstates():
+    """
+    Return (drivers, per_cpu, last_state, governor).
+
+    drivers maps a driver address to (name, states, [cpus]); per_cpu maps a
+    cpu to its list of CpuCState rows.
+    """
+    devices = load_cpuidle_devices()
+    if not devices:
+        return {}, {}, {}, None
+
+    percpu_drv = _load_percpu_driver_addrs()
+    governor = None
+    gov_ptr = _global_ptr("cpuidle_curr_governor")
+    if gov_ptr:
+        try:
+            governor = _text_field(readSU("struct cpuidle_governor", gov_ptr), "name")
+        except Exception as e:
+            dbg(f"cpuidle_curr_governor: {e}")
+
+    drivers = {}
+    per_cpu = {}
+    last_state = {}
+    for cpu in sorted(devices):
+        drv_addr = _driver_addr_for_cpu(cpu, percpu_drv)
+        if drv_addr not in drivers:
+            name, states = read_driver_states(drv_addr)
+            drivers[drv_addr] = [name, states, []]
+        name, states, cpus = drivers[drv_addr]
+        cpus.append(cpu)
+        rows, last = read_cpu_usage(cpu, devices[cpu], len(states))
+        if not rows:
+            continue
+        per_cpu[cpu] = rows
+        if last is not None:
+            last_state[cpu] = last
+    return drivers, per_cpu, last_state, governor
+
+
+def _fmt_seconds(us):
+    if us is None:
+        return "-"
+    secs = us / 1e6
+    if secs >= 1000:
+        return f"{secs:.1f}s"
+    return f"{secs:.3f}s"
+
+
+def _fmt_us(us):
+    if us is None:
+        return "-"
+    if us >= 100 or us == int(us):
+        return f"{int(round(us))}us"
+    return f"{us:g}us"
+
+
+def _state_names(states):
+    return {state.idx: state.name for state in states}
+
+
+def _print_state_table(name, states, cpus, verbose):
+    label = name or "unknown driver"
+    span = _cpu_word(len(cpus), "cpu", "cpus")
+    print(f"driver {label}: {_cpu_word(len(states), 'state', 'states')}, {span}")
+    if not states:
+        print("  (no state table could be read)")
+        return
+
+    headers = ["idx", "name", "latency", "residency", "flags"]
+    if verbose:
+        headers.insert(2, "desc")
+    body = []
+    for state in states:
+        vals = [
+            str(state.idx),
+            state.name + (" (off)" if state.off else ""),
+            _fmt_us(state.latency_us),
+            _fmt_us(state.residency_us),
+            decode_idle_flags(state.flags) or "-",
+        ]
+        if verbose:
+            vals.insert(2, state.desc or "-")
+        body.append(vals)
+    # idx right-aligned, the rest left-aligned except the two time columns.
+    right = {0} | ({3, 4} if verbose else {2, 3})
+    print(_layout(headers, body, right, indent="  "))
+
+
+def _layout(headers, body, right, indent="", marks=None):
+    """
+    Render a table. right is the set of column indexes to right-align.
+    marks, when given, holds one (blank_before, highlight) pair per body row.
+    """
+    widths = [len(header) for header in headers]
+    for vals in body:
+        for i, val in enumerate(vals):
+            if len(val) > widths[i]:
+                widths[i] = len(val)
+
+    def fmt(vals):
+        cells = [
+            val.rjust(widths[i]) if i in right else val.ljust(widths[i])
+            for i, val in enumerate(vals)
+        ]
+        return (indent + "  ".join(cells)).rstrip()
+
+    lines = [fmt(headers)]
+    for i, vals in enumerate(body):
+        blank, hl = marks[i] if marks else (False, False)
+        if blank:
+            lines.append("")
+        line = fmt(vals)
+        if hl:
+            line = _paint(line)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _usage_totals(per_cpu, names):
+    """Sum usage and time per state index across CPUs."""
+    usage = {}
+    time_us = {}
+    for rows in per_cpu.values():
+        for row in rows:
+            usage[row.idx] = usage.get(row.idx, 0) + (row.usage or 0)
+            time_us[row.idx] = time_us.get(row.idx, 0.0) + (row.time_us or 0.0)
+    total_time = sum(time_us.values())
+    body = []
+    for idx in sorted(usage):
+        share = 100.0 * time_us[idx] / total_time if total_time else 0.0
+        body.append([
+            f"{idx}",
+            names.get(idx, f"state{idx}"),
+            f"{usage[idx]}",
+            _fmt_seconds(time_us[idx]),
+            f"{share:.1f}%",
+        ])
+    return body
+
+
+def _cpu_rows(per_cpu, last_state, names, verbose, highlight):
+    """Body rows for the per-cpu table, one row per (cpu, idle state)."""
+    headers = ["cpu", "idx", "state", "usage", "time", "share"]
+    if verbose:
+        headers += ["above", "below", "rejected", "disable"]
+    headers.append("last")
+
+    body = []
+    marks = []
+    first = True
+    for cpu in sorted(per_cpu):
+        rows = per_cpu[cpu]
+        total = sum(row.time_us or 0.0 for row in rows)
+        shown = [row for row in rows if verbose or row.usage or row.time_us]
+        if not shown:
+            # Every counter is zero; show the CPU rather than drop it silently.
+            shown = rows[:1]
+        for i, row in enumerate(shown):
+            share = 100.0 * (row.time_us or 0.0) / total if total else 0.0
+            vals = [
+                str(cpu),
+                str(row.idx),
+                names.get(row.idx, f"state{row.idx}"),
+                str(row.usage),
+                _fmt_seconds(row.time_us),
+                f"{share:.1f}%",
+            ]
+            if verbose:
+                vals += [
+                    "-" if row.above is None else str(row.above),
+                    "-" if row.below is None else str(row.below),
+                    "-" if row.rejected is None else str(row.rejected),
+                    "-" if row.disable is None else str(row.disable),
+                ]
+            vals.append("*" if last_state.get(cpu) == row.idx else "")
+            body.append(vals)
+            marks.append((i == 0 and not first, cpu in highlight))
+        first = False
+    return headers, body, marks
+
+
+def show_cstate(verbose, highlight=None, cpu_filter=None):
+    highlight = highlight or set()
+    drivers, per_cpu, last_state, governor = collect_cstates()
+    if not per_cpu:
+        print(
+            "No cpuidle data was found (no registered cpuidle_devices — "
+            "cpuidle may be disabled, e.g. idle=poll)."
+        )
+        return False
+
+    names = {}
+    for _addr, (_name, states, _cpus) in drivers.items():
+        names.update(_state_names(states))
+
+    total_cpus = len(per_cpu)
+    filter_note = None
+    if cpu_filter:
+        filter_note = _cpu_list_note("filter cpu index", cpu_filter, per_cpu)
+        per_cpu = {cpu: rows for cpu, rows in per_cpu.items() if cpu in cpu_filter}
+        if not per_cpu:
+            print(filter_note)
+            return False
+
+    if governor:
+        print(f"cpuidle governor: {governor}")
+    for _addr, (name, states, cpus) in sorted(
+        drivers.items(), key=lambda item: item[1][2][0] if item[1][2] else -1
+    ):
+        _print_state_table(name, states, cpus, verbose)
+        print()
+
+    if cpu_filter:
+        print(filter_note)
+        print(f"{_cpu_word(len(per_cpu), 'logical CPU', 'logical CPUs')} of {total_cpus}")
+    else:
+        totals = _usage_totals(per_cpu, names)
+        print(f"totals across {_cpu_word(total_cpus, 'CPU', 'CPUs')}")
+        print(_layout(
+            ["idx", "state", "usage", "time", "share"],
+            totals,
+            {0, 2, 3, 4},
+            indent="  ",
+        ))
+    if highlight:
+        print(_cpu_list_note("highlight", highlight, per_cpu))
+    print()
+
+    headers, body, marks = _cpu_rows(per_cpu, last_state, names, verbose, highlight)
+    # Everything is right-aligned except the state name and the trailing mark.
+    right = {i for i in range(len(headers))} - {headers.index("state"), len(headers) - 1}
+    print(_layout(headers, body, right, marks=marks))
+    if last_state:
+        print()
+        print("* = state the CPU entered last (cpuidle_device.last_state_idx)")
     return True
 
 
@@ -877,12 +1347,15 @@ def main(argv=None):
 
     parser = argparse.ArgumentParser(
         prog="chk_cpu",
-        description="Show CPU topology from a vmcore.",
+        description="Show CPU topology and idle (C-state) data from a vmcore.",
         epilog=(
             "examples:\n"
             "  chk_cpu\n"
             "  chk_cpu --topo\n"
             "  chk_cpu --topo -v\n"
+            "  chk_cpu --cstate\n"
+            "  chk_cpu --cstate -v\n"
+            "  chk_cpu --cstate --filter-cpu-index 0,64,127\n"
             "  chk_cpu --highlight 0,64,127\n"
             "  chk_cpu --filter-cpu-index 0,64,127\n"
         ),
@@ -892,6 +1365,11 @@ def main(argv=None):
         "--topo",
         action="store_true",
         help="list physical id, core id, and cpu index (default)",
+    )
+    parser.add_argument(
+        "--cstate",
+        action="store_true",
+        help="list cpuidle C-state usage and residency for every cpu",
     )
     parser.add_argument(
         "--highlight",
@@ -908,7 +1386,10 @@ def main(argv=None):
     parser.add_argument(
         "-v", "--verbose",
         action="store_true",
-        help="also show die id and apicid when the kernel has them",
+        help=(
+            "topo: also show die id and apicid when the kernel has them; "
+            "cstate: also show every state and the above/below/rejected counters"
+        ),
     )
     parser.add_argument(
         "-d", "--debug",
@@ -922,13 +1403,23 @@ def main(argv=None):
     modes = []
     if args.topo:
         modes.append("topo")
+    if args.cstate:
+        modes.append("cstate")
     if not modes:
         modes.append("topo")
 
     ok = True
-    for mode in modes:
+    for i, mode in enumerate(modes):
+        if i:
+            print()
         if mode == "topo":
             ok = show_topo(
+                verbose=args.verbose,
+                highlight=args.highlight,
+                cpu_filter=args.filter_cpu_index,
+            ) and ok
+        elif mode == "cstate":
+            ok = show_cstate(
                 verbose=args.verbose,
                 highlight=args.highlight,
                 cpu_filter=args.filter_cpu_index,
